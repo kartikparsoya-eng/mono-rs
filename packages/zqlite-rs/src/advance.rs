@@ -9,36 +9,24 @@ use crate::diff::{self, Change, DiffError, Row, TableAndZqlSpec};
 
 // ─── Pipeline Topology Types ────────────────────────────────────────────────
 
+// Only Filter operators are present — non-filter types (Join, Take, Exists) are
+// excluded at the TS level by `#extractPipelineConfig()` eligibility checks.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Operator {
     #[serde(rename = "filter")]
     Filter { predicate: serde_json::Value },
-    #[serde(rename = "join")]
-    Join {
-        parent_key: Vec<String>,
-        child_key: Vec<String>,
-        child_table: String,
-        relationship: String,
-    },
-    #[serde(rename = "take")]
-    Take {
-        sort: Vec<(String, String)>,
-        limit: Option<usize>,
-    },
-    #[serde(rename = "exists")]
-    Exists {
-        relationship: String,
-        parent_field: Vec<String>,
-        not_exists: bool,
-    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
     pub query_id: String,
     pub source_tables: Vec<String>,
+    /// Only Filter operators — other types are excluded by TS eligibility check.
     pub operators: Vec<Operator>,
+    /// Primary key column names for matching prev rows during edits.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,10 +263,13 @@ fn process_change_for_pipeline(pipeline: &PipelineConfig, change: &Change) -> Ve
                 });
             }
         } else {
-            // Edit: row updated. Also remove any conflicting prev rows
-            for (i, prev) in change.prev_values.iter().enumerate() {
-                if i == 0 {
-                    // First prev is the "same row" (matching PK) — this is an edit
+            // Edit: row updated. Match prev row by primary key equality.
+            let matched_prev = find_prev_by_pk(&pipeline.primary_key, &change.prev_values, next_value);
+
+            for prev in &change.prev_values {
+                let is_matched = matched_prev.map_or(false, |m| std::ptr::eq(m, prev));
+                if is_matched {
+                    // Same row (PK match) — this is an edit
                     if passes_filter(&pipeline.operators, next_value) {
                         results.push(RowChange {
                             query_id: pipeline.query_id.clone(),
@@ -298,7 +289,7 @@ fn process_change_for_pipeline(pipeline: &PipelineConfig, change: &Change) -> Ve
                         });
                     }
                 } else {
-                    // Additional prev rows are unique key conflicts — remove them
+                    // Non-matched prev rows are unique key conflicts — remove them
                     if passes_filter(&pipeline.operators, prev) {
                         results.push(RowChange {
                             query_id: pipeline.query_id.clone(),
@@ -308,6 +299,19 @@ fn process_change_for_pipeline(pipeline: &PipelineConfig, change: &Change) -> Ve
                             change_type: "remove".to_string(),
                         });
                     }
+                }
+            }
+
+            // If no PK match found, treat next_value as an add
+            if matched_prev.is_none() {
+                if passes_filter(&pipeline.operators, next_value) {
+                    results.push(RowChange {
+                        query_id: pipeline.query_id.clone(),
+                        table: change.table.clone(),
+                        row_key: change.row_key.clone(),
+                        row: Some(next_value.clone()),
+                        change_type: "add".to_string(),
+                    });
                 }
             }
         }
@@ -339,11 +343,28 @@ fn passes_filter(operators: &[Operator], row: &Row) -> bool {
                     }
                 }
             }
-            // Join/Take/Exists pass through — they require state not available here
-            _ => {}
         }
     }
     true
+}
+
+/// Find the prev_value row whose primary key columns match next_value.
+/// Falls back to first prev_value if primary_key is empty (backwards compat).
+fn find_prev_by_pk<'a>(primary_key: &[String], prev_values: &'a [Row], next_value: &Row) -> Option<&'a Row> {
+    if primary_key.is_empty() {
+        return prev_values.first();
+    }
+    prev_values.iter().find(|prev| {
+        primary_key.iter().all(|col| {
+            let prev_val = prev.get(col);
+            let next_val = next_value.get(col);
+            match (prev_val, next_val) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    })
 }
 
 fn process_pipeline(pipeline: &PipelineConfig, changes: &[Change]) -> Vec<RowChange> {
@@ -495,13 +516,92 @@ mod tests {
             "query_id": "q1",
             "source_tables": ["users"],
             "operators": [
-                {"type": "filter", "predicate": {"op": "eq", "field": "active", "value": true}},
-                {"type": "take", "sort": [["name", "asc"]], "limit": 10}
-            ]
+                {"type": "filter", "predicate": {"op": "eq", "field": "active", "value": true}}
+            ],
+            "primary_key": ["id"]
         }"#;
         let config: PipelineConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.query_id, "q1");
-        assert_eq!(config.operators.len(), 2);
+        assert_eq!(config.operators.len(), 1);
+        assert_eq!(config.primary_key, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn test_pipeline_config_deserialization_no_pk() {
+        let json = r#"{
+            "query_id": "q1",
+            "source_tables": ["users"],
+            "operators": []
+        }"#;
+        let config: PipelineConfig = serde_json::from_str(json).unwrap();
+        assert!(config.primary_key.is_empty());
+    }
+
+    #[test]
+    fn test_edit_matches_by_primary_key() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev1 = Row::new();
+        prev1.insert("id".to_string(), serde_json::json!("u2"));
+        prev1.insert("name".to_string(), serde_json::json!("Other"));
+
+        let mut prev2 = Row::new();
+        prev2.insert("id".to_string(), serde_json::json!("u1"));
+        prev2.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("name".to_string(), serde_json::json!("Bob"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev1, prev2],
+            next_value: Some(next),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        // prev1 (u2) doesn't match PK -> remove
+        // prev2 (u1) matches PK -> edit
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].change_type, "remove"); // u2 conflict
+        assert_eq!(results[1].change_type, "edit");   // u1 matched
+    }
+
+    #[test]
+    fn test_edit_no_pk_match_becomes_add_remove() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u2"));
+        prev.insert("name".to_string(), serde_json::json!("Other"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        // No PK match: prev u2 -> remove, next u1 -> add
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].change_type, "remove");
+        assert_eq!(results[1].change_type, "add");
     }
 
     #[test]
@@ -553,6 +653,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
@@ -579,6 +680,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
 
@@ -602,6 +704,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
 
@@ -630,6 +733,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
@@ -655,6 +759,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
 
@@ -687,6 +792,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["orders".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
 
@@ -711,6 +817,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let changes: Vec<Change> = vec![];
@@ -723,6 +830,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -743,6 +851,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let changes: Vec<Change> = (0..1000)
@@ -766,6 +875,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let changes: Vec<Change> = (0..5)
@@ -794,6 +904,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
@@ -822,6 +933,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -843,6 +955,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -864,6 +977,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -887,6 +1001,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let long_str = "a".repeat(100_000);
@@ -910,6 +1025,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -932,6 +1048,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![],
         };
         let mut row = Row::new();
@@ -954,6 +1071,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
@@ -976,6 +1094,7 @@ mod tests {
         let pipeline = PipelineConfig {
             query_id: "q1".to_string(),
             source_tables: vec!["users".to_string()],
+            primary_key: vec![],
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],

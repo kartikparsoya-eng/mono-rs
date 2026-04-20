@@ -1,0 +1,10 @@
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/release/deps/napi_build-6236088c1b1b6774.d: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/release/deps/libnapi_build-6236088c1b1b6774.rlib: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/release/deps/libnapi_build-6236088c1b1b6774.rmeta: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs:

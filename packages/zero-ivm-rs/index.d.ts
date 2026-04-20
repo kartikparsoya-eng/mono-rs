@@ -72,3 +72,21 @@ export interface FilterResult {
   /** Edit changes that need splitting */
   splits: Array<EditSplitInfo>
 }
+
+export declare function rustBuildJoinConstraint(sourceRowJson: string, sourceKey: Array<string>, targetKey: Array<string>): string | null
+
+/**
+ * Batch decision function for Exists operator push path.
+ * Takes JSON array of change descriptors, returns JSON array of action descriptors.
+ */
+export declare function rustExistsPushBatch(changesJson: string, relationshipName: string, notExists: boolean): string
+
+export declare function rustIsJoinMatch(parentRowJson: string, parentKey: Array<string>, childRowJson: string, childKey: Array<string>): boolean
+
+/**
+ * Batch function for the pushChildChange hot path.
+ * Combines constraint building + batch matching in a single napi call.
+ */
+export declare function rustJoinPushChildBatch(childRowJson: string, childKey: Array<string>, parentKey: Array<string>, parentRowsJson: Array<string>): string
+
+export declare function rustRowEqualsForCompoundKey(aJson: string, bJson: string, key: Array<string>): boolean

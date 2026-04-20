@@ -1,0 +1,10 @@
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/debug/deps/napi_build-45f94eb85b160caf.d: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/debug/deps/libnapi_build-45f94eb85b160caf.rlib: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/Documents/Zero/mono-rs/packages/zero-ivm-rs/target/debug/deps/libnapi_build-45f94eb85b160caf.rmeta: /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs /Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs
+
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/lib.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/android.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/wasi.rs:
+/Users/kartik.parsoya/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.1/src/windows.rs:
