@@ -161,6 +161,61 @@ export class Database implements Disposable {
     );
   }
 
+  /**
+   * Get a single row with typed conversion done in Rust.
+   * Returns undefined if no row matches.
+   */
+  getRow<T>(
+    sql: string,
+    params: unknown[],
+    columnTypes: Record<string, string>,
+    tableName: string,
+  ): T | undefined {
+    return this.#run('getRow', sql, () =>
+      this.#db.getRow(sql, params, columnTypes, tableName),
+    );
+  }
+
+  /**
+   * Get multiple rows as a binary buffer (allBuf protocol).
+   * Decode with decodeBuf(). For hot paths with potentially many rows.
+   */
+  getRowsBuf(sql: string, params: unknown[]): Buffer {
+    return this.#run('getRowsBuf', sql, () =>
+      this.#db.getRowsBuf(sql, params),
+    );
+  }
+
+  /**
+   * Get a batch of change log entries as a binary buffer.
+   * Returns allBuf buffer with 4 text columns: stateVersion, table, rowKey, op.
+   * Call repeatedly with increasing offset until row_count < batchSize.
+   */
+  changesSinceBuf(
+    prevVersion: string,
+    batchSize: number,
+    offset: number,
+  ): Buffer {
+    return this.#run('changesSinceBuf', `changeLog2 > ${prevVersion}`, () =>
+      this.#db.changesSinceBuf(prevVersion, batchSize, offset),
+    );
+  }
+
+  /**
+   * Execute a query once per key group from a flat params array.
+   * Returns a single allBuf buffer with all results concatenated.
+   * More efficient than N separate getRow calls when fetching multiple rows.
+   *
+   * @param sql - SQL with positional params (e.g. "SELECT * FROM t WHERE id = ?")
+   * @param params - Flat array of all param values [key1_p1, key1_p2, key2_p1, key2_p2, ...]
+   * @param paramsPerKey - Number of params consumed per execution
+   */
+  getRowsMultiBuf(sql: string, params: unknown[], paramsPerKey: number): Buffer {
+    return this.#run('getRowsMultiBuf', sql, () =>
+      this.#db.getRowsMultiBuf(sql, params, paramsPerKey),
+    );
+  }
+
   close(): void {
     const start = Date.now();
     if (!this.#db.readonly) {

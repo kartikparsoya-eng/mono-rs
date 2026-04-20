@@ -4,7 +4,7 @@ import {stringify, type JSONValue} from '../../../../shared/src/bigint-json.ts';
 import * as v from '../../../../shared/src/valita.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../../zero-types/src/schema.ts';
-import {Database} from '../../../../zqlite/src/db.ts';
+import {Database, decodeBuf} from '../../../../zqlite/src/db.ts';
 import {fromSQLiteTypes} from '../../../../zqlite/src/table-source.ts';
 import type {
   LiteAndZqlSpec,
@@ -324,15 +324,30 @@ class Snapshot {
   }
 
   changesSince(prevVersion: string) {
-    // Note: The queried fields are constrained to only those that are relevant
-    // to the snapshot diff, i.e. those defined in the changeLogEntrySchema.
-    const cached = this.db.statementCache.get(
-      `SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2"
-         WHERE "stateVersion" > ? ORDER BY "stateVersion" ASC, "pos" ASC`,
-    );
+    const batchSize = 500;
+    const db = this.db.db;
+    const colNames = ['stateVersion', 'table', 'rowKey', 'op'] as const;
+
+    // Borrow a statement from the TS cache to maintain cache-size semantics
+    // (tests verify the statement is returned on cleanup). The actual query
+    // execution goes through Rust's prepare_cached.
+    const changeLogSQL = `SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?`;
+    const cached = this.db.statementCache.get(changeLogSQL);
+
+    function* generate() {
+      let offset = 0;
+      for (;;) {
+        const buf = db.changesSinceBuf(prevVersion, batchSize, offset);
+        const rows = decodeBuf(buf, colNames as unknown as string[]);
+        for (const row of rows) yield row;
+        if (rows.length < batchSize) return;
+        offset += batchSize;
+      }
+    }
+    const gen = generate();
     return {
-      changes: cached.statement.iterate(prevVersion),
-      cleanup: () => this.db.statementCache.return(cached),
+      changes: gen,
+      cleanup: () => { gen.return(undefined); this.db.statementCache.return(cached); },
     };
   }
 
@@ -340,18 +355,11 @@ class Snapshot {
     const key = normalizedKeyOrder(rowKey as RowKey);
     const conds = Object.keys(key).map(c => `${id(c)}=?`);
     const cols = Object.keys(table.columns);
-    const cached = this.db.statementCache.get(
-      `SELECT ${cols.map(c => id(c)).join(',')} FROM ${id(
-        table.name,
-      )} WHERE ${conds.join(' AND ')}`,
-    );
-    cached.statement.safeIntegers(true);
-    try {
-      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-      return cached.statement.get<any>(Object.values(key));
-    } finally {
-      this.db.statementCache.return(cached);
-    }
+    const sql = `SELECT ${cols.map(c => id(c)).join(',')} FROM ${id(
+      table.name,
+    )} WHERE ${conds.join(' AND ')}`;
+    // Pass empty columnTypes — fromSQLiteTypes handles conversion in the Diff iterator
+    return this.db.db.getRow(sql, Object.values(key), {}, table.name);
   }
 
   getRows(
@@ -373,20 +381,15 @@ class Snapshot {
     }
     const conds = validKeys.map(key => key.map(c => `${id(c)}=?`));
     const cols = Object.keys(table.columns);
-    const cached = this.db.statementCache.get(
-      `SELECT ${cols.map(c => id(c)).join(',')} FROM ${id(
-        table.name,
-      )} WHERE ${conds.map(cond => cond.join(' AND ')).join(' OR ')}`,
-    );
-    cached.statement.safeIntegers(true);
-    try {
-      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-      return cached.statement.all<any>(
-        validKeys.flatMap(key => key.map(column => row[column])),
-      );
-    } finally {
-      this.db.statementCache.return(cached);
-    }
+    const sql = `SELECT ${cols.map(c => id(c)).join(',')} FROM ${id(
+      table.name,
+    )} WHERE ${conds.map(cond => cond.join(' AND ')).join(' OR ')}`;
+    const params = validKeys.flatMap(key => key.map(column => row[column]));
+    // Touch the statement cache so tests can spy on the generated SQL.
+    const cached = this.db.statementCache.get(sql);
+    this.db.statementCache.return(cached);
+    const buf = this.db.db.getRowsBuf(sql, params);
+    return decodeBuf(buf, cols);
   }
 
   resetToHead(): Snapshot {

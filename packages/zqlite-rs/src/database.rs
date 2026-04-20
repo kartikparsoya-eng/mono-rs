@@ -250,7 +250,7 @@ impl Database {
             crate::types::js_array_params_to_sqlite(&env, unsafe { params.raw() }, params_len)?;
 
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         let col_count = stmt.column_count();
@@ -304,7 +304,7 @@ impl Database {
             crate::types::js_array_params_to_sqlite(&env, unsafe { params.raw() }, params_len)?;
 
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         let col_count = stmt.column_count();
@@ -373,6 +373,259 @@ impl Database {
         }
 
         Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), result) })
+    }
+
+    /// Get a single row with typed conversion done in Rust.
+    /// Returns undefined if no row matches (matching better-sqlite3's .get() behavior).
+    #[napi]
+    pub fn get_row(
+        &self,
+        env: Env,
+        sql: String,
+        params: JsObject,
+        column_types: JsObject,
+        table_name: String,
+    ) -> Result<JsObject> {
+        let conn = self.conn.borrow();
+        let col_types = parse_column_types(&env, &column_types)?;
+
+        let params_len = params.get_array_length()?;
+        let sqlite_params =
+            crate::types::js_array_params_to_sqlite(&env, unsafe { params.raw() }, params_len)?;
+
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count = stmt.column_count();
+        let columns: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap().to_string())
+            .collect();
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            sqlite_params.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+        let mut rows_result = stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        match rows_result.next().map_err(|e| Error::from_reason(format!("{e}")))? {
+            None => {
+                // Return undefined (not null) — matches better-sqlite3 .get()
+                let mut undefined = std::ptr::null_mut();
+                unsafe { napi::sys::napi_get_undefined(env.raw(), &mut undefined) };
+                Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), undefined) })
+            }
+            Some(row) => {
+                let interned_keys = intern_column_keys(&env, &columns)?;
+                let resolved_types = resolve_column_types(&columns, &col_types);
+                let raw = row_to_typed_js_object(&env, row, &interned_keys, &resolved_types, &table_name, &columns)?;
+                Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), raw) })
+            }
+        }
+    }
+
+    /// Batch-fetch multiple single-row lookups in one napi call.
+    /// Takes a SQL with ? placeholders, the number of params per lookup (params_per_key),
+    /// and a flat array of all params [key1_p1, key1_p2, ..., keyN_p1, keyN_p2, ...].
+    /// Executes the query once per key group. Returns allBuf-style buffer with all results
+    /// (0 or 1 row per key, ordered). Empty results are omitted.
+    #[napi]
+    pub fn get_rows_multi_buf(
+        &self,
+        _env: Env,
+        sql: String,
+        params: JsObject,
+        params_per_key: u32,
+    ) -> Result<Buffer> {
+        let conn = self.conn.borrow();
+
+        let params_len = params.get_array_length()?;
+        let all_params =
+            crate::types::js_array_params_to_sqlite(&_env, unsafe { params.raw() }, params_len)?;
+
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count = stmt.column_count();
+        let ppk = params_per_key as usize;
+        let num_keys = all_params.len() / ppk;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(col_count * 64 * num_keys);
+        // Reserve header
+        buf.extend_from_slice(&[0u8; 6]);
+
+        let mut row_count: u32 = 0;
+        for chunk in all_params.chunks(ppk) {
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                chunk.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+            let mut rows_result = stmt
+                .query(param_refs.as_slice())
+                .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+            if let Some(row) = rows_result.next().map_err(|e| Error::from_reason(format!("{e}")))? {
+                for i in 0..col_count {
+                    let val = row.get_ref(i).map_err(|e| Error::from_reason(format!("{e}")))?;
+                    match val {
+                        rusqlite::types::ValueRef::Null => buf.push(0),
+                        rusqlite::types::ValueRef::Integer(n) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&n.to_le_bytes());
+                        }
+                        rusqlite::types::ValueRef::Real(f) => {
+                            buf.push(2);
+                            buf.extend_from_slice(&f.to_le_bytes());
+                        }
+                        rusqlite::types::ValueRef::Text(s) => {
+                            buf.push(3);
+                            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(s);
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => {
+                            buf.push(4);
+                            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(b);
+                        }
+                    }
+                }
+                row_count += 1;
+            }
+        }
+
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        Ok(Buffer::from(buf))
+    }
+
+    /// Get multiple rows as a binary buffer (allBuf protocol).
+    /// Protocol: [u32 row_count][u16 col_count] then per cell: [u8 tag][payload]
+    #[napi]
+    pub fn get_rows_buf(
+        &self,
+        _env: Env,
+        sql: String,
+        params: JsObject,
+    ) -> Result<Buffer> {
+        let conn = self.conn.borrow();
+
+        let params_len = params.get_array_length()?;
+        let sqlite_params =
+            crate::types::js_array_params_to_sqlite(&_env, unsafe { params.raw() }, params_len)?;
+
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count = stmt.column_count();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            sqlite_params.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+        let mut rows_result = stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(col_count * 64 * 32);
+        // Reserve space for header
+        buf.extend_from_slice(&[0u8; 6]);
+
+        let mut row_count: u32 = 0;
+        while let Some(row) = rows_result.next().map_err(|e| Error::from_reason(format!("{e}")))? {
+            for i in 0..col_count {
+                let val = row.get_ref(i).map_err(|e| Error::from_reason(format!("{e}")))?;
+                match val {
+                    rusqlite::types::ValueRef::Null => buf.push(0),
+                    rusqlite::types::ValueRef::Integer(n) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Real(f) => {
+                        buf.push(2);
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Text(s) => {
+                        buf.push(3);
+                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(s);
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        buf.push(4);
+                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                }
+            }
+            row_count += 1;
+        }
+
+        // Write header
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        Ok(Buffer::from(buf))
+    }
+
+    /// Get change log entries as a binary buffer (allBuf protocol) with batching.
+    /// Hard-codes the changeLog2 query. Returns rows in allBuf format.
+    #[napi]
+    pub fn changes_since_buf(
+        &self,
+        _env: Env,
+        prev_version: String,
+        batch_size: u32,
+        offset: u32,
+    ) -> Result<Buffer> {
+        let conn = self.conn.borrow();
+
+        let sql = r#"SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2" WHERE "stateVersion" > ? ORDER BY "stateVersion" ASC, "pos" ASC LIMIT ? OFFSET ?"#;
+
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count: usize = 4;
+        let mut rows_result = stmt
+            .query(rusqlite::params![prev_version, batch_size, offset])
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(col_count * 64 * 32);
+        buf.extend_from_slice(&[0u8; 6]);
+
+        let mut row_count: u32 = 0;
+        while let Some(row) = rows_result.next().map_err(|e| Error::from_reason(format!("{e}")))? {
+            for i in 0..col_count {
+                let val = row.get_ref(i).map_err(|e| Error::from_reason(format!("{e}")))?;
+                match val {
+                    rusqlite::types::ValueRef::Null => buf.push(0),
+                    rusqlite::types::ValueRef::Integer(n) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Real(f) => {
+                        buf.push(2);
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Text(s) => {
+                        buf.push(3);
+                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(s);
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        buf.push(4);
+                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                }
+            }
+            row_count += 1;
+        }
+
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        Ok(Buffer::from(buf))
     }
 
     pub(crate) fn get_conn(&self) -> Arc<RefCell<Connection>> {
@@ -486,5 +739,117 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE test (id INTEGER)").unwrap();
         drop(conn);
+    }
+
+    #[test]
+    fn test_get_row_returns_none_for_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM test WHERE id = ?").unwrap();
+        let mut rows = stmt.query(rusqlite::params![999]).unwrap();
+        assert!(rows.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_rows_buf_empty_result() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER, name TEXT)").unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM test").unwrap();
+        let col_count = stmt.column_count();
+        let mut rows = stmt.query([]).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0u8; 6]);
+        let mut row_count: u32 = 0;
+        while let Some(_row) = rows.next().unwrap() {
+            row_count += 1;
+        }
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        // Should be: [0,0,0,0, 2,0] (0 rows, 2 columns)
+        assert_eq!(buf, vec![0, 0, 0, 0, 2, 0]);
+    }
+
+    #[test]
+    fn test_changes_since_buf_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE "_zero.changeLog2" ("stateVersion" TEXT, "table" TEXT, "rowKey" TEXT, "op" TEXT, "pos" INTEGER)"#
+        ).unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2" WHERE "stateVersion" > ? ORDER BY "stateVersion" ASC, "pos" ASC LIMIT ? OFFSET ?"#
+        ).unwrap();
+        let mut rows = stmt.query(rusqlite::params!["00", 500, 0]).unwrap();
+        let mut buf: Vec<u8> = vec![0u8; 6];
+        let mut row_count: u32 = 0;
+        while let Some(_) = rows.next().unwrap() { row_count += 1; }
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(buf, vec![0, 0, 0, 0, 4, 0]);
+    }
+
+    #[test]
+    fn test_allbuf_protocol_format() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER, name TEXT, val REAL)").unwrap();
+        conn.execute("INSERT INTO test VALUES (42, 'hello', 3.14)", []).unwrap();
+        conn.execute("INSERT INTO test VALUES (NULL, NULL, NULL)", []).unwrap();
+
+        let mut stmt = conn.prepare("SELECT id, name, val FROM test").unwrap();
+        let col_count = stmt.column_count();
+        let mut rows = stmt.query([]).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0u8; 6]);
+        let mut row_count: u32 = 0;
+
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..col_count {
+                let val = row.get_ref(i).unwrap();
+                match val {
+                    rusqlite::types::ValueRef::Null => buf.push(0),
+                    rusqlite::types::ValueRef::Integer(n) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Real(f) => {
+                        buf.push(2);
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Text(s) => {
+                        buf.push(3);
+                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(s);
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        buf.push(4);
+                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                }
+            }
+            row_count += 1;
+        }
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        // Verify header: 2 rows, 3 columns
+        assert_eq!(&buf[0..4], &2u32.to_le_bytes());
+        assert_eq!(&buf[4..6], &3u16.to_le_bytes());
+
+        // Row 1: int 42, text "hello", real 3.14
+        assert_eq!(buf[6], 1); // int tag
+        assert_eq!(&buf[7..15], &42i64.to_le_bytes());
+        assert_eq!(buf[15], 3); // text tag
+        assert_eq!(&buf[16..20], &5u32.to_le_bytes()); // "hello" len
+        assert_eq!(&buf[20..25], b"hello");
+        assert_eq!(buf[25], 2); // real tag
+        assert_eq!(&buf[26..34], &3.14f64.to_le_bytes());
+
+        // Row 2: all nulls
+        assert_eq!(buf[34], 0);
+        assert_eq!(buf[35], 0);
+        assert_eq!(buf[36], 0);
     }
 }

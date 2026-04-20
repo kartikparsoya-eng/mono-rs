@@ -30,11 +30,11 @@ impl Statement {
     /// Returns {changes: number, lastInsertRowid: number|bigint}.
     #[napi]
     pub fn run(&self, env: Env, params: JsObject) -> Result<JsObject> {
-        let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
+        let values = extract_params(&env, &params, &stmt)?;
 
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
@@ -73,11 +73,11 @@ impl Statement {
     /// Get a single row. Returns the row object or undefined if no rows.
     #[napi]
     pub fn get(&self, env: Env, params: JsObject) -> Result<Option<JsObject>> {
-        let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+        let values = extract_params(&env, &params, &stmt)?;
 
         let columns = self.get_columns(&stmt);
         let interned_keys = intern_column_keys(&env, &columns)?;
@@ -102,11 +102,11 @@ impl Statement {
     /// Get all rows as an array of objects.
     #[napi]
     pub fn all(&self, env: Env, params: JsObject) -> Result<JsObject> {
-        let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+        let values = extract_params(&env, &params, &stmt)?;
 
         let columns = self.get_columns(&stmt);
         let interned_keys = intern_column_keys(&env, &columns)?;
@@ -138,11 +138,11 @@ impl Statement {
     /// Tags: 0=null, 1=i64(8 bytes LE), 2=f64(8 bytes LE), 3=text(u32 len + bytes), 4=blob(u32 len + bytes)
     #[napi]
     pub fn all_buf(&self, env: Env, params: JsObject) -> Result<Buffer> {
-        let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+        let values = extract_params(&env, &params, &stmt)?;
 
         let col_count = stmt.column_count();
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
@@ -198,11 +198,11 @@ impl Statement {
     /// Create a lazy row iterator. Materializes all rows in Rust, converts lazily to JS.
     #[napi]
     pub fn iterate(&self, env: Env, params: JsObject) -> Result<RowIterator> {
-        let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+        let values = extract_params(&env, &params, &stmt)?;
 
         let columns = self.get_columns(&stmt);
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
@@ -235,7 +235,7 @@ impl Statement {
 }
 
 /// Extract params from a JsObject (JS Array) into rusqlite Values.
-fn extract_params(env: &Env, params: &JsObject) -> Result<Vec<rusqlite::types::Value>> {
+fn extract_params(env: &Env, params: &JsObject, stmt: &rusqlite::CachedStatement) -> Result<Vec<rusqlite::types::Value>> {
     let len = params.get_array_length()?;
     if len == 0 {
         return Ok(Vec::new());
@@ -249,6 +249,7 @@ fn extract_params(env: &Env, params: &JsObject) -> Result<Vec<rusqlite::types::V
             napi::sys::napi_get_element(env.raw(), params.raw(), 0, &mut first_element)
         };
         if status == 0 {
+            // Check if it's an array
             let mut is_array = false;
             let arr_status = unsafe {
                 napi::sys::napi_is_array(env.raw(), first_element, &mut is_array)
@@ -262,9 +263,64 @@ fn extract_params(env: &Env, params: &JsObject) -> Result<Vec<rusqlite::types::V
                     return js_array_params_to_sqlite(env, first_element, inner_len);
                 }
             }
+
+            // Check if it's a named-params object (not array, not buffer, not null)
+            let mut vt = 0;
+            unsafe { napi::sys::napi_typeof(env.raw(), first_element, &mut vt) };
+            if vt == 6 {
+                // napi_object
+                let mut is_buffer = false;
+                unsafe { napi::sys::napi_is_buffer(env.raw(), first_element, &mut is_buffer) };
+                if !is_buffer {
+                    return extract_named_params(env, first_element, stmt);
+                }
+            }
         }
     }
     js_array_params_to_sqlite(env, unsafe { params.raw() }, len)
+}
+
+/// Extract named parameters from a JS object using the statement's parameter names.
+/// better-sqlite3 supports @name, :name, $name prefixes.
+fn extract_named_params(
+    env: &Env,
+    obj_raw: napi::sys::napi_value,
+    stmt: &rusqlite::CachedStatement,
+) -> Result<Vec<rusqlite::types::Value>> {
+    use crate::types::napi_value_to_sqlite_param;
+
+    let param_count = stmt.parameter_count();
+    let mut values = Vec::with_capacity(param_count);
+
+    for i in 1..=param_count {
+        let name = stmt.parameter_name(i).ok_or_else(|| {
+            Error::from_reason(format!("Parameter at index {i} has no name"))
+        })?;
+        // Strip the prefix (@, :, $) to get the object key
+        let key = &name[1..];
+
+        // Get property from JS object
+        let mut prop_val = std::ptr::null_mut();
+        let c_key = std::ffi::CString::new(key)
+            .map_err(|_| Error::from_reason(format!("Invalid key: {key}")))?;
+        let status = unsafe {
+            napi::sys::napi_get_named_property(
+                env.raw(),
+                obj_raw,
+                c_key.as_ptr(),
+                &mut prop_val,
+            )
+        };
+        if status != 0 {
+            return Err(Error::from_reason(format!(
+                "Failed to get property '{key}' from named params object"
+            )));
+        }
+
+        values.push(napi_value_to_sqlite_param(env, prop_val)?);
+    }
+
+    Ok(values)
 }
 
 impl Statement {
