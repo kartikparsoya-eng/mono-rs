@@ -1,8 +1,21 @@
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import type {CompoundKey} from '../../../../zero-protocol/src/ast.ts';
+import type {
+  rustBuildJoinConstraint as RustBuildJoinConstraintFn,
+  rustIsJoinMatch as RustIsJoinMatchFn,
+  rustJoinPushChildBatch as RustJoinPushChildBatchFn,
+  rustRowEqualsForCompoundKey as RustRowEqualsForCompoundKeyFn,
+} from '../../../../zero-ivm-rs/index.js';
+
+type RustBindings = {
+  rustBuildJoinConstraint: typeof RustBuildJoinConstraintFn;
+  rustIsJoinMatch: typeof RustIsJoinMatchFn;
+  rustJoinPushChildBatch: typeof RustJoinPushChildBatchFn;
+  rustRowEqualsForCompoundKey: typeof RustRowEqualsForCompoundKeyFn;
+};
 
 // Conditional import — Rust bindings may not be available
-let rustBindings: typeof import('zero-ivm-rs') | undefined;
+let rustBindings: RustBindings | undefined;
 try {
   rustBindings = require('zero-ivm-rs');
 } catch {

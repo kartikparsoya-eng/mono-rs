@@ -40,8 +40,10 @@ import {
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
 import {RustStorage} from '../../../../zero-ivm-rs/index.js';
 import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
+import {isRustJoinAvailable} from './rust-join.ts';
 
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
+const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
 import {
   reloadPermissionsIfChanged,
@@ -134,6 +136,7 @@ export class PipelineDriver {
   readonly #snapshotter: Snapshotter;
   readonly #storage: ClientGroupStorage;
   readonly #rustStorage: RustStorage | null;
+  readonly #rustJoinAvailable: boolean;
   #rustOpID = 0;
   readonly #shardID: ShardID;
   readonly #logConfig: LogConfig;
@@ -179,6 +182,7 @@ export class PipelineDriver {
     this.#snapshotter = snapshotter;
     this.#storage = storage;
     this.#rustStorage = USE_RUST_IVM ? new RustStorage() : null;
+    this.#rustJoinAvailable = USE_RUST_JOIN;
     this.#shardID = shardID;
     this.#logConfig = logConfig;
     this.#config = config;
@@ -197,6 +201,9 @@ export class PipelineDriver {
     assert(!this.#snapshotter.initialized(), 'Already initialized');
     this.#snapshotter.init();
     this.#initAndResetCommon(clientSchema);
+    if (this.#rustJoinAvailable) {
+      this.#lc.debug?.('Rust join acceleration available');
+    }
   }
 
   /**
