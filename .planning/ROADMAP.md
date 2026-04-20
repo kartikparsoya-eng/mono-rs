@@ -8,8 +8,8 @@ Incremental rewrite of zero-cache's performance-critical SQLite layer from TypeS
 
 - [x] **Phase 1: Rust Foundation** - napi-rs module with Database + Statement + statement cache
 - [x] **Phase 2: StatementRunner** - SKIPPED (D-08: stays TS, pure delegation layer)
-- [ ] **Phase 3: IVM Data Layer** - TableSource + DatabaseStorage in Rust
-- [ ] **Phase 4: Schema Modules** - change-log, column-metadata, table-metadata, replication-state
+- [x] **Phase 3: IVM Data Layer** - TableSource + DatabaseStorage in Rust
+- [x] **Phase 4: Schema Modules** - SKIPPED (D-14: already Rust-backed via Phase 1, write-heavy/cold-path)
 - [ ] **Phase 5: High-Impact Services** - Snapshotter + ChangeProcessor in Rust
 - [ ] **Phase 6: Bulk Loader** - initial-sync in Rust
 - [ ] **Phase 7: Benchmarks & Validation** - Comparative A/B benchmarks
@@ -52,17 +52,9 @@ Plans:
 - [ ] 03-01: Implement Rust TableSource (Input interface, SQL generation, row serialization)
 - [ ] 03-02: Implement Rust DatabaseStorage (Storage interface, key-value on SQLite)
 
-### Phase 4: Schema Modules
-**Goal**: Replace 4 schema modules (change-log, column-metadata, table-metadata, replication-state) with Rust
-**Depends on**: Phase 1
-**Requirements**: SCHEMA-01, SCHEMA-02, SCHEMA-03, SCHEMA-04, TEST-01
-**Success Criteria** (what must be TRUE):
-  1. All schema module tests pass with Rust replacements
-  2. Read/write operations produce identical SQLite state to TS versions
-**Plans**: 1 plan
-
-Plans:
-- [ ] 04-01: Implement all 4 schema modules in Rust (parallel-safe, small modules)
+### Phase 4: Schema Modules — SKIPPED
+**Decision**: D-14 — Schema modules stay in TypeScript. All 4 modules already execute SQLite through the Rust-backed Database/Statement from Phase 1. Their logic is write-heavy (D-13) and cold-path reads with no hot loops. No performance gain from Rust rewrite.
+**Status**: Skipped
 
 ### Phase 5: High-Impact Services
 **Goal**: Replace Snapshotter and ChangeProcessor — the two highest-impact rewrite targets
@@ -111,8 +103,8 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Rust Foundation | 3/3 | Complete | 2026-04-20 |
 | 2. StatementRunner | 0/0 | Skipped (D-08) | 2026-04-20 |
-| 3. IVM Data Layer | 0/2 | Not started | - |
-| 4. Schema Modules | 0/1 | Not started | - |
+| 3. IVM Data Layer | 2/2 | Complete | 2026-04-20 |
+| 4. Schema Modules | 0/0 | Skipped (D-14) | 2026-04-20 |
 | 5. High-Impact Services | 0/2 | Not started | - |
 | 6. Bulk Loader | 0/1 | Not started | - |
 | 7. Benchmarks & Validation | 0/1 | Not started | - |
