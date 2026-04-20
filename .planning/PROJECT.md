@@ -73,22 +73,16 @@ All SQLite I/O and row-level computation must happen in Rust, delivering 5-10x t
 | Keep TS for non-SQLite paths | Diminishing returns on rewriting protocol/auth/WebSocket | — Pending |
 | 3-phase approach (SQLite → IVM → CVR) | Follows dependency chain, biggest wins first | — Pending |
 
-## Evolution
+## Current State
 
-This document evolves at phase transitions and milestone boundaries.
+**Shipped**: v1.0 — Rust SQLite Foundation (2026-04-20)
+- Binary buffer protocol: 1.78-1.98x faster than better-sqlite3 for bulk reads
+- Hot read path fully in Rust: db.ts → TableSource → Snapshotter
+- 46/46 zqlite + 10/10 snapshotter tests passing
 
-**After each phase transition** (via `/gsd-transition`):
-1. Requirements invalidated? → Move to Out of Scope with reason
-2. Requirements validated? → Move to Validated with phase reference
-3. New requirements emerged? → Add to Active
-4. Decisions to log? → Add to Key Decisions
-5. "What This Is" still accurate? → Update if drifted
-
-**After each milestone** (via `/gsd-complete-milestone`):
-1. Full review of all sections
-2. Core Value check — still the right priority?
-3. Audit Out of Scope — reasons still valid?
-4. Update Context with current state
+**Next**: v2.0 — Pipeline Driver Hot Path
+- Target: `pipeline-driver.ts#advance()` (lines 621-715)
+- Goal: Keep entire advance loop in Rust (SQLite reads + IVM iteration)
 
 ---
-*Last updated: 2026-04-20 after initialization*
+*Last updated: 2026-04-20 after v1.0 milestone completion*

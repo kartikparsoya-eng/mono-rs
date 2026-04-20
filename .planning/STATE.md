@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: executing
-stopped_at: Phase 7 context gathered
-last_updated: "2026-04-20T12:35:49.217Z"
-last_activity: 2026-04-20 -- Phase 06 planning complete
+milestone: v2.0
+milestone_name: Pipeline Driver Hot Path
+status: planning
+stopped_at: Milestone v1.0 archived
+last_updated: "2026-04-20T13:00:00.000Z"
+last_activity: 2026-04-20 -- v1.0 milestone archived, v2.0 started
 progress:
-  total_phases: 7
-  completed_phases: 4
-  total_plans: 8
-  completed_plans: 8
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,59 +21,31 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** All SQLite I/O and row-level computation in Rust for 5-10x throughput
-**Current focus:** Phase 03 — ivm-data-layer
+**Current focus:** v2.0 — Pipeline Driver Hot Path
 
 ## Current Position
 
-Phase: 03 (ivm-data-layer) — EXECUTING
-Plan: 1 of 2
-Status: Ready to execute
-Last activity: 2026-04-20 -- Phase 06 planning complete
+Phase: TBD (v2.0 planning)
+Plan: -
+Status: Ready for milestone planning
+Last activity: 2026-04-20 -- v1.0 archived
 
-Progress: [██░░░░░░░░] 29%
-
-## Performance Metrics
-
-**Velocity:**
-
-- Total plans completed: 3
-- Average duration: -
-- Total execution time: 0 hours
-
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 01 | 3 | - | - |
-| 02 | 0 (skipped) | - | - |
-
-**Recent Trend:**
-
-- Last 5 plans: -
-- Trend: -
+Progress: [░░░░░░░░░░] 0%
 
 ## Accumulated Context
 
 ### Decisions
 
-Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
+All v1.0 decisions archived in `.planning/milestones/v1.0-ROADMAP.md`.
 
-- [D-08]: StatementRunner stays in TS — pure delegation, no Rust gain
-- [Init]: napi-rs v3 + rusqlite 0.39 (bundled) as tech stack
-- [Init]: Incremental rewrite following 7-phase dependency chain
-- [Init]: Existing vitest suites as primary correctness gate
+### v2.0 Target
 
-### Pending Todos
-
-None yet.
-
-### Blockers/Concerns
-
-- Phase 1 benchmarks show 2-3x slower per-call (expected — FFI overhead). Phase 3+ is where batched Rust wins.
+- pipeline-driver.ts `#advance()` — single hottest code path (lines 621-715)
+- Depends on: snapshotter (done), table-source (done), database-storage (needs Rust)
+- Potential: IVM operators (join, take, filter, sort) if advance() shows gains
 
 ## Session Continuity
 
-Last session: 2026-04-20T12:35:49.207Z
-Stopped at: Phase 7 context gathered
-Resume file: .planning/phases/07-benchmarks/07-CONTEXT.md
+Last session: 2026-04-20
+Stopped at: v1.0 milestone archived
+Resume file: .planning/milestones/v1.0-ROADMAP.md
