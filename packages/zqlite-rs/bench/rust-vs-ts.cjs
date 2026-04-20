@@ -517,6 +517,134 @@ if (losses.length > 0) {
 }
 console.log('');
 
+// ═══════════════════════════════════════════════════════════════
+// SECTION 6: Initial-Sync INSERT Pattern (napi overhead measurement)
+// ═══════════════════════════════════════════════════════════════
+section('Section 6: Initial-Sync INSERT Pattern');
+console.log('\n── Section 6: Initial-Sync INSERT Pattern ──');
+{
+  const TOTAL_ROWS = 10000;
+  const COLS_PER_ROW = 10;
+  const BATCH_ROWS = 50; // INSERT_BATCH_SIZE from initial-sync
+  const VALUES_PER_BATCH = COLS_PER_ROW * BATCH_ROWS;
+  const NUM_BATCHES = TOTAL_ROWS / BATCH_ROWS;
+  const RUNS = 5;
+
+  const createSQL = `CREATE TABLE IF NOT EXISTS bench_sync (
+    id TEXT PRIMARY KEY, col1 TEXT, col2 TEXT, col3 TEXT,
+    col4 INTEGER, col5 INTEGER, col6 REAL, col7 REAL,
+    col8 TEXT, col9 TEXT
+  )`;
+
+  // Build batch INSERT SQL (50 rows × 10 cols = 500 placeholders)
+  const rowPlaceholder = '(' + Array(COLS_PER_ROW).fill('?').join(',') + ')';
+  const batchInsertSQL = `INSERT INTO bench_sync VALUES ${Array(BATCH_ROWS).fill(rowPlaceholder).join(',')}`;
+  const singleInsertSQL = `INSERT INTO bench_sync VALUES ${rowPlaceholder}`;
+
+  // Generate flat test data
+  const flatValues = [];
+  for (let r = 0; r < TOTAL_ROWS; r++) {
+    flatValues.push(`id-${r}`);
+    for (let c = 1; c < COLS_PER_ROW; c++) {
+      if (c <= 3) flatValues.push(`text-${r}-${c}`);
+      else if (c <= 5) flatValues.push(r * c);
+      else if (c <= 7) flatValues.push(r * 0.1 + c);
+      else flatValues.push(`data-${r}-${c}`);
+    }
+  }
+
+  function median(arr) {
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  }
+
+  // ── Pattern A: N/50 napi crossings (current behavior via Rust Statement.run) ──
+  const rustTimesA = [];
+  for (let run = 0; run < RUNS; run++) {
+    const dbPath = tmpDb(`sync-rust-a-${run}`);
+    const db = new RustDatabase(dbPath);
+    db.exec('PRAGMA journal_mode=WAL');
+    db.exec(createSQL);
+    const batchStmt = db.prepare(batchInsertSQL);
+    const singleStmt = db.prepare(singleInsertSQL);
+
+    const t0 = process.hrtime.bigint();
+    db.exec('BEGIN');
+    for (let i = 0; i < NUM_BATCHES; i++) {
+      const offset = i * VALUES_PER_BATCH;
+      batchStmt.run(flatValues.slice(offset, offset + VALUES_PER_BATCH));
+    }
+    db.exec('COMMIT');
+    const t1 = process.hrtime.bigint();
+    rustTimesA.push(Number(t1 - t0) / 1e6); // ms
+    db.close();
+    fs.unlinkSync(dbPath);
+  }
+
+  // ── Pattern A with better-sqlite3 for comparison ──
+  const bsTimesA = [];
+  for (let run = 0; run < RUNS; run++) {
+    const dbPath = tmpDb(`sync-bs-a-${run}`);
+    const db = new BetterSqlite3(dbPath);
+    db.pragma('journal_mode=WAL');
+    db.exec(createSQL);
+    const batchStmt = db.prepare(batchInsertSQL);
+
+    const t0 = process.hrtime.bigint();
+    const tx = db.transaction(() => {
+      for (let i = 0; i < NUM_BATCHES; i++) {
+        const offset = i * VALUES_PER_BATCH;
+        batchStmt.run(...flatValues.slice(offset, offset + VALUES_PER_BATCH));
+      }
+    });
+    tx();
+    const t1 = process.hrtime.bigint();
+    bsTimesA.push(Number(t1 - t0) / 1e6);
+    db.close();
+    fs.unlinkSync(dbPath);
+  }
+
+  // ── Measure napi per-call overhead (empty statement cycle) ──
+  const overheadRuns = 1000;
+  const overheadDbPath = tmpDb('sync-overhead');
+  const overheadDb = new RustDatabase(overheadDbPath);
+  overheadDb.exec('PRAGMA journal_mode=WAL');
+  overheadDb.exec(createSQL);
+  const noopStmt = overheadDb.prepare('SELECT 1');
+  const oh_t0 = process.hrtime.bigint();
+  for (let i = 0; i < overheadRuns; i++) {
+    noopStmt.get([]);
+  }
+  const oh_t1 = process.hrtime.bigint();
+  const perCallOverheadMs = Number(oh_t1 - oh_t0) / 1e6 / overheadRuns;
+  overheadDb.close();
+  fs.unlinkSync(overheadDbPath);
+
+  const medianRustA = median(rustTimesA);
+  const medianBsA = median(bsTimesA);
+  const napiOverheadMs = perCallOverheadMs * NUM_BATCHES;
+  const napiOverheadPct = (napiOverheadMs / medianRustA) * 100;
+
+  console.log(`  ${TOTAL_ROWS} rows, ${COLS_PER_ROW} cols, batch=${BATCH_ROWS} → ${NUM_BATCHES} flush calls`);
+  console.log(`  Rust Statement.run() ×${NUM_BATCHES}: ${medianRustA.toFixed(3)} ms (median of ${RUNS})`);
+  console.log(`  better-sqlite3 ×${NUM_BATCHES}:      ${medianBsA.toFixed(3)} ms (median of ${RUNS})`);
+  console.log(`  Rust/BS ratio:                     ${(medianBsA / medianRustA).toFixed(2)}x`);
+  console.log(`  Per-call napi overhead:            ${(perCallOverheadMs * 1000).toFixed(1)} µs`);
+  console.log(`  Estimated napi overhead total:     ${napiOverheadMs.toFixed(3)} ms`);
+  console.log(`  napi overhead: ${napiOverheadPct.toFixed(1)}% of flush time`);
+  console.log('');
+
+  // D-19 Decision Gate
+  if (napiOverheadPct < 5) {
+    console.log('  D-19 Decision: <5% napi overhead → SKIP Phase 6');
+  } else if (napiOverheadPct <= 15) {
+    console.log('  D-19 Decision: 5-15% napi overhead → flush-only Rust');
+  } else {
+    console.log('  D-19 Decision: >15% napi overhead → full Rust bulk INSERT');
+  }
+  console.log('');
+}
+
 // ── Regression assertions (run with --assert to enforce) ──
 if (process.argv.includes('--assert')) {
   const all = [...wins, ...losses];
