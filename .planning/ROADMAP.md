@@ -19,7 +19,7 @@
 4. All existing filter.test.ts and take.test.ts pass unchanged ✅
 
 **Plans:**
-- [x] Plan 10-01: Rust Filter predicate evaluator (`ba5fe45d0`...`5a4df0a11`)
+3/3 plans complete
 - [x] Plan 10-02: Rust Take state machine (`1a384a18d`)
 - [x] Plan 10-03: Separate IVM crate + delegate integration (`ba5fe45d0`...`d384a1e76`)
 
