@@ -43,10 +43,33 @@ import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
 import {isRustJoinAvailable} from './rust-join.ts';
 import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
 import type {FilterOperator} from '../../../../zql/src/ivm/filter-operators.ts';
+import type {Condition} from '../../../../zero-protocol/src/ast.ts';
+
+type RustAdvanceFn = (dbPath: string, prevVersion: string, currVersion: string, syncableTablesJson: string, allTableNamesJson: string, permissionsTable: string, pipelineConfigsJson: string) => string;
+
+let rustAdvanceFn: RustAdvanceFn | undefined;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const bindings = require('zqlite-rs');
+  rustAdvanceFn = bindings?.rustAdvance;
+} catch {
+  rustAdvanceFn = undefined;
+}
+
+interface RustPipelineConfig {
+  query_id: string;
+  source_tables: string[];
+  operators: RustOperator[];
+}
+type RustOperator =
+  | {type: 'filter'; predicate: unknown}
+  | {type: 'take'; sort: [string, string][]; limit: number | null}
+  | {type: 'exists'; relationship: string; parent_field: string[]; not_exists: boolean};
 
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
+const USE_RUST_ADVANCE = USE_RUST_IVM && rustAdvanceFn !== undefined;
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
 import {
@@ -169,6 +192,8 @@ export class PipelineDriver {
   );
 
   readonly #inspectorDelegate: InspectorDelegate;
+  readonly #pipelineConfigs = new Map<string, RustPipelineConfig>();
+  #useRustAdvance = false;
 
   constructor(
     lc: LogContext,
@@ -235,6 +260,8 @@ export class PipelineDriver {
     this.#pipelines.clear();
     this.#tables.clear();
     this.#allTableNames.clear();
+    this.#pipelineConfigs.clear();
+    this.#useRustAdvance = false;
     this.#initAndResetCommon(clientSchema);
   }
 
@@ -590,6 +617,16 @@ export class PipelineDriver {
         transformationHash,
         companions: liveCompanions,
       });
+
+      if (USE_RUST_ADVANCE) {
+        const config = this.#extractPipelineConfig(queryID, resolvedQuery, liveCompanions);
+        if (config) {
+          this.#pipelineConfigs.set(queryID, config);
+        } else {
+          this.#pipelineConfigs.delete(queryID);
+        }
+        this.#reevaluateRustAdvance();
+      }
     } finally {
       this.#hydrateContext = null;
     }
@@ -607,6 +644,9 @@ export class PipelineDriver {
       for (const companion of pipeline.companions) {
         companion.input.destroy();
       }
+    }
+    if (this.#pipelineConfigs.delete(queryID)) {
+      this.#reevaluateRustAdvance();
     }
   }
 
@@ -641,6 +681,15 @@ export class PipelineDriver {
       this.initialized(),
       'Pipeline driver must be initialized before advancing',
     );
+    if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
+      try {
+        return this.#rustAdvance();
+      } catch (e) {
+        if (e instanceof ResetPipelinesSignal) throw e;
+        this.#lc.warn?.(`Rust advance failed, falling back to TS: ${e}`);
+        this.#useRustAdvance = false;
+      }
+    }
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
@@ -750,6 +799,166 @@ export class PipelineDriver {
       this.#lc.debug?.(`Advanced to ${curr.version}`);
     } finally {
       this.#advanceContext = null;
+    }
+  }
+
+  #extractPipelineConfig(
+    queryID: string,
+    ast: AST,
+    companions: readonly CompanionPipeline[],
+  ): RustPipelineConfig | null {
+    if (ast.related && ast.related.length > 0) return null;
+    if (ast.limit !== undefined) return null;
+    if (companions.length > 0) return null;
+    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where)) return null;
+
+    const operators: RustOperator[] = [];
+    if (ast.where) {
+      operators.push({type: 'filter', predicate: ast.where});
+    }
+
+    const sourceTables = [ast.table ?? ''];
+    return {query_id: queryID, source_tables: sourceTables, operators};
+  }
+
+  #conditionHasCorrelatedSubquery(cond: Condition): boolean {
+    if (cond.type === 'correlatedSubquery') return true;
+    if (cond.type === 'and' || cond.type === 'or') {
+      return cond.conditions.some(c => this.#conditionHasCorrelatedSubquery(c));
+    }
+    return false;
+  }
+
+  #reevaluateRustAdvance() {
+    this.#useRustAdvance =
+      USE_RUST_ADVANCE &&
+      this.#pipelines.size > 0 &&
+      this.#pipelineConfigs.size === this.#pipelines.size;
+  }
+
+  #serializePipelineConfigs(): string {
+    return JSON.stringify([...this.#pipelineConfigs.values()]);
+  }
+
+  #rustAdvance(): {
+    version: string;
+    numChanges: number;
+    changes: Iterable<RowChange | 'yield'>;
+  } {
+    assert(rustAdvanceFn, 'Rust advance not available');
+    const {prev, curr} = this.#snapshotter.advanceWithoutDiff();
+    const numChanges = curr.numChangesSince(prev.version) as number;
+    const dbPath = curr.db.db.name;
+    const syncableTablesJson = JSON.stringify(
+      Object.fromEntries(this.#tableSpecs),
+    );
+    const allTableNamesJson = JSON.stringify([...this.#allTableNames]);
+    const permissionsTable = '';
+    const pipelineConfigsJson = this.#serializePipelineConfigs();
+
+    this.#lc.debug?.(
+      `rust_advance ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines`,
+    );
+
+    const resultJson = rustAdvanceFn(
+      dbPath,
+      prev.version,
+      curr.version,
+      syncableTablesJson,
+      allTableNamesJson,
+      permissionsTable,
+      pipelineConfigsJson,
+    );
+
+    const result = JSON.parse(resultJson) as {
+      changes: Array<{
+        queryID: string;
+        table: string;
+        row_key: Row;
+        row: Row | null;
+        type: string;
+      }>;
+      error?: string;
+      error_type?: string;
+    };
+
+    if (result.error_type === 'version_mismatch') {
+      this.#lc.warn?.('Rust advance version mismatch, retrying');
+      const retry = this.#snapshotter.advanceWithoutDiff();
+      const retryJson = rustAdvanceFn(
+        retry.curr.db.db.name,
+        retry.prev.version,
+        retry.curr.version,
+        syncableTablesJson,
+        allTableNamesJson,
+        permissionsTable,
+        pipelineConfigsJson,
+      );
+      const retryResult = JSON.parse(retryJson);
+      if (retryResult.error_type) {
+        throw new ResetPipelinesSignal(
+          retryResult.error ?? 'Rust advance retry failed',
+          retryResult.error_type,
+        );
+      }
+      for (const table of this.#tables.values()) {
+        table.setDB(retry.curr.db.db);
+      }
+      this.#ensureCostModelExistsIfEnabled(retry.curr.db.db);
+      return {
+        version: retry.curr.version,
+        numChanges,
+        changes: this.#convertRustChanges(retryResult.changes),
+      };
+    }
+
+    if (result.error_type === 'reset' || result.error_type === 'truncate') {
+      throw new ResetPipelinesSignal(
+        result.error ?? 'Rust advance signaled reset',
+        result.error_type,
+      );
+    }
+
+    if (result.error) {
+      throw new Error(result.error);
+    }
+
+    for (const table of this.#tables.values()) {
+      table.setDB(curr.db.db);
+    }
+    this.#ensureCostModelExistsIfEnabled(curr.db.db);
+    this.#lc.debug?.(`Rust advanced to ${curr.version}`);
+
+    return {
+      version: curr.version,
+      numChanges,
+      changes: this.#convertRustChanges(result.changes),
+    };
+  }
+
+  *#convertRustChanges(
+    changes: Array<{
+      queryID: string;
+      table: string;
+      row_key: Row;
+      row: Row | null;
+      type: string;
+    }>,
+  ): Iterable<RowChange | 'yield'> {
+    for (const change of changes) {
+      const type =
+        change.type === 'add'
+          ? ChangeType.ADD
+          : change.type === 'edit'
+            ? ChangeType.EDIT
+            : ChangeType.REMOVE;
+      yield {
+        type,
+        queryID: change.queryID,
+        table: change.table,
+        rowKey: change.row_key,
+        row: change.row ?? change.row_key,
+      } as RowChange;
     }
   }
 
