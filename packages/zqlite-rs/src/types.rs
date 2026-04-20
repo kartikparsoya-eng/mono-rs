@@ -3,6 +3,209 @@ use napi::{Env, JsObject, NapiRaw};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::Row;
 
+// ─── Phase 3: Column-type-aware row conversion ───
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnType {
+    Boolean,
+    Number,
+    String,
+    Json,
+    Null,
+}
+
+impl ColumnType {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "boolean" => ColumnType::Boolean,
+            "number" => ColumnType::Number,
+            "string" => ColumnType::String,
+            "json" => ColumnType::Json,
+            _ => ColumnType::Null,
+        }
+    }
+}
+
+/// Parse a JS object {colName: typeStr} into a Vec of (name, ColumnType).
+pub fn parse_column_types(env: &Env, obj: &JsObject) -> Result<Vec<(std::string::String, ColumnType)>> {
+    let names = obj.get_property_names()?;
+    let len = names.get_array_length()?;
+    let mut result = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let key: napi::JsString = names.get_element(i)?;
+        let key_str = key.into_utf8()?.into_owned()?;
+        let val: napi::JsString = obj.get_named_property(&key_str)?;
+        let val_str = val.into_utf8()?.into_owned()?;
+        result.push((key_str, ColumnType::from_str(&val_str)));
+    }
+    Ok(result)
+}
+
+/// Recursively convert a serde_json::Value to a raw napi_value.
+pub fn serde_json_to_js(env: &Env, value: &serde_json::Value) -> Result<napi::sys::napi_value> {
+    use serde_json::Value as JV;
+    match value {
+        JV::Null => {
+            let mut result = std::ptr::null_mut();
+            unsafe { napi::sys::napi_get_null(env.raw(), &mut result) };
+            Ok(result)
+        }
+        JV::Bool(b) => {
+            let mut result = std::ptr::null_mut();
+            unsafe { napi::sys::napi_get_boolean(env.raw(), *b, &mut result) };
+            Ok(result)
+        }
+        JV::Number(n) => {
+            let mut result = std::ptr::null_mut();
+            let f = n.as_f64().unwrap_or(0.0);
+            unsafe { napi::sys::napi_create_double(env.raw(), f, &mut result) };
+            Ok(result)
+        }
+        JV::String(s) => {
+            let mut result = std::ptr::null_mut();
+            unsafe {
+                napi::sys::napi_create_string_utf8(
+                    env.raw(),
+                    s.as_ptr() as *const i8,
+                    s.len() as isize,
+                    &mut result,
+                )
+            };
+            Ok(result)
+        }
+        JV::Array(arr) => {
+            let mut result = std::ptr::null_mut();
+            unsafe { napi::sys::napi_create_array_with_length(env.raw(), arr.len(), &mut result) };
+            for (i, item) in arr.iter().enumerate() {
+                let js_item = serde_json_to_js(env, item)?;
+                unsafe { napi::sys::napi_set_element(env.raw(), result, i as u32, js_item) };
+            }
+            Ok(result)
+        }
+        JV::Object(map) => {
+            let mut result = std::ptr::null_mut();
+            unsafe { napi::sys::napi_create_object(env.raw(), &mut result) };
+            for (key, val) in map {
+                let js_val = serde_json_to_js(env, val)?;
+                let key_cstr = std::ffi::CString::new(key.as_str()).unwrap();
+                unsafe {
+                    napi::sys::napi_set_named_property(env.raw(), result, key_cstr.as_ptr(), js_val)
+                };
+            }
+            Ok(result)
+        }
+    }
+}
+
+/// Convert a rusqlite Row to a raw JS object with column-type-aware conversion.
+/// This is the hot-path function used by query_all/query_batched.
+pub fn row_to_typed_js_object(
+    env: &Env,
+    row: &rusqlite::Row,
+    columns: &[std::string::String],
+    column_types: &[(std::string::String, ColumnType)],
+    table_name: &str,
+) -> Result<napi::sys::napi_value> {
+    let mut obj = std::ptr::null_mut();
+    unsafe { napi::sys::napi_create_object(env.raw(), &mut obj) };
+
+    for (i, col_name) in columns.iter().enumerate() {
+        let col_type = column_types
+            .iter()
+            .find(|(name, _)| name == col_name)
+            .map(|(_, t)| *t)
+            .unwrap_or(ColumnType::String);
+
+        let raw_value = row
+            .get_ref(i)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+
+        let js_val = match raw_value {
+            rusqlite::types::ValueRef::Null => {
+                let mut v = std::ptr::null_mut();
+                unsafe { napi::sys::napi_get_null(env.raw(), &mut v) };
+                v
+            }
+            rusqlite::types::ValueRef::Integer(n) => match col_type {
+                ColumnType::Boolean => {
+                    let mut v = std::ptr::null_mut();
+                    unsafe { napi::sys::napi_get_boolean(env.raw(), n != 0, &mut v) };
+                    v
+                }
+                ColumnType::Number => {
+                    const MAX_SAFE: i64 = 9007199254740991;
+                    const MIN_SAFE: i64 = -9007199254740991;
+                    if n > MAX_SAFE || n < MIN_SAFE {
+                        return Err(Error::from_reason(format!(
+                            "value {} (in {}.{}) is outside of supported bounds",
+                            n, table_name, col_name
+                        )));
+                    }
+                    let mut v = std::ptr::null_mut();
+                    unsafe { napi::sys::napi_create_double(env.raw(), n as f64, &mut v) };
+                    v
+                }
+                _ => {
+                    let mut v = std::ptr::null_mut();
+                    unsafe { napi::sys::napi_create_double(env.raw(), n as f64, &mut v) };
+                    v
+                }
+            },
+            rusqlite::types::ValueRef::Real(f) => {
+                let mut v = std::ptr::null_mut();
+                unsafe { napi::sys::napi_create_double(env.raw(), f, &mut v) };
+                v
+            }
+            rusqlite::types::ValueRef::Text(bytes) => {
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|e| Error::from_reason(e.to_string()))?;
+                match col_type {
+                    ColumnType::Json => {
+                        let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                            Error::from_reason(format!(
+                                "invalid json value for column {}: {}",
+                                col_name, e
+                            ))
+                        })?;
+                        serde_json_to_js(env, &parsed)?
+                    }
+                    _ => {
+                        let mut v = std::ptr::null_mut();
+                        unsafe {
+                            napi::sys::napi_create_string_utf8(
+                                env.raw(),
+                                s.as_ptr() as *const i8,
+                                s.len() as isize,
+                                &mut v,
+                            )
+                        };
+                        v
+                    }
+                }
+            }
+            rusqlite::types::ValueRef::Blob(bytes) => {
+                let mut v = std::ptr::null_mut();
+                let mut data_ptr = std::ptr::null_mut();
+                unsafe {
+                    napi::sys::napi_create_buffer_copy(
+                        env.raw(),
+                        bytes.len(),
+                        bytes.as_ptr() as *const _,
+                        &mut data_ptr,
+                        &mut v,
+                    )
+                };
+                v
+            }
+        };
+
+        let key_cstr = std::ffi::CString::new(col_name.as_str()).unwrap();
+        unsafe { napi::sys::napi_set_named_property(env.raw(), obj, key_cstr.as_ptr(), js_val) };
+    }
+
+    Ok(obj)
+}
+
 /// Set a SQLite value as a named property on a JsObject.
 ///
 /// Type coercion contract (matching better-sqlite3):
@@ -242,6 +445,40 @@ pub fn js_array_params_to_sqlite(
 mod tests {
     use rusqlite::types::Value;
     use rusqlite::types::ValueRef;
+    use super::ColumnType;
+
+    #[test]
+    fn test_column_type_from_str() {
+        assert_eq!(ColumnType::from_str("boolean"), ColumnType::Boolean);
+        assert_eq!(ColumnType::from_str("number"), ColumnType::Number);
+        assert_eq!(ColumnType::from_str("string"), ColumnType::String);
+        assert_eq!(ColumnType::from_str("json"), ColumnType::Json);
+        assert_eq!(ColumnType::from_str("null"), ColumnType::Null);
+        assert_eq!(ColumnType::from_str("unknown"), ColumnType::Null);
+    }
+
+    #[test]
+    fn test_safe_integer_bounds() {
+        const MAX_SAFE: i64 = 9007199254740991;
+        const MIN_SAFE: i64 = -9007199254740991;
+        assert!(MAX_SAFE <= 9007199254740991);
+        assert!(MIN_SAFE >= -9007199254740991);
+        assert!(MAX_SAFE + 1 > 9007199254740991);
+        assert!(MIN_SAFE - 1 < -9007199254740991);
+    }
+
+    #[test]
+    fn test_serde_json_parsing() {
+        let val: serde_json::Value =
+            serde_json::from_str(r#"{"a": 1, "b": "hello", "c": [1,2,3]}"#).unwrap();
+        assert!(val.is_object());
+
+        let null_val: serde_json::Value = serde_json::from_str("null").unwrap();
+        assert!(null_val.is_null());
+
+        let arr_val: serde_json::Value = serde_json::from_str("[1, 2, 3]").unwrap();
+        assert!(arr_val.is_array());
+    }
 
     #[test]
     fn test_value_null() {

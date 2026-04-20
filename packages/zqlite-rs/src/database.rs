@@ -7,7 +7,7 @@ use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::statement::Statement;
-use crate::types::{get_column_names, set_sqlite_value};
+use crate::types::{get_column_names, set_sqlite_value, parse_column_types, row_to_typed_js_object};
 
 #[napi(object)]
 #[derive(Default)]
@@ -228,6 +228,147 @@ impl Database {
     #[napi(getter)]
     pub fn readonly(&self) -> bool {
         self.is_readonly
+    }
+
+    /// Execute a query and return all rows as a JS array of objects,
+    /// with column-type-aware conversion done entirely in Rust.
+    #[napi]
+    pub fn query_all(
+        &self,
+        env: Env,
+        sql: String,
+        params: JsObject,
+        column_types: JsObject,
+        table_name: String,
+    ) -> Result<JsObject> {
+        let conn = self.conn.borrow();
+        let col_types = parse_column_types(&env, &column_types)?;
+
+        // Get params array length
+        let params_len = params.get_array_length()?;
+        let sqlite_params =
+            crate::types::js_array_params_to_sqlite(&env, unsafe { params.raw() }, params_len)?;
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count = stmt.column_count();
+        let columns: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap().to_string())
+            .collect();
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            sqlite_params.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+        let mut rows_result = stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let mut js_rows: Vec<napi::sys::napi_value> = Vec::new();
+        while let Some(row) = rows_result
+            .next()
+            .map_err(|e| Error::from_reason(format!("{e}")))?
+        {
+            let js_obj = row_to_typed_js_object(&env, row, &columns, &col_types, &table_name)?;
+            js_rows.push(js_obj);
+        }
+
+        let mut arr = std::ptr::null_mut();
+        unsafe { napi::sys::napi_create_array_with_length(env.raw(), js_rows.len(), &mut arr) };
+        for (i, val) in js_rows.iter().enumerate() {
+            unsafe { napi::sys::napi_set_element(env.raw(), arr, i as u32, *val) };
+        }
+
+        Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), arr) })
+    }
+
+    /// Execute a query and return rows in batches (array of arrays).
+    #[napi]
+    pub fn query_batched(
+        &self,
+        env: Env,
+        sql: String,
+        params: JsObject,
+        column_types: JsObject,
+        table_name: String,
+        batch_size: u32,
+    ) -> Result<JsObject> {
+        let conn = self.conn.borrow();
+        let col_types = parse_column_types(&env, &column_types)?;
+
+        let params_len = params.get_array_length()?;
+        let sqlite_params =
+            crate::types::js_array_params_to_sqlite(&env, unsafe { params.raw() }, params_len)?;
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let col_count = stmt.column_count();
+        let columns: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap().to_string())
+            .collect();
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            sqlite_params.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+        let mut rows_result = stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+
+        let mut batches: Vec<napi::sys::napi_value> = Vec::new();
+        let mut current_batch: Vec<napi::sys::napi_value> = Vec::with_capacity(batch_size as usize);
+
+        while let Some(row) = rows_result
+            .next()
+            .map_err(|e| Error::from_reason(format!("{e}")))?
+        {
+            let js_obj = row_to_typed_js_object(&env, row, &columns, &col_types, &table_name)?;
+            current_batch.push(js_obj);
+
+            if current_batch.len() >= batch_size as usize {
+                // Flush batch to JS array
+                let mut batch_arr = std::ptr::null_mut();
+                unsafe {
+                    napi::sys::napi_create_array_with_length(
+                        env.raw(),
+                        current_batch.len(),
+                        &mut batch_arr,
+                    )
+                };
+                for (i, val) in current_batch.iter().enumerate() {
+                    unsafe { napi::sys::napi_set_element(env.raw(), batch_arr, i as u32, *val) };
+                }
+                batches.push(batch_arr);
+                current_batch.clear();
+            }
+        }
+
+        // Flush remaining rows
+        if !current_batch.is_empty() {
+            let mut batch_arr = std::ptr::null_mut();
+            unsafe {
+                napi::sys::napi_create_array_with_length(
+                    env.raw(),
+                    current_batch.len(),
+                    &mut batch_arr,
+                )
+            };
+            for (i, val) in current_batch.iter().enumerate() {
+                unsafe { napi::sys::napi_set_element(env.raw(), batch_arr, i as u32, *val) };
+            }
+            batches.push(batch_arr);
+        }
+
+        // Create outer array of batches
+        let mut result = std::ptr::null_mut();
+        unsafe { napi::sys::napi_create_array_with_length(env.raw(), batches.len(), &mut result) };
+        for (i, batch) in batches.iter().enumerate() {
+            unsafe { napi::sys::napi_set_element(env.raw(), result, i as u32, *batch) };
+        }
+
+        Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), result) })
     }
 
     pub(crate) fn get_conn(&self) -> Arc<RefCell<Connection>> {
