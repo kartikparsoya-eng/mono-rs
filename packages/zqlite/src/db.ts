@@ -257,6 +257,23 @@ export class Statement {
     return ret as T[];
   }
 
+  /**
+   * Get all rows as a binary buffer for fast JS decoding.
+   * Use for hot paths processing >100 rows.
+   * Decode with `decodeBuf(buf, columnNames)`.
+   */
+  allBuf(...params: unknown[]): Buffer {
+    const start = performance.now();
+    const ret = this.#stmt.allBuf(params);
+    logIfSlow(
+      this.#lc.withContext('method', 'allBuf'),
+      performance.now() - start,
+      {...this.#attrs, method: 'allBuf'},
+      this.#threshold,
+    );
+    return ret;
+  }
+
   iterate<T>(...params: unknown[]): IterableIterator<T> {
     return new LoggingIterableIterator(
       this.#lc.withContext('method', 'iterate'),
@@ -352,3 +369,68 @@ function logIfSlow(
  * more specific.
  */
 export class DatabaseInitError extends Error {}
+
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+const MIN_SAFE_INTEGER = -Number.MAX_SAFE_INTEGER;
+const textDecoder = new TextDecoder();
+
+/**
+ * Decode a binary buffer from Statement.allBuf() into an array of row objects.
+ * Protocol: [u32 row_count][u16 col_count] then per cell: [u8 tag][payload]
+ * Tags: 0=null, 1=i64(8 bytes LE), 2=f64(8 bytes LE), 3=text(u32 len + bytes), 4=blob(u32 len + bytes)
+ */
+export function decodeBuf<T = Record<string, unknown>>(
+  buf: Buffer,
+  columnNames: string[],
+): T[] {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const rowCount = view.getUint32(0, true);
+  const colCount = view.getUint16(4, true);
+  const rows: T[] = new Array(rowCount);
+  let offset = 6;
+
+  for (let r = 0; r < rowCount; r++) {
+    const row: Record<string, unknown> = {};
+    for (let c = 0; c < colCount; c++) {
+      const tag = buf[offset++];
+      switch (tag) {
+        case 0: // null
+          row[columnNames[c]] = null;
+          break;
+        case 1: { // i64
+          const lo = view.getUint32(offset, true);
+          const hi = view.getInt32(offset + 4, true);
+          const n = hi * 0x100000000 + lo;
+          // Return BigInt for values outside safe integer range
+          if (n >= MAX_SAFE_INTEGER || n <= MIN_SAFE_INTEGER) {
+            row[columnNames[c]] = view.getBigInt64(offset, true);
+          } else {
+            row[columnNames[c]] = n;
+          }
+          offset += 8;
+          break;
+        }
+        case 2: // f64
+          row[columnNames[c]] = view.getFloat64(offset, true);
+          offset += 8;
+          break;
+        case 3: { // text
+          const len = view.getUint32(offset, true);
+          offset += 4;
+          row[columnNames[c]] = textDecoder.decode(buf.subarray(offset, offset + len));
+          offset += len;
+          break;
+        }
+        case 4: { // blob
+          const len = view.getUint32(offset, true);
+          offset += 4;
+          row[columnNames[c]] = Buffer.from(buf.buffer, buf.byteOffset + offset, len);
+          offset += len;
+          break;
+        }
+      }
+    }
+    rows[r] = row as T;
+  }
+  return rows;
+}

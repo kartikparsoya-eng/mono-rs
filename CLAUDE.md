@@ -122,6 +122,18 @@ A performance-focused partial rewrite of the Zero sync engine's server-side comp
 - Logging via `LogContext` (warn for slow queries, error for failures)
 <!-- GSD:conventions-end -->
 
+## Row Fetching API Choice
+
+- `.allBuf()` + `decodeBuf()` — hot paths, bulk reads, table-source, snapshotter (>100 rows)
+- `.all()` — small result sets, admin queries, tests, inspect-handler
+- `Database.queryAll()` — typed hot path (boolean/json conversion in Rust), used by table-source `#queryAllTyped`
+
+Rule: if the call site is in a loop or processes >100 rows, use `.allBuf()` or `queryAll()`.
+
+Note: `queryAll()` already uses interned keys + resolved types in Rust. For table-source specifically,
+`queryAll()` is preferred because it handles schema type conversion (boolean, json) in a single FFI call.
+`.allBuf()` is raw (no type conversion) — use it where you'd otherwise call `.all()` on large result sets.
+
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
 ## Architecture
 
