@@ -1,9 +1,9 @@
 #![deny(clippy::all)]
 
-use napi_derive::napi;
+pub mod database;
+pub mod row_iterator;
+pub mod statement;
+mod types;
 
-/// Smoke-test export to verify napi-rs toolchain works
-#[napi]
-pub fn hello() -> String {
-    "zqlite-rs loaded".to_string()
-}
+// Re-exports happen automatically via #[napi] attribute.
+// napi-rs generates index.js and index.d.ts with all exported classes/functions.
