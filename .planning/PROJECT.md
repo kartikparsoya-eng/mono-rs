@@ -73,6 +73,17 @@ All SQLite I/O and row-level computation must happen in Rust, delivering 5-10x t
 | Keep TS for non-SQLite paths | Diminishing returns on rewriting protocol/auth/WebSocket | — Pending |
 | 3-phase approach (SQLite → IVM → CVR) | Follows dependency chain, biggest wins first | — Pending |
 
+## Current Milestone: v3.0 Test Coverage & Correctness Hardening
+
+**Goal:** Close all identified test gaps so the "Rust produces identical output" claim is production-grade.
+
+**Target features:**
+- NOT EXISTS support — extend delegate to pass existsType, integration tests
+- Complex join topology integration tests — end-to-end through rust_advance()
+- Data type diversity tests — JSON, nulls, Unicode, large numbers, booleans
+- Concurrent mutation tests — multiple pushes racing against rust_advance()
+- Intermediate edit semantics verification — validate add/remove/edit ordering
+
 ## Current State
 
 **Shipped**: v1.0 — Rust SQLite Foundation (2026-04-20)
@@ -80,9 +91,13 @@ All SQLite I/O and row-level computation must happen in Rust, delivering 5-10x t
 - Hot read path fully in Rust: db.ts → TableSource → Snapshotter
 - 46/46 zqlite + 10/10 snapshotter tests passing
 
-**Next**: v2.0 — Pipeline Driver Hot Path
-- Target: `pipeline-driver.ts#advance()` (lines 621-715)
-- Goal: Keep entire advance loop in Rust (SQLite reads + IVM iteration)
+**Shipped**: v2.0 — IVM Operators in Rust (2026-04-21)
+- Filter, Join, Take, Exists operators ported to Rust
+- Rayon parallelism for filter-only pipelines
+- 129 Rust tests + 6 TS edge case tests
+- 29/30 pipeline-driver tests passing (1 pre-existing upstream failure)
+
+**Next**: v3.0 — Test Coverage & Correctness Hardening
 
 ---
-*Last updated: 2026-04-20 after v1.0 milestone completion*
+*Last updated: 2026-04-21 after v3.0 milestone start*
