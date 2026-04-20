@@ -703,4 +703,292 @@ mod tests {
         let results = process_change_for_pipeline(&pipeline, &change);
         assert_eq!(results.len(), 0);
     }
+
+    // ─── Edge Case Tests: Diff Size Extremes ────────────────────────────────
+
+    #[test]
+    fn test_empty_diff() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let changes: Vec<Change> = vec![];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_single_row_diff() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "add");
+    }
+
+    #[test]
+    fn test_large_diff_1000_rows() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let changes: Vec<Change> = (0..1000)
+            .map(|i| {
+                let mut row = Row::new();
+                row.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                Change {
+                    table: "users".to_string(),
+                    prev_values: vec![],
+                    next_value: Some(row),
+                    row_key: serde_json::json!(format!("u{}", i)),
+                }
+            })
+            .collect();
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1000);
+    }
+
+    #[test]
+    fn test_all_noop_diff() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let changes: Vec<Change> = (0..5)
+            .map(|i| {
+                let mut row = Row::new();
+                row.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                row.insert("name".to_string(), serde_json::json!("same"));
+                let prev = row.clone();
+                Change {
+                    table: "users".to_string(),
+                    prev_values: vec![prev],
+                    next_value: Some(row),
+                    row_key: serde_json::json!(format!("u{}", i)),
+                }
+            })
+            .collect();
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 5);
+        for r in &results {
+            assert_eq!(r.change_type, "edit");
+        }
+    }
+
+    #[test]
+    fn test_large_diff_filtered() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+        };
+        let changes: Vec<Change> = (0..1000)
+            .map(|i| {
+                let mut row = Row::new();
+                row.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                row.insert("active".to_string(), serde_json::json!(i % 2 == 0));
+                Change {
+                    table: "users".to_string(),
+                    prev_values: vec![],
+                    next_value: Some(row),
+                    row_key: serde_json::json!(format!("u{}", i)),
+                }
+            })
+            .collect();
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 500);
+    }
+
+    // ─── Edge Case Tests: Data Types ────────────────────────────────────────
+
+    #[test]
+    fn test_null_value_in_row() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("name".to_string(), serde_json::Value::Null);
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "add");
+    }
+
+    #[test]
+    fn test_empty_string_value() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("name".to_string(), serde_json::json!(""));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "add");
+    }
+
+    #[test]
+    fn test_unicode_values() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("name".to_string(), serde_json::json!("\u{1F600}\u{4E16}\u{754C}"));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "add");
+        let name = results[0].row.as_ref().unwrap().get("name").unwrap();
+        assert_eq!(name.as_str().unwrap(), "\u{1F600}\u{4E16}\u{754C}");
+    }
+
+    #[test]
+    fn test_very_long_string() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let long_str = "a".repeat(100_000);
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("bio".to_string(), serde_json::json!(long_str));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        let bio = results[0].row.as_ref().unwrap().get("bio").unwrap();
+        assert_eq!(bio.as_str().unwrap().len(), 100_000);
+    }
+
+    #[test]
+    fn test_integer_value() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("age".to_string(), serde_json::json!(42));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        let age = results[0].row.as_ref().unwrap().get("age").unwrap();
+        assert_eq!(age.as_i64().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_real_value() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("score".to_string(), serde_json::json!(3.14159));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 1);
+        let score = results[0].row.as_ref().unwrap().get("score").unwrap();
+        assert!((score.as_f64().unwrap() - 3.14159).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_filter_with_null_field() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("active".to_string(), serde_json::Value::Null);
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_with_missing_field() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+        };
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        let changes = vec![Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!("u1"),
+        }];
+        let results = process_pipeline(&pipeline, &changes);
+        assert_eq!(results.len(), 0);
+    }
 }
