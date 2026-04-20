@@ -6,10 +6,13 @@
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
-    "name": "zqlite-rs",
-    "triples": {
-      "defaults": true
-    }
+    "binaryName": "zqlite-rs",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
   },
   "scripts": {
     "build": "napi build --release --platform",
