@@ -29,9 +29,9 @@ Incremental rewrite of zero-cache's performance-critical SQLite layer from TypeS
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: Scaffold napi-rs Rust crate (Cargo.toml, build config, npm package wrapper)
-- [ ] 01-02: Implement Database + Statement classes with rusqlite
-- [ ] 01-03: Wire up to existing tests, fix behavioral differences
+- [x] 01-01: Scaffold napi-rs Rust crate (Cargo.toml, build config, npm package wrapper)
+- [x] 01-02: Implement Database + Statement classes with rusqlite
+- [x] 01-03: Wire up to existing tests, fix behavioral differences
 
 ### Phase 2: StatementRunner
 **Goal**: Replace `statements.ts` with Rust StatementRunner, unlocking zero-cache module rewrites
