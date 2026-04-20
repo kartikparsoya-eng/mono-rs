@@ -17,7 +17,7 @@ pub enum Value {
 
 impl Value {
     /// Parse a serde_json::Value into our Value enum
-    fn from_json(v: &serde_json::Value) -> Self {
+    pub fn from_json(v: &serde_json::Value) -> Self {
         match v {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(*b),
