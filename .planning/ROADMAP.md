@@ -35,7 +35,12 @@ Depends on: v1.0 (zqlite-rs foundation)
 
 **Success criteria:** join.test.ts passes unchanged, pipeline-driver.test.ts passes unchanged
 
-**Progress:** Plan 1/2 complete (2026-04-20) — In Progress
+**Progress:** 2/2 plans complete (2026-04-20) — ✅ Complete
+
+**Plans:**
+2/2 plans complete
+- [x] **Plan 01** — Rust Join Utility Functions
+- [x] **Plan 02** — TS Integration + Delegate Wiring
 
 Depends on: Phase 10
 

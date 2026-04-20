@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: — IVM Operators in Rust
 status: executing
-stopped_at: Completed 11-01 Rust Join Utility Functions
-last_updated: "2026-04-20T16:58:02Z"
-last_activity: 2026-04-20 -- Phase 11 Plan 01 complete
+stopped_at: Completed 11-02 TS Integration + Delegate Wiring
+last_updated: "2026-04-20T17:04:43Z"
+last_activity: 2026-04-20 -- Phase 11 Plan 02 complete
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 5
-  completed_plans: 4
-  percent: 80
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 
 ## Current Position
 
-Phase: 11 (rust-join-operator) — EXECUTING
-Plan: 2 of 2 (Plan 01 complete)
-Status: Ready for Plan 02
-Last activity: 2026-04-20 -- Completed 11-01 Rust Join Utility Functions
+Phase: 11 (rust-join-operator) — COMPLETE
+Plan: 2 of 2 (all complete)
+Status: Phase 11 complete
+Last activity: 2026-04-20 -- Completed 11-02 TS Integration + Delegate Wiring
 
 Progress: [████████████████] 100%
 
@@ -50,9 +50,11 @@ All v1.0 decisions archived in `.planning/milestones/v1.0-ROADMAP.md`.
 - D-54: Join module reuses Value/compare_values from crate::filter (no duplication)
 - D-55: JSON string serialization at napi boundary for join functions
 - D-56: Batch napi function (rust_join_push_child_batch) eliminates N FFI round-trips
+- D-57: rust-join.ts placed in view-syncer/ (plan's dispatcher/ path does not exist)
+- D-58: Full join hot-path interception deferred — requires BuilderDelegate.createJoin extension
 
 ## Session Continuity
 
-Last session: 2026-04-20T16:58:02Z
-Stopped at: Completed 11-01 Rust Join Utility Functions
-Resume: Plan 11-02 — TS integration wrapper for Rust join functions
+Last session: 2026-04-20T17:04:43Z
+Stopped at: Completed 11-02 TS Integration + Delegate Wiring
+Resume: Phase 12 — Rust Exists Operator
