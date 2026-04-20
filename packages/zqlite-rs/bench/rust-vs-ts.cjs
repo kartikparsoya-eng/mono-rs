@@ -14,7 +14,7 @@ const fs = require('node:fs');
 
 // ── Load both backends ──
 // Old: better-sqlite3 (what @rocicorp/zero-sqlite3 wraps)
-const BetterSqlite3 = require('better-sqlite3');
+const BetterSqlite3 = require('@rocicorp/zero-sqlite3');
 // New: Rust zqlite-rs
 const { Database: RustDatabase } = require(path.resolve(__dirname, '../index.js'));
 

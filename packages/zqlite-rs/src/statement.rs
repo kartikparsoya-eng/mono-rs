@@ -2,18 +2,19 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi::{Env, JsObject, NapiRaw};
+use napi::{Env, JsObject, NapiRaw, NapiValue};
 use napi_derive::napi;
 use rusqlite::Connection;
 
 use crate::row_iterator::RowIterator;
-use crate::types::{get_column_names, js_array_params_to_sqlite, row_to_js_object};
+use crate::types::{get_column_names, intern_column_keys, js_array_params_to_sqlite, row_to_js_object, row_to_js_object_fast};
 
 #[napi]
 pub struct Statement {
     conn: Arc<RefCell<Connection>>,
     sql: String,
     safe_integers: bool,
+    cached_columns: RefCell<Option<Vec<String>>>,
 }
 
 #[napi]
@@ -78,7 +79,8 @@ impl Statement {
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
 
-        let columns = get_column_names(&stmt);
+        let columns = self.get_columns(&stmt);
+        let interned_keys = intern_column_keys(&env, &columns)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
@@ -90,8 +92,8 @@ impl Statement {
 
         match rows.next().map_err(|e| Error::from_reason(format!("{e}")))? {
             Some(row) => {
-                let obj = row_to_js_object(&env, row, &columns, self.safe_integers)?;
-                Ok(Some(obj))
+                let raw = row_to_js_object_fast(&env, row, &interned_keys, self.safe_integers)?;
+                Ok(Some(unsafe { JsObject::from_raw_unchecked(env.raw(), raw) }))
             }
             None => Ok(None),
         }
@@ -99,14 +101,15 @@ impl Statement {
 
     /// Get all rows as an array of objects.
     #[napi]
-    pub fn all(&self, env: Env, params: JsObject) -> Result<Vec<JsObject>> {
+    pub fn all(&self, env: Env, params: JsObject) -> Result<JsObject> {
         let values = extract_params(&env, &params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
 
-        let columns = get_column_names(&stmt);
+        let columns = self.get_columns(&stmt);
+        let interned_keys = intern_column_keys(&env, &columns)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
@@ -116,13 +119,80 @@ impl Statement {
             .query(params_ref.as_slice())
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
 
-        let mut result = Vec::new();
+        // Build JS array directly using raw napi for minimal overhead
+        let mut result_arr = std::ptr::null_mut();
+        unsafe { napi::sys::napi_create_array(env.raw(), &mut result_arr) };
+
+        let mut idx: u32 = 0;
         while let Some(row) = rows.next().map_err(|e| Error::from_reason(format!("{e}")))? {
-            let obj = row_to_js_object(&env, row, &columns, self.safe_integers)?;
-            result.push(obj);
+            let obj = row_to_js_object_fast(&env, row, &interned_keys, self.safe_integers)?;
+            unsafe { napi::sys::napi_set_element(env.raw(), result_arr, idx, obj) };
+            idx += 1;
         }
 
-        Ok(result)
+        Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), result_arr) })
+    }
+
+    /// Get all rows as a binary buffer for fast JS decoding.
+    /// Protocol: [u32 row_count][u16 col_count] then per cell: [u8 tag][payload]
+    /// Tags: 0=null, 1=i64(8 bytes LE), 2=f64(8 bytes LE), 3=text(u32 len + bytes), 4=blob(u32 len + bytes)
+    #[napi]
+    pub fn all_buf(&self, env: Env, params: JsObject) -> Result<Buffer> {
+        let values = extract_params(&env, &params)?;
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare_cached(&self.sql)
+            .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+
+        let col_count = stmt.column_count();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let mut rows = stmt
+            .query(params_ref.as_slice())
+            .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+
+        // Pre-allocate buffer (estimate 64 bytes per cell)
+        let mut buf: Vec<u8> = Vec::with_capacity(col_count * 64 * 32);
+        // Reserve space for header (row_count u32 + col_count u16)
+        buf.extend_from_slice(&[0u8; 6]);
+
+        let mut row_count: u32 = 0;
+        while let Some(row) = rows.next().map_err(|e| Error::from_reason(format!("{e}")))? {
+            for i in 0..col_count {
+                let val = row.get_ref(i).map_err(|e| Error::from_reason(format!("{e}")))?;
+                match val {
+                    rusqlite::types::ValueRef::Null => buf.push(0),
+                    rusqlite::types::ValueRef::Integer(n) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Real(f) => {
+                        buf.push(2);
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
+                    rusqlite::types::ValueRef::Text(s) => {
+                        buf.push(3);
+                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(s);
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        buf.push(4);
+                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                }
+            }
+            row_count += 1;
+        }
+
+        // Write header
+        buf[0..4].copy_from_slice(&row_count.to_le_bytes());
+        buf[4..6].copy_from_slice(&(col_count as u16).to_le_bytes());
+
+        Ok(Buffer::from(buf))
     }
 
     /// Create a lazy row iterator. Materializes all rows in Rust, converts lazily to JS.
@@ -134,7 +204,7 @@ impl Statement {
             .prepare_cached(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
 
-        let columns = get_column_names(&stmt);
+        let columns = self.get_columns(&stmt);
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
@@ -204,6 +274,19 @@ impl Statement {
             conn,
             sql,
             safe_integers: false,
+            cached_columns: RefCell::new(None),
+        }
+    }
+
+    /// Get or compute cached column names.
+    fn get_columns(&self, stmt: &rusqlite::Statement) -> Vec<String> {
+        let mut cache = self.cached_columns.borrow_mut();
+        if let Some(cols) = cache.as_ref() {
+            cols.clone()
+        } else {
+            let cols = get_column_names(stmt);
+            *cache = Some(cols.clone());
+            cols
         }
     }
 }

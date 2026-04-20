@@ -7,7 +7,7 @@ use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::statement::Statement;
-use crate::types::{get_column_names, set_sqlite_value, parse_column_types, row_to_typed_js_object};
+use crate::types::{get_column_names, set_sqlite_value, parse_column_types, row_to_typed_js_object, intern_column_keys, resolve_column_types};
 
 #[napi(object)]
 #[derive(Default)]
@@ -266,11 +266,13 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         let mut js_rows: Vec<napi::sys::napi_value> = Vec::new();
+        let interned_keys = intern_column_keys(&env, &columns)?;
+        let resolved_types = resolve_column_types(&columns, &col_types);
         while let Some(row) = rows_result
             .next()
             .map_err(|e| Error::from_reason(format!("{e}")))?
         {
-            let js_obj = row_to_typed_js_object(&env, row, &columns, &col_types, &table_name)?;
+            let js_obj = row_to_typed_js_object(&env, row, &interned_keys, &resolved_types, &table_name, &columns)?;
             js_rows.push(js_obj);
         }
 
@@ -319,12 +321,14 @@ impl Database {
 
         let mut batches: Vec<napi::sys::napi_value> = Vec::new();
         let mut current_batch: Vec<napi::sys::napi_value> = Vec::with_capacity(batch_size as usize);
+        let interned_keys = intern_column_keys(&env, &columns)?;
+        let resolved_types = resolve_column_types(&columns, &col_types);
 
         while let Some(row) = rows_result
             .next()
             .map_err(|e| Error::from_reason(format!("{e}")))?
         {
-            let js_obj = row_to_typed_js_object(&env, row, &columns, &col_types, &table_name)?;
+            let js_obj = row_to_typed_js_object(&env, row, &interned_keys, &resolved_types, &table_name, &columns)?;
             current_batch.push(js_obj);
 
             if current_batch.len() >= batch_size as usize {

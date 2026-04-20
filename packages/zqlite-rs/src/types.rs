@@ -99,22 +99,20 @@ pub fn serde_json_to_js(env: &Env, value: &serde_json::Value) -> Result<napi::sy
 
 /// Convert a rusqlite Row to a raw JS object with column-type-aware conversion.
 /// This is the hot-path function used by query_all/query_batched.
+/// Uses pre-interned keys and pre-resolved column types for maximum performance.
 pub fn row_to_typed_js_object(
     env: &Env,
     row: &rusqlite::Row,
-    columns: &[std::string::String],
-    column_types: &[(std::string::String, ColumnType)],
+    interned_keys: &[napi::sys::napi_value],
+    resolved_types: &[ColumnType],
     table_name: &str,
+    columns: &[std::string::String],
 ) -> Result<napi::sys::napi_value> {
     let mut obj = std::ptr::null_mut();
     unsafe { napi::sys::napi_create_object(env.raw(), &mut obj) };
 
-    for (i, col_name) in columns.iter().enumerate() {
-        let col_type = column_types
-            .iter()
-            .find(|(name, _)| name == col_name)
-            .map(|(_, t)| *t)
-            .unwrap_or(ColumnType::String);
+    for (i, &key) in interned_keys.iter().enumerate() {
+        let col_type = resolved_types[i];
 
         let raw_value = row
             .get_ref(i)
@@ -138,7 +136,7 @@ pub fn row_to_typed_js_object(
                     if n > MAX_SAFE || n < MIN_SAFE {
                         return Err(Error::from_reason(format!(
                             "value {} (in {}.{}) is outside of supported bounds",
-                            n, table_name, col_name
+                            n, table_name, &columns[i]
                         )));
                     }
                     let mut v = std::ptr::null_mut();
@@ -164,7 +162,7 @@ pub fn row_to_typed_js_object(
                         let parsed: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                             Error::from_reason(format!(
                                 "invalid json value for column {}:RAW:{}",
-                                col_name, s
+                                &columns[i], s
                             ))
                         })?;
                         serde_json_to_js(env, &parsed)?
@@ -199,11 +197,27 @@ pub fn row_to_typed_js_object(
             }
         };
 
-        let key_cstr = std::ffi::CString::new(col_name.as_str()).unwrap();
-        unsafe { napi::sys::napi_set_named_property(env.raw(), obj, key_cstr.as_ptr(), js_val) };
+        unsafe { napi::sys::napi_set_property(env.raw(), obj, key, js_val) };
     }
 
     Ok(obj)
+}
+
+/// Pre-resolve column types into a flat Vec indexed by column position.
+pub fn resolve_column_types(
+    columns: &[std::string::String],
+    column_types: &[(std::string::String, ColumnType)],
+) -> Vec<ColumnType> {
+    columns
+        .iter()
+        .map(|col_name| {
+            column_types
+                .iter()
+                .find(|(name, _)| name == col_name)
+                .map(|(_, t)| *t)
+                .unwrap_or(ColumnType::String)
+        })
+        .collect()
 }
 
 /// Set a SQLite value as a named property on a JsObject.
@@ -376,7 +390,111 @@ pub fn napi_value_to_sqlite_param(env: &Env, raw: napi::sys::napi_value) -> Resu
     }
 }
 
-/// Convert a rusqlite Row to a JS object with column names as keys.
+/// Pre-intern column names as JS string napi_values for reuse across rows.
+pub fn intern_column_keys(env: &Env, columns: &[String]) -> Result<Vec<napi::sys::napi_value>> {
+    let mut keys = Vec::with_capacity(columns.len());
+    for col in columns {
+        let mut key = std::ptr::null_mut();
+        let status = unsafe {
+            napi::sys::napi_create_string_utf8(
+                env.raw(),
+                col.as_ptr() as *const i8,
+                col.len() as isize,
+                &mut key,
+            )
+        };
+        if status != 0 {
+            return Err(Error::from_reason(format!("Failed to intern key: {col}")));
+        }
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+/// Convert a rusqlite Row to a raw JS object using pre-interned keys.
+/// This is the fast path — no CString allocation, no high-level wrappers.
+pub fn row_to_js_object_fast(
+    env: &Env,
+    row: &Row,
+    interned_keys: &[napi::sys::napi_value],
+    safe_integers: bool,
+) -> Result<napi::sys::napi_value> {
+    let mut obj = std::ptr::null_mut();
+    unsafe { napi::sys::napi_create_object(env.raw(), &mut obj) };
+
+    for (i, &key) in interned_keys.iter().enumerate() {
+        let val = row
+            .get_ref(i)
+            .map_err(|e| Error::from_reason(format!("Failed to get column {i}: {e}")))?;
+
+        let js_val = sqlite_value_to_raw_napi(env, val, safe_integers)?;
+        unsafe { napi::sys::napi_set_property(env.raw(), obj, key, js_val) };
+    }
+
+    Ok(obj)
+}
+
+/// Convert a SQLite ValueRef to a raw napi_value without high-level wrappers.
+fn sqlite_value_to_raw_napi(
+    env: &Env,
+    val: ValueRef,
+    safe_integers: bool,
+) -> Result<napi::sys::napi_value> {
+    let mut v = std::ptr::null_mut();
+    match val {
+        ValueRef::Null => {
+            unsafe { napi::sys::napi_get_null(env.raw(), &mut v) };
+        }
+        ValueRef::Integer(i) => {
+            if safe_integers && (i >= 9_007_199_254_740_991 || i <= -9_007_199_254_740_991) {
+                let mut words = [0u64; 1];
+                let (sign, magnitude) = if i < 0 { (1, (-i) as u64) } else { (0, i as u64) };
+                words[0] = magnitude;
+                unsafe {
+                    napi::sys::napi_create_bigint_words(
+                        env.raw(),
+                        sign,
+                        1,
+                        words.as_ptr(),
+                        &mut v,
+                    )
+                };
+            } else {
+                unsafe { napi::sys::napi_create_double(env.raw(), i as f64, &mut v) };
+            }
+        }
+        ValueRef::Real(f) => {
+            unsafe { napi::sys::napi_create_double(env.raw(), f, &mut v) };
+        }
+        ValueRef::Text(s) => {
+            let s = std::str::from_utf8(s)
+                .map_err(|e| Error::from_reason(format!("Invalid UTF-8: {e}")))?;
+            unsafe {
+                napi::sys::napi_create_string_utf8(
+                    env.raw(),
+                    s.as_ptr() as *const i8,
+                    s.len() as isize,
+                    &mut v,
+                )
+            };
+        }
+        ValueRef::Blob(b) => {
+            let mut data_ptr = std::ptr::null_mut();
+            unsafe {
+                napi::sys::napi_create_buffer_copy(
+                    env.raw(),
+                    b.len(),
+                    b.as_ptr() as *const _,
+                    &mut data_ptr,
+                    &mut v,
+                )
+            };
+        }
+    }
+    Ok(v)
+}
+
+/// Convert a rusqlite Row to a JS object with column names as keys (legacy, uses high-level API).
 pub fn row_to_js_object(
     env: &Env,
     row: &Row,
