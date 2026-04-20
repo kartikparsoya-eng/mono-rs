@@ -66,11 +66,10 @@ Plans:
   3. Snapshotter Diff iterator keeps all SQLite queries in Rust (no per-change FFI crossing)
   4. NULL-safe multi-key OR lookups work without 320x regression
   5. BEGIN CONCURRENT snapshot isolation works correctly
-**Plans**: 2 plans
+**Plans**: 1 plan (D-15: ChangeProcessor stays TS)
 
 Plans:
-- [ ] 05-01: Implement Rust Snapshotter (Diff iterator, BEGIN CONCURRENT, snapshot comparison)
-- [ ] 05-02: Implement Rust ChangeProcessor (CDC write path, PG change -> SQLite ops)
+- [ ] 05-01: Rust Snapshotter read methods (getRow, getRowsBuf, changesSinceBuf) + snapshotter.ts integration
 
 ### Phase 6: Bulk Loader
 **Goal**: Replace initial-sync with Rust bulk loader for fast initial data population
@@ -105,6 +104,6 @@ Plans:
 | 2. StatementRunner | 0/0 | Skipped (D-08) | 2026-04-20 |
 | 3. IVM Data Layer | 2/2 | Complete | 2026-04-20 |
 | 4. Schema Modules | 0/0 | Skipped (D-14) | 2026-04-20 |
-| 5. High-Impact Services | 0/2 | Not started | - |
+| 5. High-Impact Services | 0/1 | Planned | - |
 | 6. Bulk Loader | 0/1 | Not started | - |
 | 7. Benchmarks & Validation | 0/1 | Not started | - |
