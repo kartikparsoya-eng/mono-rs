@@ -76,3 +76,18 @@ Depends on: Phase 12
 **Goal:** End-to-end validation, performance regression suite, documentation.
 
 Depends on: Phase 13
+
+### Phase 15: Rust Advance Correctness + Cleanup
+
+**Goal:** Fix edit semantics mismatch (INT-01) and remove dead code from advance.rs.
+
+**Gap Closure:** Closes INT-01 from v2.0-MILESTONE-AUDIT.md
+
+**Tasks:**
+1. Fix `process_change_for_pipeline` to match prev row by PK equality instead of positional `prev_values[0]`
+2. Remove dead `Operator::Join/Take/Exists` variants from advance.rs (or replace with `unreachable!()`)
+3. Fix env var edge case test to use `vi.resetModules()` for proper module reload isolation
+
+**Success criteria:** All existing tests pass, INT-01 resolved, no dead code in advance.rs
+
+Depends on: Phase 14
