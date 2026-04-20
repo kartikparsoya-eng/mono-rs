@@ -11,7 +11,7 @@ Incremental rewrite of zero-cache's performance-critical SQLite layer from TypeS
 - [x] **Phase 3: IVM Data Layer** - TableSource + DatabaseStorage in Rust
 - [x] **Phase 4: Schema Modules** - SKIPPED (D-14: already Rust-backed via Phase 1, write-heavy/cold-path)
 - [x] **Phase 5: High-Impact Services** - Snapshotter + ChangeProcessor in Rust
-- [ ] **Phase 6: Bulk Loader** - initial-sync in Rust
+- [x] **Phase 6: Bulk Loader** - SKIPPED (D-19: napi overhead 0.4% < 5% threshold)
 - [ ] **Phase 7: Benchmarks & Validation** - Comparative A/B benchmarks
 
 ## Phase Details
