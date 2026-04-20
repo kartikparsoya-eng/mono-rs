@@ -1,10 +1,10 @@
 import {trace, type Attributes} from '@opentelemetry/api';
 import type {LogContext} from '@rocicorp/logger';
-import SQLite3Database, {
-  SqliteError,
-  type RunResult,
-  type Statement as SQLite3Statement,
-} from '@rocicorp/zero-sqlite3';
+import {
+  Database as RustDatabase,
+  type Statement as RustStatement,
+  type RowIterator as RustRowIterator,
+} from 'zqlite-rs';
 import {manualSpan} from '../../otel/src/span.ts';
 import {version} from '../../otel/src/version.ts';
 
@@ -19,8 +19,15 @@ function mb(bytes: number): string {
   return (bytes / MB).toFixed(2);
 }
 
+export class SqliteError extends Error {
+  override name = 'SqliteError';
+  code?: string;
+}
+
+export type RunResult = {changes: number; lastInsertRowid: number | bigint};
+
 export class Database implements Disposable {
-  readonly #db: SQLite3Database.Database;
+  readonly #db: RustDatabase;
   readonly #threshold: number;
   readonly #lc: LogContext;
   readonly #pageSize: number;
@@ -28,12 +35,12 @@ export class Database implements Disposable {
   constructor(
     lc: LogContext,
     path: string,
-    options?: SQLite3Database.Options,
+    options?: {readonly?: boolean; fileMustExist?: boolean},
     slowQueryThreshold = 100,
   ) {
     try {
       this.#lc = lc.withContext('class', 'Database').withContext('path', path);
-      this.#db = new SQLite3Database(path, options);
+      this.#db = new RustDatabase(path, options);
       this.#threshold = slowQueryThreshold;
 
       const [{page_size: pageSize}] = this.pragma<{page_size: number}>(
@@ -121,8 +128,12 @@ export class Database implements Disposable {
     try {
       return fn();
     } catch (e) {
-      if (e instanceof SqliteError) {
-        e.message += `: ${sql}`;
+      if (e instanceof Error) {
+        // Strip rusqlite's " in ... at offset N" suffix to match better-sqlite3 format
+        const msg = e.message.replace(/ in .+ at offset \d+$/, '');
+        const sqliteErr = new SqliteError(`${msg}: ${sql}`);
+        sqliteErr.stack = e.stack;
+        throw sqliteErr;
       }
       throw e;
     } finally {
@@ -152,7 +163,7 @@ export class Database implements Disposable {
   }
 
   transaction<T>(fn: () => T): T {
-    return this.#db.transaction(fn)();
+    return this.#db.transaction(fn) as T;
   }
 
   get name() {
@@ -169,25 +180,25 @@ export class Database implements Disposable {
 }
 
 export class Statement {
-  readonly #stmt: SQLite3Statement;
+  readonly #stmt: RustStatement;
   readonly #lc: LogContext;
   readonly #threshold: number;
   readonly #attrs: Attributes;
-  readonly scanStatus: SQLite3Statement['scanStatusV2'];
-  readonly scanStatusReset: SQLite3Statement['scanStatusReset'];
+
+  // Stubs for scanStatusV2/scanStatusReset (used by table-source.ts, not needed for Phase 1)
+  readonly scanStatus: (...args: unknown[]) => unknown = () => undefined;
+  readonly scanStatusReset: () => void = () => {};
 
   constructor(
     lc: LogContext,
     attrs: Attributes,
-    stmt: SQLite3Statement,
+    stmt: RustStatement,
     threshold: number,
   ) {
     this.#lc = lc.withContext('class', 'Statement');
     this.#attrs = attrs;
     this.#stmt = stmt;
     this.#threshold = threshold;
-    this.scanStatus = this.#stmt.scanStatusV2.bind(this.#stmt);
-    this.scanStatusReset = this.#stmt.scanStatusReset.bind(this.#stmt);
   }
 
   safeIntegers(useBigInt: boolean): this {
@@ -197,19 +208,19 @@ export class Statement {
 
   run(...params: unknown[]): RunResult {
     const start = performance.now();
-    const ret = this.#stmt.run(...params);
+    const ret = this.#stmt.run(params);
     logIfSlow(
       this.#lc.withContext('method', 'run'),
       performance.now() - start,
       {...this.#attrs, method: 'run'},
       this.#threshold,
     );
-    return ret;
+    return ret as RunResult;
   }
 
   get<T>(...params: unknown[]): T {
     const start = performance.now();
-    const ret = this.#stmt.get(...params);
+    const ret = this.#stmt.get(params);
     logIfSlow(
       this.#lc.withContext('method', 'get'),
       performance.now() - start,
@@ -221,7 +232,7 @@ export class Statement {
 
   all<T>(...params: unknown[]): T[] {
     const start = performance.now();
-    const ret = this.#stmt.all(...params);
+    const ret = this.#stmt.all(params);
     logIfSlow(
       this.#lc.withContext('method', 'all'),
       performance.now() - start,
@@ -235,7 +246,7 @@ export class Statement {
     return new LoggingIterableIterator(
       this.#lc.withContext('method', 'iterate'),
       this.#attrs,
-      this.#stmt.iterate(...params),
+      this.#stmt.iterate(params),
       this.#threshold,
     ) as IterableIterator<T>;
   }
@@ -243,7 +254,7 @@ export class Statement {
 
 class LoggingIterableIterator<T> implements IterableIterator<T> {
   readonly #lc: LogContext;
-  readonly #it: IterableIterator<T>;
+  readonly #it: RustRowIterator;
   readonly #threshold: number;
   readonly #attrs: Attributes;
   #start: number;
@@ -252,7 +263,7 @@ class LoggingIterableIterator<T> implements IterableIterator<T> {
   constructor(
     lc: LogContext,
     attrs: Attributes,
-    it: IterableIterator<T>,
+    it: RustRowIterator,
     slowQueryThreshold: number,
   ) {
     this.#lc = lc;
@@ -265,7 +276,7 @@ class LoggingIterableIterator<T> implements IterableIterator<T> {
 
   next(): IteratorResult<T> {
     const start = performance.now();
-    const ret = this.#it.next();
+    const ret = this.#it.next() as IteratorResult<T>;
     const elapsed = performance.now() - start;
     this.#sqliteRowTimeSum += elapsed;
     if (ret.done) {
@@ -296,13 +307,12 @@ class LoggingIterableIterator<T> implements IterableIterator<T> {
   return(): IteratorResult<T> {
     this.#log();
     // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    return this.#it.return?.() as any;
+    return this.#it.return() as any;
   }
 
   throw(e: unknown): IteratorResult<T> {
     this.#log();
-    // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    return this.#it.throw?.(e) as any;
+    return {done: true, value: undefined} as IteratorResult<T>;
   }
 }
 

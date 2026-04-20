@@ -68,7 +68,7 @@ impl Database {
         self.conn
             .borrow()
             .execute_batch(&sql)
-            .map_err(|e| Error::from_reason(format!("{e}: {sql}")))
+            .map_err(|e| Error::from_reason(format!("{e}")))
     }
 
     #[napi]
@@ -77,7 +77,7 @@ impl Database {
         let full_sql = format!("PRAGMA {sql}");
         let mut stmt = conn
             .prepare(&full_sql)
-            .map_err(|e| Error::from_reason(format!("{e}: PRAGMA {sql}")))?;
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         let columns = get_column_names(&stmt);
         let mut rows_out = Vec::new();
@@ -88,7 +88,7 @@ impl Database {
                     .map(|i| row.get::<_, rusqlite::types::Value>(i))
                     .collect::<std::result::Result<Vec<_>, _>>())
             })
-            .map_err(|e| Error::from_reason(format!("{e}: PRAGMA {sql}")))?;
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         for row_result in rows {
             let values = row_result
@@ -110,17 +110,14 @@ impl Database {
         {
             let conn = self.conn.borrow();
             conn.prepare(&sql)
-                .map_err(|e| Error::from_reason(format!("{e}: {sql}")))?;
+                .map_err(|e| Error::from_reason(format!("{e}")))?;
         }
         Ok(Statement::new_internal(self.conn.clone(), sql))
     }
 
     #[napi]
     pub fn close(&self) -> Result<()> {
-        if !self.is_readonly {
-            let conn = self.conn.borrow();
-            let _ = conn.execute_batch("PRAGMA optimize");
-        }
+        // Optimize is handled by the TS wrapper for logging purposes
         Ok(())
     }
 

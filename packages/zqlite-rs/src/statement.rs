@@ -33,15 +33,25 @@ impl Statement {
         let conn = self.conn.borrow();
         let mut stmt = conn
             .prepare_cached(&self.sql)
-            .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
 
-        stmt.execute(params_ref.as_slice())
-            .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
+        // Use query + drain to match better-sqlite3 behavior (run() works on SELECT too)
+        match stmt.execute(params_ref.as_slice()) {
+            Ok(_) => {}
+            Err(rusqlite::Error::ExecuteReturnedResults) => {
+                // SELECT statements — just drain the rows
+                let mut rows = stmt
+                    .query(params_ref.as_slice())
+                    .map_err(|e| Error::from_reason(format!("{e}")))?;
+                while let Some(_) = rows.next().map_err(|e| Error::from_reason(format!("{e}")))? {}
+            }
+            Err(e) => return Err(Error::from_reason(format!("{e}"))),
+        }
 
         let changes = conn.changes() as f64;
         let last_insert_rowid = conn.last_insert_rowid();
