@@ -41,9 +41,13 @@ import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts
 import {RustStorage} from '../../../../zero-ivm-rs/index.js';
 import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
 import {isRustJoinAvailable} from './rust-join.ts';
+import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
+import type {FilterOperator} from '../../../../zql/src/ivm/filter-operators.ts';
 
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
+const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
+const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
 import {
   reloadPermissionsIfChanged,
@@ -203,6 +207,9 @@ export class PipelineDriver {
     this.#initAndResetCommon(clientSchema);
     if (this.#rustJoinAvailable) {
       this.#lc.debug?.('Rust join acceleration available');
+    }
+    if (USE_RUST_EXISTS) {
+      this.#lc.debug?.('Rust exists acceleration available');
     }
   }
 
@@ -458,7 +465,25 @@ export class PipelineDriver {
             ),
           decorateInput: input => input,
           addEdge() {},
-          decorateFilterInput: input => input,
+          decorateFilterInput: (input, name) => {
+            if (USE_RUST_EXISTS && name.includes(':exists(')) {
+              const match = name.match(RUST_EXISTS_NAME_RE);
+              if (match) {
+                const relationshipName = match[1];
+                const schema = input.getSchema();
+                const rel = schema.relationships[relationshipName];
+                if (rel) {
+                  return createRustExistsWrapper(
+                    input as FilterOperator,
+                    relationshipName,
+                    rel.correlation.parentField,
+                    'EXISTS',
+                  );
+                }
+              }
+            }
+            return input;
+          },
         },
         queryID,
         costModel,
