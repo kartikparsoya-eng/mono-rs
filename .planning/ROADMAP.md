@@ -6,8 +6,8 @@ Incremental rewrite of zero-cache's performance-critical SQLite layer from TypeS
 
 ## Phases
 
-- [ ] **Phase 1: Rust Foundation** - napi-rs module with Database + Statement + statement cache
-- [ ] **Phase 2: StatementRunner** - Parameterized query runner for zero-cache
+- [x] **Phase 1: Rust Foundation** - napi-rs module with Database + Statement + statement cache
+- [x] **Phase 2: StatementRunner** - SKIPPED (D-08: stays TS, pure delegation layer)
 - [ ] **Phase 3: IVM Data Layer** - TableSource + DatabaseStorage in Rust
 - [ ] **Phase 4: Schema Modules** - change-log, column-metadata, table-metadata, replication-state
 - [ ] **Phase 5: High-Impact Services** - Snapshotter + ChangeProcessor in Rust
@@ -33,17 +33,9 @@ Plans:
 - [x] 01-02: Implement Database + Statement classes with rusqlite
 - [x] 01-03: Wire up to existing tests, fix behavioral differences
 
-### Phase 2: StatementRunner
-**Goal**: Replace `statements.ts` with Rust StatementRunner, unlocking zero-cache module rewrites
-**Depends on**: Phase 1
-**Requirements**: FOUND-04, TEST-01
-**Success Criteria** (what must be TRUE):
-  1. `packages/zero-cache/src/db/statements.test.ts` passes with Rust StatementRunner
-  2. Parameterized queries and batch operations work identically to TS version
-**Plans**: 1 plan
-
-Plans:
-- [ ] 02-01: Implement StatementRunner in Rust, swap imports, validate tests
+### Phase 2: StatementRunner — SKIPPED
+**Decision**: D-08 — StatementRunner stays in TypeScript. It's 70 lines of pure delegation with no performance gain from Rust rewrite. Real wins come from Phases 3-6 where entire hot loops stay in Rust.
+**Status**: Skipped
 
 ### Phase 3: IVM Data Layer
 **Goal**: Replace TableSource and DatabaseStorage with Rust implementations, eliminating per-row Object.fromEntries overhead
@@ -117,8 +109,8 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Rust Foundation | 0/3 | Not started | - |
-| 2. StatementRunner | 0/1 | Not started | - |
+| 1. Rust Foundation | 3/3 | Complete | 2026-04-20 |
+| 2. StatementRunner | 0/0 | Skipped (D-08) | 2026-04-20 |
 | 3. IVM Data Layer | 0/2 | Not started | - |
 | 4. Schema Modules | 0/1 | Not started | - |
 | 5. High-Impact Services | 0/2 | Not started | - |
