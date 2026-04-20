@@ -419,6 +419,80 @@ section('Realistic workloads');
   old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
 }
 
+// ── 12b. View-syncer diff simulation (D-22: composite hot path) ──
+// Simulates a full snapshotter diff cycle: changesSinceBuf → getRowsMultiBuf → decode
+// Uses 1000 changes across 5 tables to simulate realistic multi-table sync
+section('View-syncer diff simulation (composite)');
+{
+  const p1 = tmpDb('old-vs'), p2 = tmpDb('new-vs');
+  const old = setupOld(p1), neo = setupNew(p2);
+
+  const tables = ['users', 'issues', 'comments', 'labels', 'reactions'];
+  for (const t of tables) {
+    old.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`);
+    neo.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`);
+  }
+  old.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
+  neo.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
+
+  // Seed 1000 rows across 5 tables + 1000 changelog entries
+  const insOld = {};
+  for (const t of tables) insOld[t] = old.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
+  const insClOld = old.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  old.transaction(() => {
+    for (let i = 0; i < 1000; i++) {
+      const t = tables[i % 5];
+      insOld[t].run(i, `data-${i}-${'x'.repeat(50)}`, `extra-${i}`, '10');
+      insClOld.run('10', i, t, `{"id":${i}}`, 's');
+    }
+  })();
+
+  const insNew = {};
+  for (const t of tables) insNew[t] = neo.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
+  const insClNew = neo.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  neo.exec('BEGIN');
+  for (let i = 0; i < 1000; i++) {
+    const t = tables[i % 5];
+    insNew[t].run([i, `data-${i}-${'x'.repeat(50)}`, `extra-${i}`, '10']);
+    insClNew.run(['10', i, t, `{"id":${i}}`, 's']);
+  }
+  neo.exec('COMMIT');
+
+  const clColNames = ['stateVersion', 'table', 'rowKey', 'op'];
+  const dataColNames = ['id', 'data', 'extra', '_0_version'];
+  const clStmt = old.prepare('SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?');
+  const getStmts = {};
+  for (const t of tables) getStmts[t] = old.prepare(`SELECT * FROM ${t} WHERE id = ?`);
+  const getRowSqls = {};
+  for (const t of tables) getRowSqls[t] = `SELECT * FROM ${t} WHERE id = ?`;
+
+  // TS path: changeLog query + per-row getRow
+  results.push(bench('vsDiff(1K)     [sqlite3]', () => {
+    const changes = clStmt.all('00', 1000, 0);
+    for (const c of changes) {
+      const key = JSON.parse(c.rowKey);
+      getStmts[c.table].get(key.id);
+    }
+  }, 500));
+
+  // Rust path: changesSinceBuf + getRowsMultiBuf (batched by table)
+  results.push(bench('vsDiff(1K)     [rust]   ', () => {
+    const changes = decodeBuf(neo.changesSinceBuf('00', 1000, 0), clColNames);
+    // Group by table, then batch fetch
+    const byTable = {};
+    for (const c of changes) {
+      const t = c.table;
+      if (!byTable[t]) byTable[t] = [];
+      byTable[t].push(JSON.parse(c.rowKey).id);
+    }
+    for (const [t, ids] of Object.entries(byTable)) {
+      decodeBuf(neo.getRowsMultiBuf(getRowSqls[t], ids, 1), dataColNames);
+    }
+  }, 500));
+
+  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // SECTION 5: Txn write (for completeness)
 // ═══════════════════════════════════════════════════════════════
@@ -650,9 +724,16 @@ if (process.argv.includes('--assert')) {
   const all = [...wins, ...losses];
   const find = (label) => all.find(e => e.label.includes(label));
   const assertions = [
+    // Buffer protocol (must be faster)
     ['allBuf(1K)', 1.5, find('all(1K)')],
     ['allBuf(5K)', 1.5, find('all(5K)')],
     ['allBuf(100)', 1.3, find('all(100)')],
+    // Snapshotter hot path (parity gates — detect major regressions)
+    ['changesSince', 0.5, find('changesSince')],
+    ['getRowsBuf(10)', 0.8, find('getRowsBuf(10)')],
+    // Composite workloads (parity gates)
+    ['diff(100)multi', 0.8, find('diff(100)multi')],
+    ['vsDiff(1K)', 0.7, find('vsDiff(1K)')],
   ];
   let failed = 0;
   for (const [name, min, entry] of assertions) {
