@@ -17,6 +17,21 @@ export declare class RustFilterPredicate {
   filterPushBatch(changes: object): FilterResult
 }
 
+/**
+ * Generic key-value storage backed by a Rust HashMap.
+ * Stores raw JSON strings — no parsing or validation.
+ */
+export declare class RustStorage {
+  constructor()
+  get(key: string): string | null
+  set(key: string, value: string): void
+  del(key: string): void
+  /** Scan all keys with a given prefix. Returns array of [key, value] pairs. */
+  scan(prefix: string): Array<Array<string>>
+  clear(): void
+  size(): number
+}
+
 export declare class RustTakeState {
   constructor(sortJson: string)
   /** Returns JSON string of TakeState or null */

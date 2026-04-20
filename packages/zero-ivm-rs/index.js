@@ -577,5 +577,6 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.RustFilterPredicate = nativeBinding.RustFilterPredicate
+module.exports.RustStorage = nativeBinding.RustStorage
 module.exports.RustTakeState = nativeBinding.RustTakeState
 module.exports.EditSplitType = nativeBinding.EditSplitType
