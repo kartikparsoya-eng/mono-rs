@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 pub mod database;
+pub mod diff;
 pub mod row_iterator;
 pub mod statement;
 mod types;
