@@ -38,6 +38,10 @@ import {
   type CompanionSubquery,
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
+import {RustStorage} from '../../../../zero-ivm-rs/index.js';
+import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
+
+const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
 import {
   reloadPermissionsIfChanged,
@@ -129,6 +133,8 @@ export class PipelineDriver {
   readonly #lc: LogContext;
   readonly #snapshotter: Snapshotter;
   readonly #storage: ClientGroupStorage;
+  readonly #rustStorage: RustStorage | null;
+  #rustOpID = 0;
   readonly #shardID: ShardID;
   readonly #logConfig: LogConfig;
   readonly #config: ZeroConfig | undefined;
@@ -172,6 +178,7 @@ export class PipelineDriver {
     this.#lc = lc.withContext('clientGroupID', clientGroupID);
     this.#snapshotter = snapshotter;
     this.#storage = storage;
+    this.#rustStorage = USE_RUST_IVM ? new RustStorage() : null;
     this.#shardID = shardID;
     this.#logConfig = logConfig;
     this.#config = config;
@@ -787,6 +794,9 @@ export class PipelineDriver {
 
   /** Implements `BuilderDelegate.createStorage()` */
   #createStorage(): Storage {
+    if (this.#rustStorage) {
+      return new RustTakeStorage(this.#rustStorage, ++this.#rustOpID);
+    }
     return this.#storage.createStorage();
   }
 
