@@ -13,10 +13,15 @@
 **Approach:** Each Rust operator implements same Input/Output interface via thin TS wrapper. SourceChange in → Change[] out. Take uses in-memory HashMap (no SQLite JSON.parse/stringify). Unsupported cases fall back to TS path.
 
 **Key deliverables:**
-1. Rust Filter operator (stateless predicate evaluation)
-2. Rust Take operator (in-memory storage, bound tracking)
-3. TS wrapper classes delegating to napi-rs
-4. All existing filter.test.ts and take.test.ts pass unchanged
+1. ~~Rust Filter operator (stateless predicate evaluation)~~ ✅ Plan 10-01
+2. ~~Rust Take operator (in-memory storage, bound tracking)~~ ✅ Plan 10-02
+3. ~~TS wrapper classes delegating to napi-rs~~ ✅ Plan 10-03
+4. All existing filter.test.ts and take.test.ts pass unchanged ✅
+
+**Plans:**
+- [x] Plan 10-01: Rust Filter predicate evaluator (`ba5fe45d0`...`5a4df0a11`)
+- [x] Plan 10-02: Rust Take state machine (`1a384a18d`)
+- [x] Plan 10-03: Separate IVM crate + delegate integration (`ba5fe45d0`...`d384a1e76`)
 
 **Success criteria:** Operator tests pass unchanged, benchmark shows improvement over TS path
 

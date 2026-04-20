@@ -33,6 +33,12 @@ Port the Filter and Take IVM operators to Rust via napi-rs, proving the operator
 - **D-41:** No per-change runtime fallback; once a pipeline is built with Rust operator, all changes go through Rust
 - **D-42:** Filter fallback triggers: unsupported AST node type, custom function predicate, relationship field reference
 
+### Architecture (added after 10-03 failure)
+- **D-43:** Separate `zero-ivm-rs` crate — IVM Rust code lives in its own napi crate, not in `zqlite-rs`
+- **D-44:** Zero modifications to `packages/zql/` — Rust integration happens at the delegate level (`pipeline-driver.ts`), not in `builder.ts`
+- **D-45:** Take integration via `BuilderDelegate.createStorage()` — return `RustTakeStorage` instead of `DatabaseStorage`
+- **D-46:** Filter integration deferred to 10-04 — requires adding optional `createFilter?` to `BuilderDelegate` interface
+
 ### Constraints (carried from v2.0)
 - **D-29:** NEVER modify test files — tests are correctness oracle
 - **D-30:** Unsupported cases fall back to existing TS path
@@ -84,7 +90,8 @@ Port the Filter and Take IVM operators to Rust via napi-rs, proving the operator
 - Value conversion: JS objects ↔ Rust via serde or manual napi::Env methods
 
 ### Integration Points
-- `packages/zql/src/builder/builder.ts` — where RustFilter/RustTake wrapper would be instantiated instead of TS Filter/Take
+- `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts` — production delegate, where `createStorage()` returns Rust or TS storage
+- `packages/zql/src/builder/builder.ts` — calls `delegate.createStorage()` for Take (no modification needed)
 - `packages/zqlite/src/table-source.ts` — genPush() calls operator.push() on the chain
 
 </code_context>
