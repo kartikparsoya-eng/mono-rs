@@ -1,6 +1,7 @@
 import type {SQLQuery} from '@databases/sql';
 import type {LogContext} from '@rocicorp/logger';
-import SQLite3Database from '@rocicorp/zero-sqlite3';
+// SQLITE_SCANSTAT_NVISIT = 1 (from SQLite3 scan status opcodes)
+const SQLITE_SCANSTAT_NVISIT = 1;
 import type {LogConfig} from '../../otel/src/log-options.ts';
 import {timeSampled} from '../../otel/src/maybe-time.ts';
 import {assert, unreachable} from '../../shared/src/asserts.ts';
@@ -58,6 +59,11 @@ type Statements = {
 
 let eventCount = 0;
 
+// Regexes for converting Rust queryAll errors to UnsupportedValueError
+const RE_STRIP_SQL_SUFFIX = /: SELECT .*$/;
+const RE_INVALID_JSON =
+  /invalid json value for column (\w+):RAW:(.+?)(?:: SELECT .*)?$/;
+
 /**
  * A source that is backed by a SQLite table.
  *
@@ -77,6 +83,8 @@ export class TableSource implements Source {
   readonly #connections: Connection[] = [];
   readonly #table: string;
   readonly #columns: Record<string, SchemaValue>;
+  #db: Database;
+  #columnTypesMap: Record<string, string> | undefined;
   // Maps sorted columns JSON string (e.g. '["a","b"]) to Set of columns.
   readonly #uniqueIndexes: Map<string, Set<string>>;
   readonly #primaryKey: PrimaryKey;
@@ -108,6 +116,7 @@ export class TableSource implements Source {
     this.#columns = columns;
     this.#uniqueIndexes = getUniqueIndexes(db, tableName);
     this.#primaryKey = primaryKey;
+    this.#db = db;
     this.#stmts = this.#getStatementsFor(db);
     this.#shouldYield = shouldYield;
 
@@ -130,7 +139,52 @@ export class TableSource implements Source {
    * algorithm for concurrent traversal of historic timelines.
    */
   setDB(db: Database) {
+    this.#db = db;
     this.#stmts = this.#getStatementsFor(db);
+  }
+
+  get #columnTypes(): Record<string, string> {
+    if (!this.#columnTypesMap) {
+      this.#columnTypesMap = {};
+      for (const [name, schema] of Object.entries(this.#columns)) {
+        this.#columnTypesMap[name] = schema.type;
+      }
+    }
+    return this.#columnTypesMap;
+  }
+
+  #queryAllTyped<T>(sql: string, params: unknown[]): T[] {
+    try {
+      return this.#db.queryAll<T>(sql, params, this.#columnTypes, this.#table);
+    } catch (e: unknown) {
+      if (e instanceof Error) {
+        const msg = e.message;
+        // Convert Rust errors to UnsupportedValueError for API compatibility
+        if (msg.includes('is outside of supported bounds')) {
+          throw new UnsupportedValueError(
+            msg.replace(RE_STRIP_SQL_SUFFIX, ''),
+          );
+        }
+        if (msg.includes('invalid json value for column')) {
+          const m = msg.match(RE_INVALID_JSON);
+          if (m) {
+            // Re-parse with JSON.parse to get the real JS SyntaxError
+            let cause: unknown;
+            try {
+              JSON.parse(m[2]);
+            } catch (parseErr) {
+              cause = parseErr;
+            }
+            const detail = cause instanceof Error ? cause.message : m[2];
+            throw new UnsupportedValueError(
+              `Failed to parse JSON for ${this.#table}.${m[1]}: ${detail}`,
+              {cause},
+            );
+          }
+        }
+      }
+      throw e;
+    }
   }
 
   #getStatementsFor(db: Database) {
@@ -286,13 +340,84 @@ export class TableSource implements Source {
     const query = this.#requestToSQL(req, connection.filters?.condition, sort);
     const sqlAndBindings = format(query);
 
-    const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
-    cachedStatement.statement.safeIntegers(true);
-    const rowIterator = cachedStatement.statement.iterate<Row>(
-      ...sqlAndBindings.values,
-    );
-    try {
-      debug?.initQuery(this.#table, sqlAndBindings.text);
+    if (debug) {
+      // Debug path: uses iterate() for scanStatus and debug delegate compatibility
+      const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
+      cachedStatement.statement.safeIntegers(true);
+      const rowIterator = cachedStatement.statement.iterate<Row>(
+        ...sqlAndBindings.values,
+      );
+      try {
+        debug.initQuery(this.#table, sqlAndBindings.text);
+
+        if (sort) {
+          const comparator = makeComparator(sort, req.reverse);
+          yield* generateWithStart(
+            generateWithYields(
+              generateWithOverlay(
+                req.start?.row,
+                this.#mapFromSQLiteTypes(
+                  this.#columns,
+                  rowIterator,
+                  sqlAndBindings.text,
+                  debug,
+                ),
+                req.constraint,
+                this.#overlay,
+                connection.lastPushedEpoch,
+                comparator,
+                connection.filters?.predicate,
+              ),
+              this.#shouldYield,
+            ),
+            req.start,
+            comparator,
+          );
+        } else {
+          yield* generateWithYields(
+            generateWithOverlayUnordered(
+              this.#mapFromSQLiteTypes(
+                this.#columns,
+                rowIterator,
+                sqlAndBindings.text,
+                debug,
+              ),
+              req.constraint,
+              this.#overlay,
+              connection.lastPushedEpoch,
+              this.#primaryKey,
+              connection.filters?.predicate,
+            ),
+            this.#shouldYield,
+          );
+        }
+      } finally {
+        rowIterator.return?.();
+        let totalNvisit = 0;
+        let i = 0;
+        while (true) {
+          const nvisit = cachedStatement.statement.scanStatus(
+            i++,
+            SQLITE_SCANSTAT_NVISIT,
+            1,
+          );
+          if (nvisit === undefined) {
+            break;
+          }
+          totalNvisit += Number(nvisit);
+        }
+        if (totalNvisit !== 0) {
+          debug.recordNVisit(this.#table, sqlAndBindings.text, totalNvisit);
+        }
+        cachedStatement.statement.scanStatusReset();
+        this.#stmts.cache.return(cachedStatement);
+      }
+    } else {
+      // Hot path: single FFI call, Rust handles all row iteration + type conversion
+      const rows = this.#queryAllTyped<Row>(
+        sqlAndBindings.text,
+        sqlAndBindings.values as unknown[],
+      );
 
       if (sort) {
         const comparator = makeComparator(sort, req.reverse);
@@ -300,12 +425,7 @@ export class TableSource implements Source {
           generateWithYields(
             generateWithOverlay(
               req.start?.row,
-              this.#mapFromSQLiteTypes(
-                this.#columns,
-                rowIterator,
-                sqlAndBindings.text,
-                debug,
-              ),
+              rows,
               req.constraint,
               this.#overlay,
               connection.lastPushedEpoch,
@@ -320,12 +440,7 @@ export class TableSource implements Source {
       } else {
         yield* generateWithYields(
           generateWithOverlayUnordered(
-            this.#mapFromSQLiteTypes(
-              this.#columns,
-              rowIterator,
-              sqlAndBindings.text,
-              debug,
-            ),
+            rows,
             req.constraint,
             this.#overlay,
             connection.lastPushedEpoch,
@@ -335,29 +450,6 @@ export class TableSource implements Source {
           this.#shouldYield,
         );
       }
-    } finally {
-      // Ensure the SQLite iterate() is closed.
-      rowIterator.return?.();
-      if (debug) {
-        let totalNvisit = 0;
-        let i = 0;
-        while (true) {
-          const nvisit = cachedStatement.statement.scanStatus(
-            i++,
-            SQLite3Database.SQLITE_SCANSTAT_NVISIT,
-            1,
-          );
-          if (nvisit === undefined) {
-            break;
-          }
-          totalNvisit += Number(nvisit);
-        }
-        if (totalNvisit !== 0) {
-          debug.recordNVisit(this.#table, sqlAndBindings.text, totalNvisit);
-        }
-        cachedStatement.statement.scanStatusReset();
-      }
-      this.#stmts.cache.return(cachedStatement);
     }
   }
 
@@ -507,15 +599,9 @@ export class TableSource implements Source {
     const keyCols = Object.keys(rowKey);
 
     const stmt = this.#getRowStmt(keyCols);
-    const row = this.#stmts.cache.use(stmt, cached =>
-      cached.statement
-        .safeIntegers(true)
-        .get<Row>(...toSQLiteTypes(keyCols, rowKey, this.#columns)),
-    );
-    if (row) {
-      return fromSQLiteTypes(this.#columns, row, this.#table);
-    }
-    return row;
+    const params = toSQLiteTypes(keyCols, rowKey, this.#columns);
+    const rows = this.#queryAllTyped<Row>(stmt, params as unknown[]);
+    return rows.length > 0 ? rows[0] : undefined;
   }
 
   #requestToSQL(

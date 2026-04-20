@@ -146,6 +146,21 @@ export class Database implements Disposable {
     }
   }
 
+  /**
+   * Execute a query and return all rows with typed conversion done in Rust.
+   * columnTypes maps column names to their schema types (e.g. 'boolean', 'json').
+   */
+  queryAll<T>(
+    sql: string,
+    params: unknown[],
+    columnTypes: Record<string, string>,
+    tableName: string,
+  ): T[] {
+    return this.#run('queryAll', sql, () =>
+      this.#db.queryAll(sql, params, columnTypes, tableName),
+    );
+  }
+
   close(): void {
     const start = Date.now();
     if (!this.#db.readonly) {

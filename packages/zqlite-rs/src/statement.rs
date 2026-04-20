@@ -170,6 +170,30 @@ fn extract_params(env: &Env, params: &JsObject) -> Result<Vec<rusqlite::types::V
     if len == 0 {
         return Ok(Vec::new());
     }
+    // better-sqlite3 compat: if the single argument is itself an array, flatten it.
+    // This handles stmt.run([a, b, c]) being called as run(...params) in TS,
+    // resulting in params = [[a, b, c]].
+    if len == 1 {
+        let mut first_element = std::ptr::null_mut();
+        let status = unsafe {
+            napi::sys::napi_get_element(env.raw(), params.raw(), 0, &mut first_element)
+        };
+        if status == 0 {
+            let mut is_array = false;
+            let arr_status = unsafe {
+                napi::sys::napi_is_array(env.raw(), first_element, &mut is_array)
+            };
+            if arr_status == 0 && is_array {
+                let mut inner_len: u32 = 0;
+                let len_status = unsafe {
+                    napi::sys::napi_get_array_length(env.raw(), first_element, &mut inner_len)
+                };
+                if len_status == 0 {
+                    return js_array_params_to_sqlite(env, first_element, inner_len);
+                }
+            }
+        }
+    }
     js_array_params_to_sqlite(env, unsafe { params.raw() }, len)
 }
 

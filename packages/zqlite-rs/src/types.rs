@@ -161,10 +161,10 @@ pub fn row_to_typed_js_object(
                     .map_err(|e| Error::from_reason(e.to_string()))?;
                 match col_type {
                     ColumnType::Json => {
-                        let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                        let parsed: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                             Error::from_reason(format!(
-                                "invalid json value for column {}: {}",
-                                col_name, e
+                                "invalid json value for column {}:RAW:{}",
+                                col_name, s
                             ))
                         })?;
                         serde_json_to_js(env, &parsed)?
@@ -233,7 +233,7 @@ pub fn set_sqlite_value(
             obj.set_named_property(key, null_unknown)?;
         }
         ValueRef::Integer(i) => {
-            if safe_integers {
+            if safe_integers && (i >= 9_007_199_254_740_991 || i <= -9_007_199_254_740_991) {
                 let bigint = env.create_bigint_from_i64(i)?;
                 obj.set_named_property(key, bigint)?;
             } else {
