@@ -35,6 +35,8 @@ Depends on: v1.0 (zqlite-rs foundation)
 
 **Success criteria:** join.test.ts passes unchanged, pipeline-driver.test.ts passes unchanged
 
+**Progress:** Plan 1/2 complete (2026-04-20) — In Progress
+
 Depends on: Phase 10
 
 ### Phase 12: Rust Exists Operator
