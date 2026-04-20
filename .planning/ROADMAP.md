@@ -10,7 +10,7 @@ Incremental rewrite of zero-cache's performance-critical SQLite layer from TypeS
 - [x] **Phase 2: StatementRunner** - SKIPPED (D-08: stays TS, pure delegation layer)
 - [x] **Phase 3: IVM Data Layer** - TableSource + DatabaseStorage in Rust
 - [x] **Phase 4: Schema Modules** - SKIPPED (D-14: already Rust-backed via Phase 1, write-heavy/cold-path)
-- [ ] **Phase 5: High-Impact Services** - Snapshotter + ChangeProcessor in Rust
+- [x] **Phase 5: High-Impact Services** - Snapshotter + ChangeProcessor in Rust
 - [ ] **Phase 6: Bulk Loader** - initial-sync in Rust
 - [ ] **Phase 7: Benchmarks & Validation** - Comparative A/B benchmarks
 
@@ -69,7 +69,7 @@ Plans:
 **Plans**: 1 plan (D-15: ChangeProcessor stays TS)
 
 Plans:
-- [ ] 05-01: Rust Snapshotter read methods (getRow, getRowsBuf, changesSinceBuf) + snapshotter.ts integration
+- [x] 05-01: Rust Snapshotter read methods (getRow, getRowsBuf, changesSinceBuf) + snapshotter.ts integration
 
 ### Phase 6: Bulk Loader
 **Goal**: Replace initial-sync with Rust bulk loader for fast initial data population
@@ -104,6 +104,6 @@ Plans:
 | 2. StatementRunner | 0/0 | Skipped (D-08) | 2026-04-20 |
 | 3. IVM Data Layer | 2/2 | Complete | 2026-04-20 |
 | 4. Schema Modules | 0/0 | Skipped (D-14) | 2026-04-20 |
-| 5. High-Impact Services | 0/1 | Planned | - |
+| 5. High-Impact Services | 1/1 | Complete | 2026-04-20 |
 | 6. Bulk Loader | 0/1 | Not started | - |
 | 7. Benchmarks & Validation | 0/1 | Not started | - |
