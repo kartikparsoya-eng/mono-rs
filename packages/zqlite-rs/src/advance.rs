@@ -36,7 +36,7 @@ pub enum Operator {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PipelineConfig {
     pub query_id: String,
     pub source_tables: Vec<String>,
@@ -301,34 +301,47 @@ fn like_match(text: &str, pattern: &str) -> bool {
     like_match_impl(&text_chars, &pattern_chars, 0, 0)
 }
 
-fn like_match_impl(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
-    if pi == pattern.len() {
-        return ti == text.len();
-    }
-    match pattern[pi] {
-        '%' => {
-            for i in ti..=text.len() {
-                if like_match_impl(text, pattern, i, pi + 1) {
-                    return true;
+/// Iterative two-pointer LIKE matching — O(N*M) worst case.
+/// Tracks the last '%' position to backtrack greedily instead of recursing.
+fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize) -> bool {
+    let (tlen, plen) = (text.len(), pattern.len());
+    let mut star_pi: Option<usize> = None; // pattern index after last '%'
+    let mut star_ti: usize = 0; // text index when we matched last '%'
+
+    while ti < tlen || pi < plen {
+        if pi < plen {
+            match pattern[pi] {
+                '%' => {
+                    star_pi = Some(pi + 1);
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
                 }
+                '_' if ti < tlen => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                c if ti < tlen
+                    && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() =>
+                {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {} // mismatch — fall through to backtrack
             }
-            false
         }
-        '_' => {
-            if ti < text.len() {
-                like_match_impl(text, pattern, ti + 1, pi + 1)
-            } else {
-                false
-            }
-        }
-        c => {
-            if ti < text.len() && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() {
-                like_match_impl(text, pattern, ti + 1, pi + 1)
-            } else {
-                false
-            }
+        // Mismatch or pattern exhausted with text remaining: backtrack to last '%'
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp;
+        } else {
+            return false;
         }
     }
+    true
 }
 
 // ─── Pipeline Processing ────────────────────────────────────────────────────
@@ -1207,6 +1220,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             operators: vec![],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev1 = Row::new();
@@ -1243,6 +1257,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             operators: vec![],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -1320,6 +1335,7 @@ mod tests {
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
+            ..Default::default()
         };
 
         let mut next_value = Row::new();
@@ -1345,6 +1361,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -1369,6 +1386,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -1400,6 +1418,7 @@ mod tests {
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
+            ..Default::default()
         };
 
         let mut next = Row::new();
@@ -1424,6 +1443,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
 
         let mut row1 = Row::new();
@@ -1457,6 +1477,7 @@ mod tests {
             source_tables: vec!["orders".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
 
         let mut next = Row::new();
@@ -1482,6 +1503,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let changes: Vec<Change> = vec![];
         let results = process_pipeline(&pipeline, &changes);
@@ -1495,6 +1517,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1516,6 +1539,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let changes: Vec<Change> = (0..1000)
             .map(|i| {
@@ -1540,6 +1564,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let changes: Vec<Change> = (0..5)
             .map(|i| {
@@ -1571,6 +1596,7 @@ mod tests {
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
+            ..Default::default()
         };
         let changes: Vec<Change> = (0..1000)
             .map(|i| {
@@ -1598,6 +1624,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1620,6 +1647,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1642,6 +1670,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1666,6 +1695,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let long_str = "a".repeat(100_000);
         let mut row = Row::new();
@@ -1690,6 +1720,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1713,6 +1744,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             primary_key: vec![],
             operators: vec![],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1738,6 +1770,7 @@ mod tests {
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1761,6 +1794,7 @@ mod tests {
             operators: vec![Operator::Filter {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
+            ..Default::default()
         };
         let mut row = Row::new();
         row.insert("id".to_string(), serde_json::json!("u1"));
@@ -1863,6 +1897,7 @@ mod tests {
                     source_tables: vec!["items".to_string()],
                     primary_key: vec!["id".to_string()],
                     operators,
+                    ..Default::default()
                 }
             })
             .collect()
@@ -1932,6 +1967,7 @@ mod tests {
                 source_tables: vec!["items".to_string()],
                 primary_key: vec!["id".to_string()],
                 operators: vec![],
+                ..Default::default()
             })
             .collect();
         let changes: Vec<Change> = (0..5)
@@ -2000,6 +2036,7 @@ mod tests {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -2038,6 +2075,7 @@ mod tests {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -2074,6 +2112,7 @@ mod tests {
                 predicate: serde_json::json!({"op": "gt", "field": "age", "value": 18}),
             }],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -2109,6 +2148,7 @@ mod tests {
                 predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
             }],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();
@@ -2142,6 +2182,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             operators: vec![],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         // Change 1: insert
@@ -2183,6 +2224,7 @@ mod tests {
             source_tables: vec!["users".to_string()],
             operators: vec![],
             primary_key: vec!["id".to_string()],
+            ..Default::default()
         };
 
         let mut prev = Row::new();

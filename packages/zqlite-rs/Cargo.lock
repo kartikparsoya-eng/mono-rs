@@ -799,6 +799,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zero-ivm-rs"
+version = "0.0.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -808,6 +819,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 name = "zqlite-rs"
 version = "0.0.0"
 dependencies = [
+ "libsqlite3-sys",
  "napi",
  "napi-build",
  "napi-derive",
@@ -816,4 +828,5 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zero-ivm-rs",
 ]

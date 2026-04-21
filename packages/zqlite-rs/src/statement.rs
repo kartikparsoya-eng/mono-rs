@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -9,12 +10,47 @@ use rusqlite::Connection;
 use crate::row_iterator::RowIterator;
 use crate::types::{get_column_names, intern_column_keys, js_array_params_to_sqlite, row_to_js_object, row_to_js_object_fast};
 
+// FFI declarations for scanstatus APIs.
+// These are compiled into the bundled SQLite (SQLITE_ENABLE_STMT_SCANSTATUS)
+// but not re-exported through the libsqlite3-sys pre-generated bindings.
+extern "C" {
+    fn sqlite3_stmt_scanstatus_v2(
+        pStmt: *mut libsqlite3_sys::sqlite3_stmt,
+        idx: c_int,
+        iScanStatusOp: c_int,
+        flags: c_int,
+        pOut: *mut c_void,
+    ) -> c_int;
+    fn sqlite3_stmt_scanstatus_reset(pStmt: *mut libsqlite3_sys::sqlite3_stmt);
+}
+
+/// Holds a raw SQLite prepared statement for scanstatus queries.
+/// The raw stmt is prepared via sqlite3_prepare_v2 (not rusqlite's cached statements)
+/// because we need the raw pointer for sqlite3_stmt_scanstatus_v2 FFI calls.
+struct RawScanStmt(*mut libsqlite3_sys::sqlite3_stmt);
+
+impl Drop for RawScanStmt {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libsqlite3_sys::sqlite3_finalize(self.0) };
+        }
+    }
+}
+
+// Scanstatus opcode → output type mapping (from SQLite docs):
+// NLOOP(0), NVISIT(1), NCYCLE(7) → sqlite3_int64
+// EST(2) → f64
+// NAME(3), EXPLAIN(4) → const char*
+// SELECTID(5), PARENTID(6) → i32
+
 #[napi]
 pub struct Statement {
     conn: Arc<RefCell<Connection>>,
     sql: String,
     safe_integers: bool,
     cached_columns: RefCell<Option<Vec<String>>>,
+    /// Lazily-prepared raw statement for scanstatus FFI calls.
+    scan_stmt: RefCell<Option<RawScanStmt>>,
 }
 
 #[napi]
@@ -195,6 +231,107 @@ impl Statement {
         Ok(Buffer::from(buf))
     }
 
+    /// Get scanstatus information for a prepared statement.
+    /// Wraps sqlite3_stmt_scanstatus_v2. Returns undefined when idx is out of range.
+    ///
+    /// Opcodes (matching SQLite constants):
+    ///   0=NLOOP(i64), 1=NVISIT(i64), 2=EST(f64), 3=NAME(str),
+    ///   4=EXPLAIN(str), 5=SELECTID(i32), 6=PARENTID(i32), 7=NCYCLE(i64)
+    #[napi]
+    pub fn scan_status(&self, idx: i32, op: i32, flags: i32) -> Result<Either<Either<f64, String>, Undefined>> {
+        if let Err(e) = self.ensure_scan_stmt() {
+            return Err(Error::from_reason(e));
+        }
+        let scan = self.scan_stmt.borrow();
+        let raw_stmt = match scan.as_ref() {
+            Some(s) => s.0,
+            None => return Ok(Either::B(())),
+        };
+
+        match op {
+            // NLOOP(0), NVISIT(1), NCYCLE(7) -> sqlite3_int64
+            0 | 1 | 7 => {
+                let mut val: i64 = 0;
+                let rc = unsafe {
+                    sqlite3_stmt_scanstatus_v2(
+                        raw_stmt,
+                        idx,
+                        op,
+                        flags,
+                        &mut val as *mut i64 as *mut c_void,
+                    )
+                };
+                if rc != 0 {
+                    return Ok(Either::B(()));
+                }
+                Ok(Either::A(Either::A(val as f64)))
+            }
+            // EST(2) -> f64
+            2 => {
+                let mut val: f64 = 0.0;
+                let rc = unsafe {
+                    sqlite3_stmt_scanstatus_v2(
+                        raw_stmt,
+                        idx,
+                        op,
+                        flags,
+                        &mut val as *mut f64 as *mut c_void,
+                    )
+                };
+                if rc != 0 {
+                    return Ok(Either::B(()));
+                }
+                Ok(Either::A(Either::A(val)))
+            }
+            // NAME(3), EXPLAIN(4) -> const char*
+            3 | 4 => {
+                let mut val: *const c_char = std::ptr::null();
+                let rc = unsafe {
+                    sqlite3_stmt_scanstatus_v2(
+                        raw_stmt,
+                        idx,
+                        op,
+                        flags,
+                        &mut val as *mut *const c_char as *mut c_void,
+                    )
+                };
+                if rc != 0 || val.is_null() {
+                    return Ok(Either::B(()));
+                }
+                let s = unsafe { CStr::from_ptr(val) }.to_string_lossy();
+                Ok(Either::A(Either::B(s.into_owned())))
+            }
+            // SELECTID(5), PARENTID(6) -> int
+            5 | 6 => {
+                let mut val: i32 = 0;
+                let rc = unsafe {
+                    sqlite3_stmt_scanstatus_v2(
+                        raw_stmt,
+                        idx,
+                        op,
+                        flags,
+                        &mut val as *mut i32 as *mut c_void,
+                    )
+                };
+                if rc != 0 {
+                    return Ok(Either::B(()));
+                }
+                Ok(Either::A(Either::A(val as f64)))
+            }
+            _ => Ok(Either::B(())),
+        }
+    }
+
+    /// Reset scanstatus counters for the prepared statement.
+    #[napi]
+    pub fn scan_status_reset(&self) -> Result<()> {
+        let scan = self.scan_stmt.borrow();
+        if let Some(s) = scan.as_ref() {
+            unsafe { sqlite3_stmt_scanstatus_reset(s.0) };
+        }
+        Ok(())
+    }
+
     /// Create a lazy row iterator. Materializes all rows in Rust, converts lazily to JS.
     #[napi]
     pub fn iterate(&self, env: Env, params: JsObject) -> Result<RowIterator> {
@@ -331,6 +468,7 @@ impl Statement {
             sql,
             safe_integers: false,
             cached_columns: RefCell::new(None),
+            scan_stmt: RefCell::new(None),
         }
     }
 
@@ -344,6 +482,37 @@ impl Statement {
             *cache = Some(cols.clone());
             cols
         }
+    }
+
+    /// Ensure the raw scan statement is prepared for scanstatus calls.
+    /// Uses the same database handle as the main connection.
+    fn ensure_scan_stmt(&self) -> std::result::Result<(), String> {
+        let mut scan = self.scan_stmt.borrow_mut();
+        if scan.is_some() {
+            return Ok(());
+        }
+        let conn = self.conn.borrow();
+        // SAFETY: handle() returns the raw sqlite3* managed by rusqlite.
+        // It remains valid as long as the Connection is alive, which it is
+        // because we hold Arc<RefCell<Connection>>.
+        let db_handle = unsafe { conn.handle() };
+        let sql_bytes = self.sql.as_bytes();
+        let mut raw_stmt: *mut libsqlite3_sys::sqlite3_stmt = std::ptr::null_mut();
+        let mut tail: *const c_char = std::ptr::null();
+        let rc = unsafe {
+            libsqlite3_sys::sqlite3_prepare_v2(
+                db_handle,
+                sql_bytes.as_ptr() as *const c_char,
+                sql_bytes.len() as c_int,
+                &mut raw_stmt,
+                &mut tail,
+            )
+        };
+        if rc != 0 || raw_stmt.is_null() {
+            return Err(format!("sqlite3_prepare_v2 failed with code {rc}"));
+        }
+        *scan = Some(RawScanStmt(raw_stmt));
+        Ok(())
     }
 }
 

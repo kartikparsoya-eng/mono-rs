@@ -181,9 +181,7 @@ export class Database implements Disposable {
    * Decode with decodeBuf(). For hot paths with potentially many rows.
    */
   getRowsBuf(sql: string, params: unknown[]): Buffer {
-    return this.#run('getRowsBuf', sql, () =>
-      this.#db.getRowsBuf(sql, params),
-    );
+    return this.#run('getRowsBuf', sql, () => this.#db.getRowsBuf(sql, params));
   }
 
   /**
@@ -210,7 +208,11 @@ export class Database implements Disposable {
    * @param params - Flat array of all param values [key1_p1, key1_p2, key2_p1, key2_p2, ...]
    * @param paramsPerKey - Number of params consumed per execution
    */
-  getRowsMultiBuf(sql: string, params: unknown[], paramsPerKey: number): Buffer {
+  getRowsMultiBuf(
+    sql: string,
+    params: unknown[],
+    paramsPerKey: number,
+  ): Buffer {
     return this.#run('getRowsMultiBuf', sql, () =>
       this.#db.getRowsMultiBuf(sql, params, paramsPerKey),
     );
@@ -255,9 +257,17 @@ export class Statement {
   readonly #threshold: number;
   readonly #attrs: Attributes;
 
-  // Stubs for scanStatusV2/scanStatusReset (used by table-source.ts, not needed for Phase 1)
-  readonly scanStatus: (...args: unknown[]) => unknown = () => undefined;
-  readonly scanStatusReset: () => void = () => {};
+  scanStatus(
+    idx: number,
+    op: number,
+    flags: number,
+  ): number | string | undefined {
+    return this.#stmt.scanStatus(idx, op, flags);
+  }
+
+  scanStatusReset(): void {
+    this.#stmt.scanStatusReset();
+  }
 
   constructor(
     lc: LogContext,
@@ -397,7 +407,7 @@ class LoggingIterableIterator<T> implements IterableIterator<T> {
     return this.#it.return() as any;
   }
 
-  throw(e: unknown): IteratorResult<T> {
+  throw(_e: unknown): IteratorResult<T> {
     this.#log();
     return {done: true, value: undefined} as IteratorResult<T>;
   }
@@ -452,7 +462,8 @@ export function decodeBuf<T = Record<string, unknown>>(
         case 0: // null
           row[columnNames[c]] = null;
           break;
-        case 1: { // i64
+        case 1: {
+          // i64
           const lo = view.getUint32(offset, true);
           const hi = view.getInt32(offset + 4, true);
           const n = hi * 0x100000000 + lo;
@@ -469,17 +480,25 @@ export function decodeBuf<T = Record<string, unknown>>(
           row[columnNames[c]] = view.getFloat64(offset, true);
           offset += 8;
           break;
-        case 3: { // text
+        case 3: {
+          // text
           const len = view.getUint32(offset, true);
           offset += 4;
-          row[columnNames[c]] = textDecoder.decode(buf.subarray(offset, offset + len));
+          row[columnNames[c]] = textDecoder.decode(
+            buf.subarray(offset, offset + len),
+          );
           offset += len;
           break;
         }
-        case 4: { // blob
+        case 4: {
+          // blob
           const len = view.getUint32(offset, true);
           offset += 4;
-          row[columnNames[c]] = Buffer.from(buf.buffer, buf.byteOffset + offset, len);
+          row[columnNames[c]] = Buffer.from(
+            buf.buffer,
+            buf.byteOffset + offset,
+            len,
+          );
           offset += len;
           break;
         }

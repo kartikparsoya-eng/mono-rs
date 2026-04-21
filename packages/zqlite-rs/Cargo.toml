@@ -15,7 +15,9 @@ rusqlite = { version = "0.33", features = [
   "blob",
   "hooks",
   "trace",
+  "column_decltype",
 ] }
+libsqlite3-sys = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rayon = "1.10"

@@ -153,14 +153,16 @@ function getScanstatusLoops(stmt: Statement): ScanstatusLoop[] {
     }
 
     loops.push({
-      selectId: must(selectId),
+      selectId: must(selectId) as number,
       parentId: must(
         stmt.scanStatus(idx, SQLite3Database.SQLITE_SCANSTAT_PARENTID, 1),
-      ),
+      ) as number,
       explain: must(
         stmt.scanStatus(idx, SQLite3Database.SQLITE_SCANSTAT_EXPLAIN, 1),
-      ),
-      est: must(stmt.scanStatus(idx, SQLite3Database.SQLITE_SCANSTAT_EST, 1)),
+      ) as string,
+      est: must(
+        stmt.scanStatus(idx, SQLite3Database.SQLITE_SCANSTAT_EST, 1),
+      ) as number,
     });
   }
 

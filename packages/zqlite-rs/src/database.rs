@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi::{Env, JsObject, NapiRaw, NapiValue};
+use napi::{Env, JsObject, JsString, NapiRaw, NapiValue};
 use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
 
@@ -112,13 +112,6 @@ impl Database {
 
     #[napi]
     pub fn prepare(&self, sql: String) -> Result<Statement> {
-        // BEGIN CONCURRENT is a custom SQLite extension in @rocicorp/zero-sqlite3.
-        // Standard SQLite doesn't support it; fall back to BEGIN IMMEDIATE.
-        let sql = if sql.trim().eq_ignore_ascii_case("BEGIN CONCURRENT") {
-            "BEGIN IMMEDIATE".to_string()
-        } else {
-            sql
-        };
         {
             let conn = self.conn.borrow();
             conn.prepare(&sql)
@@ -169,8 +162,28 @@ impl Database {
         } else {
             // Error — rollback
             let _ = conn.execute_batch("ROLLBACK");
-            // Re-throw the JS exception
-            Err(Error::from_reason("Transaction callback threw an exception"))
+            // Retrieve the original JS exception message for better debugging
+            let mut exception_raw = std::ptr::null_mut();
+            let exc_status = unsafe {
+                napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception_raw)
+            };
+            if exc_status == 0 && !exception_raw.is_null() {
+                // Try to get .message property from the exception object
+                let exception = unsafe { JsObject::from_raw_unchecked(env.raw(), exception_raw) };
+                if let Ok(msg) = exception.get_named_property::<JsString>("message") {
+                    if let Ok(msg_str) = msg.into_utf8() {
+                        if let Ok(s) = msg_str.as_str() {
+                            return Err(Error::from_reason(format!(
+                                "Transaction callback threw: {s}"
+                            )));
+                        }
+                    }
+                }
+                // Fallback: try to coerce exception to string
+                Err(Error::from_reason("Transaction callback threw an exception (could not extract message)"))
+            } else {
+                Err(Error::from_reason("Transaction callback threw an exception"))
+            }
         }
     }
 

@@ -198,37 +198,47 @@ pub fn like_match(text: &str, pattern: &str) -> bool {
     like_match_impl(&text_chars, &pattern_chars, 0, 0)
 }
 
-fn like_match_impl(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
-    if pi == pattern.len() {
-        return ti == text.len();
-    }
-    match pattern[pi] {
-        '%' => {
-            // % matches zero or more characters
-            for i in ti..=text.len() {
-                if like_match_impl(text, pattern, i, pi + 1) {
-                    return true;
+/// Iterative two-pointer LIKE matching — O(N*M) worst case.
+/// Tracks the last '%' position to backtrack greedily instead of recursing.
+fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize) -> bool {
+    let (tlen, plen) = (text.len(), pattern.len());
+    let mut star_pi: Option<usize> = None; // pattern index after last '%'
+    let mut star_ti: usize = 0; // text index when we matched last '%'
+
+    while ti < tlen || pi < plen {
+        if pi < plen {
+            match pattern[pi] {
+                '%' => {
+                    star_pi = Some(pi + 1);
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
                 }
+                '_' if ti < tlen => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                c if ti < tlen
+                    && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() =>
+                {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {} // mismatch — fall through to backtrack
             }
-            false
         }
-        '_' => {
-            // _ matches exactly one character
-            if ti < text.len() {
-                like_match_impl(text, pattern, ti + 1, pi + 1)
-            } else {
-                false
-            }
-        }
-        c => {
-            // Case-insensitive comparison (SQL LIKE is typically case-insensitive for ASCII)
-            if ti < text.len() && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() {
-                like_match_impl(text, pattern, ti + 1, pi + 1)
-            } else {
-                false
-            }
+        // Mismatch or pattern exhausted with text remaining: backtrack to last '%'
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp;
+        } else {
+            return false;
         }
     }
+    true
 }
 
 // ─── napi Binding ───────────────────────────────────────────────────────────
