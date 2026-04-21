@@ -29,7 +29,7 @@ pub struct PipelineConfig {
     pub primary_key: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RowChange {
     #[serde(rename = "queryID")]
     pub query_id: String,
