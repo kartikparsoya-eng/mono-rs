@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value as JsonValue;
 
 pub type Row = HashMap<String, serde_json::Value>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Change {
     pub table: String,
     pub prev_values: Vec<Row>,
@@ -14,16 +16,39 @@ pub struct Change {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableSpec {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_columns")]
     pub columns: Vec<String>,
     pub primary_key: Vec<String>,
     pub unique_keys: Vec<Vec<String>>,
     pub min_row_version: Option<String>,
+    #[serde(default)]
+    pub all_potential_primary_keys: Vec<Vec<String>>,
+}
+
+fn deserialize_columns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    match value {
+        JsonValue::Array(arr) => arr
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::String(s) => Ok(s),
+                _ => Err(serde::de::Error::custom("expected string in array")),
+            })
+            .collect(),
+        JsonValue::Object(map) => Ok(map.keys().cloned().collect()),
+        _ => Err(serde::de::Error::custom("expected array or object for columns")),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZqlSpec {
+    #[serde(default)]
     pub columns: HashMap<String, ColumnSpec>,
 }
 
@@ -34,6 +59,7 @@ pub struct ColumnSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableAndZqlSpec {
     pub table_spec: TableSpec,
     pub zql_spec: ZqlSpec,
@@ -493,6 +519,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
             unique_keys: vec![vec!["id".to_string()]],
             min_row_version: None,
+            all_potential_primary_keys: vec![],
         }
     }
 

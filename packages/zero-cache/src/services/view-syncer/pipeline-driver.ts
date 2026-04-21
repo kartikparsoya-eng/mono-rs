@@ -2,7 +2,10 @@ import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
 import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
 import {must} from '../../../../shared/src/must.ts';
+import {RustStorage} from '../../../../zero-ivm-rs/index.js';
+import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
 import type {AST, LiteralValue} from '../../../../zero-protocol/src/ast.ts';
+import type {Condition} from '../../../../zero-protocol/src/ast.ts';
 import type {ClientSchema} from '../../../../zero-protocol/src/client-schema.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../../zero-protocol/src/primary-key.ts';
@@ -15,6 +18,7 @@ import {ChangeIndex} from '../../../../zql/src/ivm/change-index.ts';
 import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import type {Change} from '../../../../zql/src/ivm/change.ts';
 import type {Node} from '../../../../zql/src/ivm/data.ts';
+import type {FilterOperator} from '../../../../zql/src/ivm/filter-operators.ts';
 import {
   skipYields,
   type Input,
@@ -38,38 +42,56 @@ import {
   type CompanionSubquery,
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
-import {RustStorage} from '../../../../zero-ivm-rs/index.js';
-import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
-import {isRustJoinAvailable} from './rust-join.ts';
 import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
-import type {FilterOperator} from '../../../../zql/src/ivm/filter-operators.ts';
-import type {Condition} from '../../../../zero-protocol/src/ast.ts';
+import {isRustJoinAvailable} from './rust-join.ts';
 
-type RustAdvanceFn = (dbPath: string, prevVersion: string, currVersion: string, syncableTablesJson: string, allTableNamesJson: string, permissionsTable: string, pipelineConfigsJson: string) => string;
+type RustAdvanceFn = (
+  dbPath: string,
+  prevVersion: string,
+  currVersion: string,
+  syncableTablesJson: string,
+  allTableNamesJson: string,
+  permissionsTable: string,
+  pipelineConfigsJson: string,
+) => string;
+
+type RustFanOutFn = (
+  changesJson: string,
+  pipelineConfigsJson: string,
+) => string;
 
 let rustAdvanceFn: RustAdvanceFn | undefined;
+let rustFanOutFn: RustFanOutFn | undefined;
 try {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const bindings = require('zqlite-rs');
   rustAdvanceFn = bindings?.rustAdvance;
+  rustFanOutFn = bindings?.rustFanOut;
 } catch {
   rustAdvanceFn = undefined;
+  rustFanOutFn = undefined;
 }
 
 interface RustPipelineConfig {
   query_id: string;
   source_tables: string[];
   operators: RustOperator[];
+  primary_key: string[];
 }
 type RustOperator =
   | {type: 'filter'; predicate: unknown}
   | {type: 'take'; sort: [string, string][]; limit: number | null}
-  | {type: 'exists'; relationship: string; parent_field: string[]; not_exists: boolean};
+  | {
+      type: 'exists';
+      relationship: string;
+      parent_field: string[];
+      not_exists: boolean;
+    };
 
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
-const USE_RUST_ADVANCE = USE_RUST_IVM && rustAdvanceFn !== undefined;
+const USE_RUST_ADVANCE = USE_RUST_IVM && rustFanOutFn !== undefined;
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 
 function collectExistsTypes(
@@ -646,7 +668,11 @@ export class PipelineDriver {
       });
 
       if (USE_RUST_ADVANCE) {
-        const config = this.#extractPipelineConfig(queryID, resolvedQuery, liveCompanions);
+        const config = this.#extractPipelineConfig(
+          queryID,
+          resolvedQuery,
+          liveCompanions,
+        );
         if (config) {
           this.#pipelineConfigs.set(queryID, config);
         } else {
@@ -837,7 +863,8 @@ export class PipelineDriver {
     if (ast.related && ast.related.length > 0) return null;
     if (ast.limit !== undefined) return null;
     if (companions.length > 0) return null;
-    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where)) return null;
+    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where))
+      return null;
 
     const operators: RustOperator[] = [];
     if (ast.where) {
@@ -845,7 +872,14 @@ export class PipelineDriver {
     }
 
     const sourceTables = [ast.table ?? ''];
-    return {query_id: queryID, source_tables: sourceTables, operators};
+    const tableName = ast.table ?? '';
+    const pk = this.#primaryKeys?.get(tableName) ?? [];
+    return {
+      query_id: queryID,
+      source_tables: sourceTables,
+      operators,
+      primary_key: [...pk],
+    };
   }
 
   #conditionHasCorrelatedSubquery(cond: Condition): boolean {
@@ -872,30 +906,34 @@ export class PipelineDriver {
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
   } {
-    assert(rustAdvanceFn, 'Rust advance not available');
-    const {prev, curr} = this.#snapshotter.advanceWithoutDiff();
-    const numChanges = curr.numChangesSince(prev.version) as number;
-    const dbPath = curr.db.db.name;
-    const syncableTablesJson = JSON.stringify(
-      Object.fromEntries(this.#tableSpecs),
+    assert(rustFanOutFn, 'Rust fan-out not available');
+
+    // Use TS diff (correct two-snapshot isolation) then Rust for Rayon fan-out
+    const diff = this.#snapshotter.advance(
+      this.#tableSpecs,
+      this.#allTableNames,
     );
-    const allTableNamesJson = JSON.stringify([...this.#allTableNames]);
-    const permissionsTable = '';
-    const pipelineConfigsJson = this.#serializePipelineConfigs();
+    const {prev, curr, changes: numChanges} = diff;
 
     this.#lc.debug?.(
-      `rust_advance ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines`,
+      `rust_fan_out ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines`,
     );
 
-    const resultJson = rustAdvanceFn(
-      dbPath,
-      prev.version,
-      curr.version,
-      syncableTablesJson,
-      allTableNamesJson,
-      permissionsTable,
-      pipelineConfigsJson,
-    );
+    // Collect changes from TS diff iterator
+    const collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }> = [];
+    for (const change of diff) {
+      collectedChanges.push(change);
+    }
+
+    const changesJson = JSON.stringify(collectedChanges);
+    const pipelineConfigsJson = this.#serializePipelineConfigs();
+
+    const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
 
     const result = JSON.parse(resultJson) as {
       changes: Array<{
@@ -909,43 +947,6 @@ export class PipelineDriver {
       error_type?: string;
     };
 
-    if (result.error_type === 'version_mismatch') {
-      this.#lc.warn?.('Rust advance version mismatch, retrying');
-      const retry = this.#snapshotter.advanceWithoutDiff();
-      const retryJson = rustAdvanceFn(
-        retry.curr.db.db.name,
-        retry.prev.version,
-        retry.curr.version,
-        syncableTablesJson,
-        allTableNamesJson,
-        permissionsTable,
-        pipelineConfigsJson,
-      );
-      const retryResult = JSON.parse(retryJson);
-      if (retryResult.error_type) {
-        throw new ResetPipelinesSignal(
-          retryResult.error ?? 'Rust advance retry failed',
-          retryResult.error_type,
-        );
-      }
-      for (const table of this.#tables.values()) {
-        table.setDB(retry.curr.db.db);
-      }
-      this.#ensureCostModelExistsIfEnabled(retry.curr.db.db);
-      return {
-        version: retry.curr.version,
-        numChanges,
-        changes: this.#convertRustChanges(retryResult.changes),
-      };
-    }
-
-    if (result.error_type === 'reset' || result.error_type === 'truncate') {
-      throw new ResetPipelinesSignal(
-        result.error ?? 'Rust advance signaled reset',
-        result.error_type,
-      );
-    }
-
     if (result.error) {
       throw new Error(result.error);
     }
@@ -954,7 +955,7 @@ export class PipelineDriver {
       table.setDB(curr.db.db);
     }
     this.#ensureCostModelExistsIfEnabled(curr.db.db);
-    this.#lc.debug?.(`Rust advanced to ${curr.version}`);
+    this.#lc.debug?.(`Rust fan-out advanced to ${curr.version}`);
 
     return {
       version: curr.version,

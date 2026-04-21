@@ -89,6 +89,12 @@ enum Predicate {
 impl Predicate {
     fn from_json(v: &serde_json::Value) -> Option<Self> {
         let obj = v.as_object()?;
+
+        // Check for AST where-condition format (type: "simple" | "and" | "or")
+        if let Some(typ) = obj.get("type").and_then(|t| t.as_str()) {
+            return Self::from_ast_json(obj, typ);
+        }
+
         let op = obj.get("op")?.as_str()?;
 
         match op {
@@ -143,6 +149,70 @@ impl Predicate {
             "not" => {
                 let inner = Predicate::from_json(obj.get("condition")?)?;
                 Some(Predicate::Not(Box::new(inner)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse the TS AST where-condition format.
+    fn from_ast_json(obj: &serde_json::Map<String, serde_json::Value>, typ: &str) -> Option<Self> {
+        match typ {
+            "simple" => {
+                let ast_op = obj.get("op")?.as_str()?;
+                let left = obj.get("left")?.as_object()?;
+                let right = obj.get("right")?.as_object()?;
+                let field = left.get("name")?.as_str()?.to_string();
+
+                if ast_op == "IS" {
+                    let val = right.get("value");
+                    if val.is_none() || val == Some(&serde_json::Value::Null) {
+                        return Some(Predicate::IsNull(field));
+                    }
+                    return Some(Predicate::IsNotNull(field));
+                }
+                if ast_op == "IS NOT" {
+                    return Some(Predicate::IsNotNull(field));
+                }
+                if ast_op == "IN" {
+                    if let Some(arr) = right.get("value").and_then(|v| v.as_array()) {
+                        let values: Vec<Value> = arr.iter().map(Value::from_json).collect();
+                        return Some(Predicate::In(field, values));
+                    }
+                    return None;
+                }
+                if ast_op == "LIKE" {
+                    let pattern = right.get("value")?.as_str()?.to_string();
+                    return Some(Predicate::Like(field, pattern));
+                }
+
+                let value = Value::from_json(right.get("value")?);
+                match ast_op {
+                    "=" => Some(Predicate::Eq(field, value)),
+                    "!=" => Some(Predicate::Neq(field, value)),
+                    ">" => Some(Predicate::Gt(field, value)),
+                    ">=" => Some(Predicate::Gte(field, value)),
+                    "<" => Some(Predicate::Lt(field, value)),
+                    "<=" => Some(Predicate::Lte(field, value)),
+                    _ => None,
+                }
+            }
+            "and" => {
+                let conditions: Vec<Predicate> = obj
+                    .get("conditions")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(Predicate::from_json)
+                    .collect();
+                Some(Predicate::And(conditions))
+            }
+            "or" => {
+                let conditions: Vec<Predicate> = obj
+                    .get("conditions")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(Predicate::from_json)
+                    .collect();
+                Some(Predicate::Or(conditions))
             }
             _ => None,
         }
@@ -493,6 +563,38 @@ pub fn rust_advance(
     // Cleanup
     let _ = prev_conn.execute_batch("ROLLBACK");
     let _ = curr_conn.execute_batch("ROLLBACK");
+
+    let result = AdvanceResult {
+        changes: row_changes,
+        error: None,
+        error_type: None,
+    };
+
+    serde_json::to_string(&result)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to serialize result: {}", e)))
+}
+
+// ─── Fan-out Only Entry Point ────────────────────────────────────────────────
+
+/// Accepts pre-computed changes (from TS diff) and only does Rayon fan-out
+/// over pipelines. This avoids the prev-snapshot bug where two fresh SQLite
+/// connections see the same data for edits.
+#[napi]
+pub fn rust_fan_out(
+    changes_json: String,
+    pipeline_configs_json: String,
+) -> napi::Result<String> {
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {}", e)))?;
+
+    let pipelines: Vec<PipelineConfig> = serde_json::from_str(&pipeline_configs_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse pipeline_configs: {}", e)))?;
+
+    let changes_arc = Arc::new(changes);
+    let row_changes: Vec<RowChange> = pipelines
+        .par_iter()
+        .flat_map(|pipeline| process_pipeline(pipeline, &changes_arc))
+        .collect();
 
     let result = AdvanceResult {
         changes: row_changes,
@@ -1323,5 +1425,220 @@ mod tests {
             .flat_map(|p| process_pipeline(p, &changes_arc))
             .collect();
         assert!(result.is_empty());
+    }
+
+    // ─── Phase 19: Edit Semantics Tests ─────────────────────────────────────
+
+    /// Edit split quadrant: old passes filter, new fails → remove
+    #[test]
+    fn test_edit_split_old_passes_new_fails_emits_remove() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u1"));
+        prev.insert("active".to_string(), serde_json::json!(true));
+        prev.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("active".to_string(), serde_json::json!(false));
+        next.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "remove");
+        assert!(results[0].row.is_none());
+    }
+
+    /// Edit split quadrant: old fails filter, new passes → "edit" (PK matched).
+    /// When PK matches, line 273 checks passes_filter(next) first — if true, emits "edit"
+    /// regardless of whether old passed. This is correct: the downstream operator (TS filter)
+    /// handles the split into "add" if needed. At the advance level, PK match = edit.
+    #[test]
+    fn test_edit_split_old_fails_new_passes_emits_edit() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u1"));
+        prev.insert("active".to_string(), serde_json::json!(false));
+        prev.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("active".to_string(), serde_json::json!(true));
+        next.insert("name".to_string(), serde_json::json!("Alice Updated"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next.clone()),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        assert_eq!(results.len(), 1);
+        // PK matched + new passes filter → "edit" at advance level
+        assert_eq!(results[0].change_type, "edit");
+        assert_eq!(results[0].row, Some(next));
+    }
+
+    /// Edit quadrant: both pass filter → edit with updated row data
+    #[test]
+    fn test_edit_both_pass_filter_emits_edit() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "gt", "field": "age", "value": 18}),
+            }],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u1"));
+        prev.insert("age".to_string(), serde_json::json!(25));
+        prev.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("age".to_string(), serde_json::json!(30));
+        next.insert("name".to_string(), serde_json::json!("Alice Updated"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next.clone()),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "edit");
+        assert_eq!(results[0].row, Some(next));
+    }
+
+    /// Edit quadrant: both fail filter → no output
+    #[test]
+    fn test_edit_both_fail_filter_emits_nothing() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![Operator::Filter {
+                predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+            }],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u1"));
+        prev.insert("active".to_string(), serde_json::json!(false));
+        prev.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("active".to_string(), serde_json::json!(false));
+        next.insert("name".to_string(), serde_json::json!("Bob"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        assert!(results.is_empty());
+    }
+
+    /// Insert→Delete cancellation (D-92): per-change processing produces add + remove pair.
+    /// Full cancellation (zero net output) is a higher-level property not handled at
+    /// process_change_for_pipeline level — each changelog entry is processed independently.
+    #[test]
+    fn test_insert_then_delete_same_pk_produces_add_remove_pair() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+            primary_key: vec!["id".to_string()],
+        };
+
+        // Change 1: insert
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!("u1"));
+        next.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let insert_change = Change {
+            table: "users".to_string(),
+            prev_values: vec![],
+            next_value: Some(next.clone()),
+            row_key: serde_json::json!("u1"),
+        };
+
+        let insert_results = process_change_for_pipeline(&pipeline, &insert_change);
+        assert_eq!(insert_results.len(), 1);
+        assert_eq!(insert_results[0].change_type, "add");
+        assert_eq!(insert_results[0].row, Some(next.clone()));
+
+        // Change 2: delete same PK
+        let delete_change = Change {
+            table: "users".to_string(),
+            prev_values: vec![next],
+            next_value: None,
+            row_key: serde_json::json!("u1"),
+        };
+
+        let delete_results = process_change_for_pipeline(&pipeline, &delete_change);
+        assert_eq!(delete_results.len(), 1);
+        assert_eq!(delete_results[0].change_type, "remove");
+        assert!(delete_results[0].row.is_none());
+    }
+
+    /// Update→Delete produces remove with correct row_key
+    #[test]
+    fn test_update_then_delete_emits_remove() {
+        let pipeline = PipelineConfig {
+            query_id: "q1".to_string(),
+            source_tables: vec!["users".to_string()],
+            operators: vec![],
+            primary_key: vec!["id".to_string()],
+        };
+
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!("u1"));
+        prev.insert("name".to_string(), serde_json::json!("Updated"));
+
+        let change = Change {
+            table: "users".to_string(),
+            prev_values: vec![prev],
+            next_value: None,
+            row_key: serde_json::json!("u1"),
+        };
+
+        let results = process_change_for_pipeline(&pipeline, &change);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].change_type, "remove");
+        assert!(results[0].row.is_none());
+        assert_eq!(results[0].row_key, serde_json::json!("u1"));
     }
 }
