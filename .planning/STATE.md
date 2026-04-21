@@ -27,8 +27,8 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 Phase: 20 (Rust Operator Trait & Pipeline Builder)
 Plan: Not yet planned
-Status: Ready for /gsd-discuss-phase or /gsd-plan-phase
-Last activity: 2026-04-21 -- v4.0 milestone planning complete
+Status: Ready for /gsd-discuss-phase 20
+Last activity: 2026-04-21 -- Phase 19.5 (correctness harness) retroactively tracked as complete
 
 ## Completed Milestones
 
@@ -53,6 +53,10 @@ Last activity: 2026-04-21 -- v4.0 milestone planning complete
 **Two parallel tracks:** Phases 20+21 can start in parallel. Then hydration track (22→23) and advance track (24) run in parallel, converging at Phase 26.
 
 ## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 19.5 inserted before Phase 20: Dual-Execution Correctness Harness (retroactively tracked, already complete)
 
 ### Decisions
 

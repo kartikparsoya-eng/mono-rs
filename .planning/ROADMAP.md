@@ -1,5 +1,34 @@
 # Roadmap — v4.0 Parallel IVM Runtime
 
+## Mandatory Verification Gate (All Phases)
+
+Every phase MUST pass these checks before commit:
+
+1. `npx vitest run packages/zero-cache/src/services/view-syncer/pipeline-driver.test.ts` — 28 pass, 2 pre-existing failures
+2. `ZERO_DUAL_EXEC=strict npx vitest run packages/zero-cache/src/services/view-syncer/pipeline-driver.test.ts` — dual-execution shadow mode (TS vs Rust) with no mismatches
+3. `npx vitest run packages/zero-cache/src/services/view-syncer/fuzz-ivm.test.ts` — property-based fuzz (1k iterations default)
+4. `FUZZ_NUM_RUNS=10000 npx vitest run packages/zero-cache/src/services/view-syncer/fuzz-ivm.test.ts` — extended fuzz (run periodically, mandatory before merge)
+5. All v3.0 integration tests (not-exists, join-topology, json, null, unicode, numbers, concurrency, edit-semantics)
+6. `cargo test` in both `packages/zqlite-rs/` and `packages/zero-ivm-rs/`
+
+As Rust operators expand beyond filter-only, update `fuzz-ivm.test.ts` to cover new operator types (Join, Take, Exists).
+
+---
+
+## Phase 19.5: Dual-Execution Correctness Harness (INSERTED) ✅ COMPLETE
+
+**Goal:** Build a dual-execution comparator and property-based fuzz harness to ensure Rust IVM correctness throughout v4.0 development.
+
+**Status:** Complete (commit 84504f36b)
+
+**Deliverables:**
+
+1. `dual-executor.ts` — shadow mode runs TS + Rust, compares results (`ZERO_DUAL_EXEC=strict|1|log`)
+2. `fuzz-ivm.test.ts` — fast-check property tests (10k iterations pass)
+3. Pipeline-driver integration — `#dualExecAdvance()` wired into advance path
+
+---
+
 ## Phase 20: Rust Operator Trait & Pipeline Builder
 
 **Goal:** Port the IVM operator tree to Rust — Filter, Join, Take, Exists, Skip, Cap as a unified trait with `fetch()` and `push()` methods. Build a pipeline builder that constructs operator trees from ZQL ASTs.
