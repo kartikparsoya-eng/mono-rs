@@ -14,8 +14,8 @@
 
 ## Concurrency
 
-- [ ] **CON-01**: Multiple concurrent pushes against `rust_advance()` produce deterministic results
-- [ ] **CON-02**: Pipeline add/remove during active advance doesn't corrupt state
+- [x] **CON-01**: Multiple concurrent pushes against `rust_advance()` produce deterministic results
+- [x] **CON-02**: Pipeline add/remove during active advance doesn't corrupt state
 
 ## Edit Semantics
 
@@ -25,17 +25,17 @@
 ## Traceability
 
 | REQ-ID | Phase |
-|--------|-------|
-| OPC-01 | 16 |
-| OPC-02 | 16 |
-| DAT-01 | 17 |
-| DAT-02 | 17 |
-| DAT-03 | 17 |
-| DAT-04 | 17 |
-| CON-01 | 18 |
-| CON-02 | 18 |
-| EDI-01 | 19 |
-| EDI-02 | 19 |
+| ------ | ----- |
+| OPC-01 | 16    |
+| OPC-02 | 16    |
+| DAT-01 | 17    |
+| DAT-02 | 17    |
+| DAT-03 | 17    |
+| DAT-04 | 17    |
+| CON-01 | 18    |
+| CON-02 | 18    |
+| EDI-01 | 19    |
+| EDI-02 | 19    |
 
 ## Out of Scope
 
