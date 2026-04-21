@@ -2,9 +2,9 @@
 
 ## Operator Runtime
 
-- [ ] **OPR-01**: Unified Rust `Operator` trait with `fetch()` and `push()` methods matching TS IVM semantics
-- [ ] **OPR-02**: All IVM operators (Filter, Join, Take, Exists, Skip, Cap) ported to Rust with full fetch + push support
-- [ ] **OPR-03**: Pipeline builder constructs Rust operator tree from ZQL AST, matching TS `buildPipeline()` output
+- [x] **OPR-01**: Unified Rust `Operator` trait with `fetch()` and `push()` methods matching TS IVM semantics
+- [x] **OPR-02**: All IVM operators (Filter, Join, Take, Exists, Skip, Cap) ported to Rust with full fetch + push support
+- [x] **OPR-03**: Pipeline builder constructs Rust operator tree from ZQL AST, matching TS `buildPipeline()` output
 
 ## Source & Connection
 
