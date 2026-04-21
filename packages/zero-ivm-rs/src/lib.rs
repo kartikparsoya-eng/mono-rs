@@ -13,3 +13,4 @@ pub mod cap_op;
 pub mod join_op;
 pub mod take_op;
 pub mod exists_op;
+pub mod pipeline;

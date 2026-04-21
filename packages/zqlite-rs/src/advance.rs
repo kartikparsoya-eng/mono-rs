@@ -9,24 +9,46 @@ use crate::diff::{self, Change, DiffError, Row, TableAndZqlSpec};
 
 // ─── Pipeline Topology Types ────────────────────────────────────────────────
 
-// Only Filter operators are present — non-filter types (Join, Take, Exists) are
-// excluded at the TS level by `#extractPipelineConfig()` eligibility checks.
+// Only Filter operators are actively processed — other types are accepted for
+// forward-compatibility but not yet used in the fan-out path.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Operator {
     #[serde(rename = "filter")]
     Filter { predicate: serde_json::Value },
+    #[serde(rename = "take")]
+    Take {
+        sort: Vec<(String, String)>,
+        limit: Option<i64>,
+    },
+    #[serde(rename = "exists")]
+    Exists {
+        relationship: String,
+        parent_field: Vec<String>,
+        not_exists: bool,
+    },
+    #[serde(rename = "join")]
+    Join {
+        relationship: String,
+        parent_field: Vec<String>,
+        child_field: Vec<String>,
+        child_ast: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
     pub query_id: String,
     pub source_tables: Vec<String>,
-    /// Only Filter operators — other types are excluded by TS eligibility check.
     pub operators: Vec<Operator>,
-    /// Primary key column names for matching prev rows during edits.
     #[serde(default)]
     pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub related: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub order_by: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -413,6 +435,9 @@ fn passes_filter(operators: &[Operator], row: &Row) -> bool {
                     }
                 }
             }
+            // Take, Exists, and Join are accepted for forward-compatibility
+            // but not yet evaluated in the fan-out path.
+            Operator::Take { .. } | Operator::Exists { .. } | Operator::Join { .. } => {}
         }
     }
     true

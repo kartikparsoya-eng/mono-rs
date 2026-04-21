@@ -43,6 +43,10 @@ import {
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
 import {
+  decodeAdvanceResultBuf,
+  type DecodedRowChange,
+} from './decode-advance-buf.ts';
+import {
   isDualExecEnabled,
   dualExecCompare,
   materializeChanges,
@@ -65,16 +69,21 @@ type RustFanOutFn = (
   pipelineConfigsJson: string,
 ) => string;
 
+type RustHydrateFn = (dbPath: string, queriesJson: string) => Buffer;
+
 let rustAdvanceFn: RustAdvanceFn | undefined;
 let rustFanOutFn: RustFanOutFn | undefined;
+let rustHydrateFn: RustHydrateFn | undefined;
 try {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const bindings = require('zqlite-rs');
   rustAdvanceFn = bindings?.rustAdvance;
   rustFanOutFn = bindings?.rustFanOut;
+  rustHydrateFn = bindings?.rustHydrate;
 } catch {
   rustAdvanceFn = undefined;
   rustFanOutFn = undefined;
+  rustHydrateFn = undefined;
 }
 
 interface RustPipelineConfig {
@@ -82,6 +91,14 @@ interface RustPipelineConfig {
   source_tables: string[];
   operators: RustOperator[];
   primary_key: string[];
+  related?: Array<{
+    relationship: string;
+    parent_field: string[];
+    child_field: string[];
+    child_ast: unknown;
+  }>;
+  limit?: number | null;
+  order_by?: [string, string][];
 }
 type RustOperator =
   | {type: 'filter'; predicate: unknown}
@@ -91,12 +108,23 @@ type RustOperator =
       relationship: string;
       parent_field: string[];
       not_exists: boolean;
+    }
+  | {
+      type: 'join';
+      relationship: string;
+      parent_field: string[];
+      child_field: string[];
+      child_ast: unknown;
     };
 
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
 const USE_RUST_ADVANCE = USE_RUST_IVM && rustFanOutFn !== undefined;
+const USE_RUST_HYDRATION =
+  USE_RUST_IVM &&
+  process.env.ZERO_DISABLE_RUST_HYDRATION !== '1' &&
+  rustHydrateFn !== undefined;
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 
 function collectExistsTypes(
@@ -579,12 +607,16 @@ export class PipelineDriver {
         },
       });
 
-      yield* hydrateInternal(
-        input,
-        queryID,
-        must(this.#primaryKeys),
-        this.#tableSpecs,
-      );
+      if (USE_RUST_HYDRATION && companionMeta.length === 0) {
+        yield* this.#rustHydrate(queryID, resolvedQuery);
+      } else {
+        yield* hydrateInternal(
+          input,
+          queryID,
+          must(this.#primaryKeys),
+          this.#tableSpecs,
+        );
+      }
 
       for (const {table, row} of companionRows) {
         const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
@@ -867,17 +899,49 @@ export class PipelineDriver {
   #extractPipelineConfig(
     queryID: string,
     ast: AST,
-    companions: readonly CompanionPipeline[],
+    _companions: readonly CompanionPipeline[],
   ): RustPipelineConfig | null {
-    if (ast.related && ast.related.length > 0) return null;
-    if (ast.limit !== undefined) return null;
-    if (companions.length > 0) return null;
-    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where))
+    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where)) {
       return null;
+    }
 
     const operators: RustOperator[] = [];
+    const existsTypes = collectExistsTypes(ast.where);
+
     if (ast.where) {
       operators.push({type: 'filter', predicate: ast.where});
+    }
+
+    if (ast.related) {
+      for (const rel of ast.related) {
+        if (rel.system === 'exists') {
+          operators.push({
+            type: 'exists',
+            relationship: rel.subquery.table ?? '',
+            parent_field: rel.correlation.parentField,
+            not_exists:
+              existsTypes.get(
+                rel.subquery.alias ?? rel.subquery.table ?? '',
+              ) === 'NOT EXISTS',
+          });
+        } else {
+          operators.push({
+            type: 'join',
+            relationship: rel.subquery.table ?? '',
+            parent_field: rel.correlation.parentField,
+            child_field: rel.correlation.childField,
+            child_ast: rel.subquery,
+          });
+        }
+      }
+    }
+
+    if (ast.limit !== undefined) {
+      operators.push({
+        type: 'take',
+        sort: (ast.orderBy ?? []).map(([col, dir]) => [col, dir]),
+        limit: ast.limit,
+      });
     }
 
     const sourceTables = [ast.table ?? ''];
@@ -888,6 +952,14 @@ export class PipelineDriver {
       source_tables: sourceTables,
       operators,
       primary_key: [...pk],
+      related: ast.related?.map(r => ({
+        relationship: r.subquery.table ?? '',
+        parent_field: r.correlation.parentField,
+        child_field: r.correlation.childField,
+        child_ast: r.subquery,
+      })),
+      limit: ast.limit,
+      order_by: ast.orderBy?.map(([col, dir]) => [col, dir]),
     };
   }
 
@@ -903,7 +975,10 @@ export class PipelineDriver {
     this.#useRustAdvance =
       USE_RUST_ADVANCE &&
       this.#pipelines.size > 0 &&
-      this.#pipelineConfigs.size === this.#pipelines.size;
+      this.#pipelineConfigs.size === this.#pipelines.size &&
+      [...this.#pipelineConfigs.values()].every(c =>
+        c.operators.every(op => op.type === 'filter'),
+      );
   }
 
   #serializePipelineConfigs(): string {
@@ -973,6 +1048,50 @@ export class PipelineDriver {
     };
   }
 
+  *#rustHydrate(
+    queryID: string,
+    resolvedQuery: AST,
+  ): Iterable<RowChange | 'yield'> {
+    assert(rustHydrateFn, 'Rust hydrate not available');
+    const db = this.#snapshotter.current().db;
+    const tableName = resolvedQuery.table ?? '';
+    const pk = this.#primaryKeys?.get(tableName) ?? [];
+    const queriesJson = JSON.stringify([
+      {
+        query_id: queryID,
+        ast: resolvedQuery,
+        primary_key: [...pk],
+      },
+    ]);
+    const resultBuf = rustHydrateFn(db.db.name, queriesJson);
+    const decoded = decodeAdvanceResultBuf(resultBuf);
+    if (decoded.error) {
+      throw new Error(`Rust hydration failed: ${decoded.error}`);
+    }
+    yield* this.#convertDecodedChanges(queryID, decoded.changes);
+  }
+
+  *#convertDecodedChanges(
+    queryID: string,
+    changes: DecodedRowChange[],
+  ): Iterable<RowChange | 'yield'> {
+    for (const change of changes) {
+      const type =
+        change.type === 'add'
+          ? ChangeType.ADD
+          : change.type === 'edit'
+            ? ChangeType.EDIT
+            : ChangeType.REMOVE;
+      yield {
+        type,
+        queryID,
+        table: change.table,
+        rowKey: change.row_key,
+        row: change.row ?? (change.row_key as Row),
+      } as RowChange;
+    }
+  }
+
   *#convertRustChanges(
     changes: Array<{
       queryID: string;
@@ -1030,6 +1149,10 @@ export class PipelineDriver {
     for (const change of diff) {
       collectedChanges.push(change);
     }
+
+    this.#lc.debug?.(
+      `dual-exec: ${this.#pipelineConfigs.size} pipelines (full tree)`,
+    );
 
     // 2. Run Rust fan-out on collected changes
     let rustChanges: RowChange[] = [];
