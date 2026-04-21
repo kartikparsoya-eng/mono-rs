@@ -8,10 +8,10 @@ last_updated: '2026-04-21T18:55:00.000Z'
 last_activity: 2026-04-21
 progress:
   total_phases: 10
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 7
   completed_plans: 8
-  percent: 40
+  percent: 50
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** All SQLite I/O and row-level computation in Rust with multi-core parallelism
-**Current focus:** Phase 24 — Parallel Advance (Full Operator Tree)
+**Current focus:** Phase 25 — Parallel Advance (Full Operator Tree)
 
 ## Current Position
 
-Phase: 24
+Phase: 25
 Plan: Not started
-Status: Phase 23 complete, advancing to Phase 24
+Status: Phase 24 complete, advancing to Phase 25
 Last activity: 2026-04-21
 
 ## Completed Milestones
@@ -44,7 +44,7 @@ Last activity: 2026-04-21
 | 21    | Rust TableSource + Connection Pool     | —          | ✅ Complete |
 | 22    | Parallel Multi-Pipeline Hydration      | 20, 21     | ✅ Complete |
 | 23    | Within-Pipeline Child Parallelism      | 22         | ✅ Complete |
-| 24    | Parallel Advance (Full Operator Tree)  | 20, 21     | Pending     |
+| 24    | Parallel Advance (Full Operator Tree)  | 20, 21     | ✅ Complete |
 | 25    | Serialization Format & FFI             | 22, 24     | Pending     |
 | 26    | Pipeline-Driver TS Integration         | 22, 24, 25 | Pending     |
 | 27    | Cross-ViewSyncer Poke Dispatch         | 24, 26     | Pending     |

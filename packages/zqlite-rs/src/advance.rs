@@ -606,6 +606,304 @@ pub fn rust_fan_out(
         .map_err(|e| napi::Error::from_reason(format!("Failed to serialize result: {}", e)))
 }
 
+// ─── Full Advance (Phase 24) ────────────────────────────────────────────────
+
+use crate::hydrate::build_push_operator_chain;
+use crate::source::SourceChange;
+use crate::table_source::RustTableSource;
+use zero_ivm_rs::pipeline::OperatorConfig;
+use zero_ivm_rs::types::Change as IvmChange;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FullPipelineConfig {
+    pub query_id: String,
+    pub source_table: String,
+    pub operator_config: Vec<OperatorConfig>,
+    pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub split_edit_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FullAdvanceResult {
+    pub changes: Vec<RowChange>,
+    pub error: Option<String>,
+    pub error_type: Option<String>,
+    pub reset: bool,
+}
+
+/// Convert a diff::Row (HashMap) to a source::Row (serde_json::Map).
+fn diff_row_to_source_row(h: &crate::diff::Row) -> crate::source::Row {
+    h.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+fn diff_change_to_source_changes(
+    change: &Change,
+    primary_key: &[String],
+) -> Vec<SourceChange> {
+    let mut results = Vec::new();
+
+    // Match prev_values to next_value by primary key
+    if change.prev_values.is_empty() {
+        // Pure Add
+        if let Some(ref nv) = change.next_value {
+            results.push(SourceChange::Add(diff_row_to_source_row(nv)));
+        }
+    } else if change.next_value.is_none() {
+        // Pure Remove(s)
+        for pv in &change.prev_values {
+            results.push(SourceChange::Remove(diff_row_to_source_row(pv)));
+        }
+    } else {
+        let nv = change.next_value.as_ref().unwrap();
+        let next_pk: Vec<Option<&serde_json::Value>> =
+            primary_key.iter().map(|k| nv.get(k)).collect();
+
+        let mut matched = false;
+        for pv in &change.prev_values {
+            let prev_pk: Vec<Option<&serde_json::Value>> =
+                primary_key.iter().map(|k| pv.get(k)).collect();
+            if prev_pk == next_pk {
+                results.push(SourceChange::Edit {
+                    row: diff_row_to_source_row(nv),
+                    old_row: diff_row_to_source_row(pv),
+                });
+                matched = true;
+            } else {
+                results.push(SourceChange::Remove(diff_row_to_source_row(pv)));
+            }
+        }
+        if !matched {
+            results.push(SourceChange::Add(diff_row_to_source_row(nv)));
+        }
+    }
+    results
+}
+
+fn ivm_change_to_row_changes(
+    change: &IvmChange,
+    query_id: &str,
+    table: &str,
+    primary_key: &[String],
+) -> Vec<RowChange> {
+    fn extract_row_key(
+        row: &serde_json::Map<String, serde_json::Value>,
+        primary_key: &[String],
+    ) -> serde_json::Value {
+        if primary_key.len() == 1 {
+            row.get(&primary_key[0])
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Array(
+                primary_key
+                    .iter()
+                    .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
+                    .collect(),
+            )
+        }
+    }
+
+    match change {
+        IvmChange::Add(node) => vec![RowChange {
+            query_id: query_id.to_string(),
+            table: table.to_string(),
+            row_key: extract_row_key(&node.row, primary_key),
+            row: Some(node.row.clone().into_iter().collect()),
+            change_type: "add".to_string(),
+        }],
+        IvmChange::Remove(node) => vec![RowChange {
+            query_id: query_id.to_string(),
+            table: table.to_string(),
+            row_key: extract_row_key(&node.row, primary_key),
+            row: None,
+            change_type: "remove".to_string(),
+        }],
+        IvmChange::Edit { node, old_node: _ } => vec![RowChange {
+            query_id: query_id.to_string(),
+            table: table.to_string(),
+            row_key: extract_row_key(&node.row, primary_key),
+            row: Some(node.row.clone().into_iter().collect()),
+            change_type: "edit".to_string(),
+        }],
+        IvmChange::Child { node: _, child } => {
+            // Child changes propagate as edits to the parent row
+            // For now, represent as a child change type
+            vec![RowChange {
+                query_id: query_id.to_string(),
+                table: table.to_string(),
+                row_key: serde_json::Value::Null,
+                row: None,
+                change_type: "child".to_string(),
+            }]
+        }
+    }
+}
+
+pub fn advance_pipelines_full(
+    db_path: &str,
+    changes: &[Change],
+    pipelines: &[FullPipelineConfig],
+) -> FullAdvanceResult {
+    // Process pipelines in parallel — each gets its own RustTableSource
+    let changes_arc = Arc::new(changes.to_vec());
+
+    let all_row_changes: Vec<Vec<RowChange>> = pipelines
+        .par_iter()
+        .map(|pipeline| {
+            process_full_pipeline(db_path, pipeline, &changes_arc)
+        })
+        .collect();
+
+    let row_changes: Vec<RowChange> = all_row_changes.into_iter().flatten().collect();
+
+    FullAdvanceResult {
+        changes: row_changes,
+        error: None,
+        error_type: None,
+        reset: false,
+    }
+}
+
+fn process_full_pipeline(
+    db_path: &str,
+    pipeline: &FullPipelineConfig,
+    changes: &[Change],
+) -> Vec<RowChange> {
+    // Extract column info from the Source config
+    let (table_name, columns, pk, sort) = match &pipeline.operator_config[0] {
+        OperatorConfig::Source {
+            table_name,
+            columns,
+            primary_key,
+            sort,
+        } => (table_name.clone(), columns.clone(), primary_key.clone(), sort.clone()),
+        _ => return vec![],
+    };
+
+    // Create RustTableSource for this pipeline's root table
+    let mut column_types = HashMap::new();
+    for c in &columns {
+        column_types.insert(c.clone(), crate::query_builder::ColumnType::String);
+    }
+    let mut source = match RustTableSource::new(
+        db_path, 2, table_name.clone(), columns, column_types, pk.clone(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("advance_full: failed to create source for {table_name}: {e}");
+            return vec![];
+        }
+    };
+
+    // Connect with sort + split_edit_keys
+    let split_keys: Option<HashSet<String>> = if pipeline.split_edit_keys.is_empty() {
+        None
+    } else {
+        Some(pipeline.split_edit_keys.iter().cloned().collect())
+    };
+    source.connect(Some(sort), None, split_keys);
+
+    let source_arc = Arc::new(source);
+
+    // Build push operator chain (everything after Source)
+    let mut op_chain = match build_push_operator_chain(source_arc.clone(), &pipeline.operator_config) {
+        Ok(Some(chain)) => chain,
+        Ok(None) => {
+            // No operators after Source — just convert changes directly
+            return changes_to_row_changes_direct(changes, pipeline, &table_name, &pk);
+        }
+        Err(e) => {
+            eprintln!("advance_full: failed to build push chain for {}: {e}", pipeline.query_id);
+            return vec![];
+        }
+    };
+
+    // Filter changes for this pipeline's table and push through
+    let mut row_changes = Vec::new();
+    for change in changes.iter() {
+        if change.table != pipeline.source_table {
+            continue;
+        }
+
+        let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+        for sc in source_changes {
+            let ivm_change = source_change_to_ivm_change(&sc);
+            let output_changes = op_chain.push(ivm_change);
+            for oc in &output_changes {
+                row_changes.extend(ivm_change_to_row_changes(
+                    oc,
+                    &pipeline.query_id,
+                    &change.table,
+                    &pipeline.primary_key,
+                ));
+            }
+        }
+    }
+
+    row_changes
+}
+
+fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
+    let make_node = |row: &crate::source::Row| zero_ivm_rs::types::Node {
+        row: row.clone(),
+        relationships: HashMap::new(),
+    };
+    match sc {
+        SourceChange::Add(row) => IvmChange::Add(make_node(row)),
+        SourceChange::Remove(row) => IvmChange::Remove(make_node(row)),
+        SourceChange::Edit { row, old_row } => IvmChange::Edit {
+            node: make_node(row),
+            old_node: make_node(old_row),
+        },
+    }
+}
+
+fn changes_to_row_changes_direct(
+    changes: &[Change],
+    pipeline: &FullPipelineConfig,
+    table_name: &str,
+    primary_key: &[String],
+) -> Vec<RowChange> {
+    let mut row_changes = Vec::new();
+    for change in changes {
+        if change.table != pipeline.source_table {
+            continue;
+        }
+        let source_changes = diff_change_to_source_changes(change, primary_key);
+        for sc in &source_changes {
+            let ivm_change = source_change_to_ivm_change(sc);
+            row_changes.extend(ivm_change_to_row_changes(
+                &ivm_change,
+                &pipeline.query_id,
+                table_name,
+                primary_key,
+            ));
+        }
+    }
+    row_changes
+}
+
+/// NAPI entry point: full advance with complete operator tree support.
+/// Replaces `rust_fan_out` for pipelines with Join/Take/Exists operators.
+#[napi]
+pub fn rust_advance_full(
+    db_path: String,
+    changes_json: String,
+    pipeline_configs_json: String,
+) -> napi::Result<String> {
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+
+    let pipelines: Vec<FullPipelineConfig> = serde_json::from_str(&pipeline_configs_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse pipeline_configs: {e}")))?;
+
+    let result = advance_pipelines_full(&db_path, &changes, &pipelines);
+
+    serde_json::to_string(&result)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to serialize result: {e}")))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
