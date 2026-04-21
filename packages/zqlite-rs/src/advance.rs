@@ -1110,4 +1110,218 @@ mod tests {
         let results = process_pipeline(&pipeline, &changes);
         assert_eq!(results.len(), 0);
     }
+
+    // ─── Rayon determinism helpers & tests ───────────────────────────────────
+
+    fn sorted_row_changes(changes: &[RowChange]) -> Vec<&RowChange> {
+        let mut sorted: Vec<&RowChange> = changes.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.query_id
+                .cmp(&b.query_id)
+                .then_with(|| a.row_key.to_string().cmp(&b.row_key.to_string()))
+        });
+        sorted
+    }
+
+    fn make_add_change(table: &str, id: &str, val: i64, active: bool, category: &str) -> Change {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        row.insert("val".to_string(), serde_json::json!(val));
+        row.insert("active".to_string(), serde_json::json!(active));
+        row.insert("category".to_string(), serde_json::json!(category));
+        Change {
+            table: table.to_string(),
+            prev_values: vec![],
+            next_value: Some(row),
+            row_key: serde_json::json!(id),
+        }
+    }
+
+    fn make_edit_change(table: &str, id: &str, old_val: i64, new_val: i64) -> Change {
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!(id));
+        prev.insert("val".to_string(), serde_json::json!(old_val));
+        prev.insert("active".to_string(), serde_json::json!(true));
+        prev.insert("category".to_string(), serde_json::json!("a"));
+        let mut next = Row::new();
+        next.insert("id".to_string(), serde_json::json!(id));
+        next.insert("val".to_string(), serde_json::json!(new_val));
+        next.insert("active".to_string(), serde_json::json!(true));
+        next.insert("category".to_string(), serde_json::json!("a"));
+        Change {
+            table: table.to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next),
+            row_key: serde_json::json!(id),
+        }
+    }
+
+    fn make_delete_change(table: &str, id: &str) -> Change {
+        let mut prev = Row::new();
+        prev.insert("id".to_string(), serde_json::json!(id));
+        prev.insert("val".to_string(), serde_json::json!(100));
+        prev.insert("active".to_string(), serde_json::json!(false));
+        prev.insert("category".to_string(), serde_json::json!("b"));
+        Change {
+            table: "items".to_string(),
+            prev_values: vec![prev],
+            next_value: None,
+            row_key: serde_json::json!(id),
+        }
+    }
+
+    fn make_20_pipelines() -> Vec<PipelineConfig> {
+        let categories = ["a", "b", "c"];
+        (0..20)
+            .map(|i| {
+                let operators = match i {
+                    0..=4 => vec![],
+                    5..=9 => vec![Operator::Filter {
+                        predicate: serde_json::json!({"op": "gt", "field": "val", "value": i * 10}),
+                    }],
+                    10..=14 => vec![Operator::Filter {
+                        predicate: serde_json::json!({"op": "eq", "field": "active", "value": true}),
+                    }],
+                    15..=17 => vec![Operator::Filter {
+                        predicate: serde_json::json!({"op": "in", "field": "category", "values": ["a", "b"]}),
+                    }],
+                    _ => vec![Operator::Filter {
+                        predicate: serde_json::json!({
+                            "op": "and",
+                            "conditions": [
+                                {"op": "gt", "field": "val", "value": 0},
+                                {"op": "eq", "field": "active", "value": true}
+                            ]
+                        }),
+                    }],
+                };
+                PipelineConfig {
+                    query_id: format!("q{}", i),
+                    source_tables: vec!["items".to_string()],
+                    primary_key: vec!["id".to_string()],
+                    operators,
+                }
+            })
+            .collect()
+    }
+
+    fn make_50_changes() -> Vec<Change> {
+        let categories = ["a", "b", "c"];
+        let mut changes = Vec::with_capacity(50);
+        for i in 0..30 {
+            changes.push(make_add_change(
+                "items",
+                &format!("r{}", i),
+                (i as i64) * 10,
+                i % 2 == 0,
+                categories[i % 3],
+            ));
+        }
+        for i in 0..10 {
+            changes.push(make_edit_change(
+                "items",
+                &format!("e{}", i),
+                (i as i64) * 5,
+                (i as i64) * 5 + 100,
+            ));
+        }
+        for i in 0..10 {
+            changes.push(make_delete_change("items", &format!("d{}", i)));
+        }
+        changes
+    }
+
+    #[test]
+    fn test_par_iter_determinism_20_pipelines_50_iterations() {
+        let pipelines = make_20_pipelines();
+        let changes = make_50_changes();
+        let changes_arc = Arc::new(changes);
+
+        let baseline: Vec<RowChange> = pipelines
+            .par_iter()
+            .flat_map(|p| process_pipeline(p, &changes_arc))
+            .collect();
+        assert!(
+            !baseline.is_empty(),
+            "baseline must produce results to be a meaningful test"
+        );
+        let baseline_sorted = sorted_row_changes(&baseline);
+
+        for i in 0..50 {
+            let result: Vec<RowChange> = pipelines
+                .par_iter()
+                .flat_map(|p| process_pipeline(p, &changes_arc))
+                .collect();
+            let result_sorted = sorted_row_changes(&result);
+            assert_eq!(
+                baseline_sorted, result_sorted,
+                "determinism failed on iteration {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_par_iter_determinism_preserves_pipeline_order() {
+        let pipelines: Vec<PipelineConfig> = (0..10)
+            .map(|i| PipelineConfig {
+                query_id: format!("order_q{}", i),
+                source_tables: vec!["items".to_string()],
+                primary_key: vec!["id".to_string()],
+                operators: vec![],
+            })
+            .collect();
+        let changes: Vec<Change> = (0..5)
+            .map(|i| make_add_change("items", &format!("p{}", i), i as i64, true, "a"))
+            .collect();
+        let changes_arc = Arc::new(changes);
+
+        for iteration in 0..50 {
+            let result: Vec<RowChange> = pipelines
+                .par_iter()
+                .flat_map(|p| process_pipeline(p, &changes_arc))
+                .collect();
+            let mut last_seen_index: i32 = -1;
+            for rc in &result {
+                let idx = rc
+                    .query_id
+                    .strip_prefix("order_q")
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                assert!(
+                    idx >= last_seen_index,
+                    "pipeline order violated at iteration {}: saw q{} after q{}",
+                    iteration,
+                    idx,
+                    last_seen_index
+                );
+                last_seen_index = idx;
+            }
+        }
+    }
+
+    #[test]
+    fn test_par_iter_empty_pipelines_no_panic() {
+        let pipelines: Vec<PipelineConfig> = vec![];
+        let changes = make_50_changes();
+        let changes_arc = Arc::new(changes);
+        let result: Vec<RowChange> = pipelines
+            .par_iter()
+            .flat_map(|p| process_pipeline(p, &changes_arc))
+            .collect();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_par_iter_empty_changes_no_panic() {
+        let pipelines = make_20_pipelines();
+        let changes: Vec<Change> = vec![];
+        let changes_arc = Arc::new(changes);
+        let result: Vec<RowChange> = pipelines
+            .par_iter()
+            .flat_map(|p| process_pipeline(p, &changes_arc))
+            .collect();
+        assert!(result.is_empty());
+    }
 }
