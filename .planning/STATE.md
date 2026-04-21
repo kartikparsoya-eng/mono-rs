@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v3.0
-milestone_name: milestone
-status: executing
-stopped_at: Phase 19 complete
-last_updated: '2026-04-21T07:15:00.000Z'
-last_activity: 2026-04-21 -- Phase 19 edit semantics complete
+milestone: v4.0
+milestone_name: Parallel IVM Runtime
+status: planning
+stopped_at: Milestone planning complete
+last_updated: '2026-04-21T10:00:00.000Z'
+last_activity: 2026-04-21 -- v4.0 milestone planning, v3.0 archived
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 6
-  completed_plans: 6
-  percent: 100
+  total_phases: 9
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -20,22 +20,37 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-04-21)
 
-**Core value:** All SQLite I/O and row-level computation in Rust for 5-10x throughput
-**Current focus:** v3.0 milestone complete — all phases done
+**Core value:** All SQLite I/O and row-level computation in Rust with multi-core parallelism
+**Current focus:** v4.0 Parallel IVM Runtime — move full operator tree to Rust
 
 ## Current Position
 
-Phase: 19
-Plan: All complete
-Status: Ready for milestone completion
-Last activity: 2026-04-21 -- Phase 19 edit semantics complete
+Phase: 20 (Rust Operator Trait & Pipeline Builder)
+Plan: Not yet planned
+Status: Ready for /gsd-discuss-phase or /gsd-plan-phase
+Last activity: 2026-04-21 -- v4.0 milestone planning complete
 
-## Completed Phases
+## Completed Milestones
 
-- **Phase 16:** NOT EXISTS & Join Topology Tests ✅ (2 plans, 11 new tests)
-- **Phase 17:** Data Type Diversity Tests ✅ (2 plans, 19 new tests)
-- **Phase 18:** Concurrency & Rayon Determinism Tests ✅ (2 plans, 10 new tests)
-- **Phase 19:** Edit Semantics Verification ✅ (2 plans, rust_fan_out fix + 10 new tests)
+- **v1.0:** Rust SQLite Foundation (2026-04-20) — binary buffer protocol, hot read path
+- **v2.0:** IVM Operators in Rust (2026-04-21) — Filter, Join, Take, Exists, Rayon fan-out
+- **v3.0:** Test Coverage & Correctness Hardening (2026-04-21) — 139 tests, E2E Docker validation
+
+## v4.0 Phase Overview
+
+| Phase | Name                                   | Depends On | Status  |
+| ----- | -------------------------------------- | ---------- | ------- |
+| 20    | Rust Operator Trait & Pipeline Builder | —          | Pending |
+| 21    | Rust TableSource + Connection Pool     | —          | Pending |
+| 22    | Parallel Multi-Pipeline Hydration      | 20, 21     | Pending |
+| 23    | Within-Pipeline Child Parallelism      | 22         | Pending |
+| 24    | Parallel Advance (Full Operator Tree)  | 20, 21     | Pending |
+| 25    | Serialization Format & FFI             | 22, 24     | Pending |
+| 26    | Pipeline-Driver TS Integration         | 22, 24, 25 | Pending |
+| 27    | Cross-ViewSyncer Poke Dispatch         | 24, 26     | Pending |
+| 28    | E2E Validation & Benchmarks            | 26, 27     | Pending |
+
+**Two parallel tracks:** Phases 20+21 can start in parallel. Then hydration track (22→23) and advance track (24) run in parallel, converging at Phase 26.
 
 ## Accumulated Context
 
@@ -43,9 +58,19 @@ Last activity: 2026-04-21 -- Phase 19 edit semantics complete
 
 All v1.0 decisions archived in `.planning/milestones/v1.0-ROADMAP.md`.
 All v2.0 decisions archived in `.planning/milestones/v2.0-ROADMAP.md`.
+All v3.0 decisions archived in `.planning/milestones/v3.0-ROADMAP.md`.
+
+### Key Architecture Insight (v4.0)
+
+- `input.fetch({})` during hydration goes through the FULL IVM operator tree — Filter, Join, Take, Exists all do real work
+- Join.fetch() fires separate SQLite queries per parent row per relationship (N\*M child queries)
+- Can't just batch SQL strings — child queries depend on parent row values (lazy closures)
+- Only way to parallelize: move operator tree to Rust, use connection pool with Rayon
+- napi `Env` is not Send — must use binary serialization for Rust → TS transfer
+- TS boundary: orchestration + I/O (CVR, pokes, auth, locks). Rust boundary: computation (SQLite, IVM, parallelism)
 
 ## Session Continuity
 
-Last session: 2026-04-21T07:15:00.000Z
-Stopped at: Phase 19 complete
-Resume: Run /gsd-complete-milestone v3.0
+Last session: 2026-04-21T10:00:00.000Z
+Stopped at: v4.0 milestone planning complete
+Resume: Run /gsd-discuss-phase 20 or /gsd-plan-phase 20
