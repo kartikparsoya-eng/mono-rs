@@ -178,10 +178,24 @@ describe('pipeline-driver edge cases', () => {
     pipelines.init(clientSchema);
 
     // Filter-only query (eligible for Rust IVM)
-    [...pipelines.addQuery('hash-filter', 'qFilter', OPEN_ISSUES_ONLY, startTimer())];
+    [
+      ...pipelines.addQuery(
+        'hash-filter',
+        'qFilter',
+        OPEN_ISSUES_ONLY,
+        startTimer(),
+      ),
+    ];
 
     // JOIN query (ineligible for Rust IVM)
-    [...pipelines.addQuery('hash-join', 'qJoin', ISSUES_AND_COMMENTS, startTimer())];
+    [
+      ...pipelines.addQuery(
+        'hash-join',
+        'qJoin',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    ];
 
     replicator.processTransaction(
       '134',
@@ -208,7 +222,12 @@ describe('pipeline-driver edge cases', () => {
 
     // Add a second pipeline after the first advance
     const hydration = [
-      ...pipelines.addQuery('hash-join', 'q2', ISSUES_AND_COMMENTS, startTimer()),
+      ...pipelines.addQuery(
+        'hash-join',
+        'q2',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
     ];
     expect(hydration.length).toBeGreaterThan(0);
 
@@ -226,7 +245,12 @@ describe('pipeline-driver edge cases', () => {
     pipelines.init(clientSchema);
     [...pipelines.addQuery('hash1', 'q1', OPEN_ISSUES_ONLY, startTimer())];
     [
-      ...pipelines.addQuery('hash-join', 'q2', ISSUES_AND_COMMENTS, startTimer()),
+      ...pipelines.addQuery(
+        'hash-join',
+        'q2',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
     ];
 
     replicator.processTransaction(
@@ -271,8 +295,67 @@ describe('pipeline-driver edge cases', () => {
     replicator.processTransaction('134', ...inserts);
 
     const result = changes();
-    const addResults = result.filter(c => c.queryID === 'q1' && c.table === 'issues');
+    const addResults = result.filter(
+      c => c.queryID === 'q1' && c.table === 'issues',
+    );
     expect(addResults.length).toBe(500);
+  });
+
+  // Regression test: Without initializeTakeState() after Rust hydration,
+  // Take.push() silently drops ALL changes because takeState is uninitialized.
+  // This test runs without ZERO_DUAL_EXEC, so hydration goes through
+  // #rustHydrate (the production path) which bypasses input.fetch().
+  test('LIMIT query remains reactive after Rust hydration', () => {
+    const ISSUES_WITH_LIMIT: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      limit: 2,
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-limit',
+        'queryLimit',
+        ISSUES_WITH_LIMIT,
+        startTimer(),
+      ),
+    ];
+
+    // Hydration should return issues '1' and '2' (LIMIT 2, ORDER BY id ASC)
+    const hydratedIssues = hydrated.filter(r => r.table === 'issues');
+    expect(hydratedIssues).toHaveLength(2);
+    expect(hydratedIssues.map(r => r.rowKey)).toEqual(
+      expect.arrayContaining([{id: '1'}, {id: '2'}]),
+    );
+
+    // Insert issue '0' which sorts before '1', pushing '2' out of the window
+    replicator.processTransaction(
+      '134',
+      messages.insert('issues', {id: '0', closed: 0}),
+    );
+
+    const result = changes();
+    const issueChanges = result.filter(
+      c => c.queryID === 'queryLimit' && c.table === 'issues',
+    );
+
+    // Without the fix, issueChanges would be empty (Take drops everything)
+    expect(issueChanges.length).toBeGreaterThanOrEqual(1);
+
+    // Issue '0' should enter the window
+    expect(issueChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 0, rowKey: {id: '0'}}),
+      ]),
+    );
+
+    // Issue '2' should fall out of the window
+    expect(issueChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 1, rowKey: {id: '2'}}),
+      ]),
+    );
   });
 
   test('ZERO_DISABLE_RUST_IVM=1 forces TS path and produces correct output', () => {
