@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 27 verified and complete
-last_updated: '2026-04-22T03:30:00.000Z'
-last_activity: 2026-04-22 -- Phase 27 verified and complete
+status: complete
+stopped_at: All phases complete
+last_updated: '2026-04-22T11:23:00.000Z'
+last_activity: 2026-04-22 -- Phase 29 complete: Dual-Exec Correctness Hardening
 progress:
-  total_phases: 10
-  completed_phases: 7
-  total_plans: 18
-  completed_plans: 16
-  percent: 89
+  total_phases: 11
+  completed_phases: 11
+  total_plans: 22
+  completed_plans: 22
+  percent: 100
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** All SQLite I/O and row-level computation in Rust with multi-core parallelism
-**Current focus:** Phase 28 — E2E Validation & Benchmark Suite
+**Current focus:** Phase 29 — Dual-Exec Correctness Hardening
 
 ## Current Position
 
-Phase: 28 (E2E Validation & Benchmark Suite) — NOT STARTED
-Plan: 0 of 0
-Status: Ready for discuss
-Last activity: 2026-04-22 -- Phase 27 verified and complete
+Phase: 29 (Dual-Exec Correctness Hardening) — COMPLETE
+Plan: 3 of 3
+Status: All phases complete
+Last activity: 2026-04-22 -- Phase 29 verified and complete
 
 ## Completed Milestones
 
@@ -48,7 +48,8 @@ Last activity: 2026-04-22 -- Phase 27 verified and complete
 | 25    | Serialization Format & FFI             | 22, 24     | ✅ Complete |
 | 26    | Pipeline-Driver TS Integration         | 22, 24, 25 | ✅ Complete |
 | 27    | Cross-ViewSyncer Poke Dispatch         | 24, 26     | ✅ Complete |
-| 28    | E2E Validation & Benchmarks            | 26, 27     | In Progress |
+| 28    | E2E Validation & Benchmarks            | 26, 27     | ✅ Complete |
+| 29    | Dual-Exec Correctness Hardening        | 28         | ✅ Complete |
 
 **Two parallel tracks:** Phases 20+21 can start in parallel. Then hydration track (22→23) and advance track (24) run in parallel, converging at Phase 26.
 
@@ -57,6 +58,7 @@ Last activity: 2026-04-22 -- Phase 27 verified and complete
 ### Roadmap Evolution
 
 - Phase 19.5 inserted before Phase 20: Dual-Execution Correctness Harness (retroactively tracked, already complete)
+- Phase 29 added: Dual-Exec Correctness Hardening (close coverage gaps found in Phase 28 audit)
 
 ### Decisions
 
@@ -75,6 +77,6 @@ All v3.0 decisions archived in `.planning/milestones/v3.0-ROADMAP.md`.
 
 ## Session Continuity
 
-Last session: 2026-04-22T03:30:00.000Z
-Stopped at: Phase 27 verified and complete
-Resume: Run /gsd-next to start Phase 28 discuss
+Last session: 2026-04-22T05:08:00.000Z
+Stopped at: Phase 29 added
+Resume: v4.0 milestone complete. Run /gsd-complete-milestone
