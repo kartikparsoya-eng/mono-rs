@@ -569,6 +569,218 @@ fn build_next_operator(
     }
 }
 
+/// Build an operator chain suitable for push propagation (advance path).
+/// Uses sequential JoinOperator/ExistsOperator which have proper push() implementations.
+/// The chain starts AFTER the root Source — the caller pushes changes directly into it.
+pub fn build_push_operator_chain(
+    source: Arc<RustTableSource>,
+    configs: &[OperatorConfig],
+) -> Result<Option<Box<dyn Operator>>, String> {
+    if configs.is_empty() {
+        return Err("empty operator config".to_string());
+    }
+
+    // Skip the root Source config
+    let rest = match &configs[0] {
+        OperatorConfig::Source { .. } => &configs[1..],
+        _ => return Err("first config must be a Source".to_string()),
+    };
+
+    if rest.is_empty() {
+        return Ok(None);
+    }
+
+    // Build a dummy root that will receive pushed changes
+    let root: Box<dyn Operator> = Box::new(PassthroughOperator::new());
+    let mut current = root;
+    for config in rest {
+        current = build_push_next_operator(source.clone(), current, config)?;
+    }
+    Ok(Some(current))
+}
+
+/// A no-op operator used as the root of push chains.
+/// It holds changes that are pushed into it, which the next operator can pull.
+struct PassthroughOperator {
+    pending: Vec<Node>,
+}
+
+impl PassthroughOperator {
+    fn new() -> Self {
+        Self { pending: vec![] }
+    }
+}
+
+impl Operator for PassthroughOperator {
+    fn fetch(&mut self, _req: &FetchRequest) -> Vec<Node> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn push(&mut self, change: Change) -> Vec<Change> {
+        vec![change]
+    }
+
+    fn op_type(&self) -> &'static str {
+        "passthrough"
+    }
+}
+
+/// Build next operator for the push path — uses sequential JoinOperator/ExistsOperator.
+fn build_push_next_operator(
+    source: Arc<RustTableSource>,
+    input: Box<dyn Operator>,
+    config: &OperatorConfig,
+) -> Result<Box<dyn Operator>, String> {
+    use zero_ivm_rs::cap_op::CapOperator;
+    use zero_ivm_rs::exists_op::ExistsOperator;
+    use zero_ivm_rs::filter::Predicate;
+    use zero_ivm_rs::filter_op::FilterOperator;
+    use zero_ivm_rs::join_op::JoinOperator;
+    use zero_ivm_rs::skip_op::{Bound, SkipOperator};
+    use zero_ivm_rs::take_op::TakeOperator;
+    use zero_ivm_rs::types::Row;
+
+    fn parse_sort(sort: &[(String, String)]) -> Vec<zero_ivm_rs::types::SortSpec> {
+        sort.iter()
+            .map(|(f, d)| zero_ivm_rs::types::SortSpec {
+                field: f.clone(),
+                direction: if d == "desc" {
+                    zero_ivm_rs::types::SortDirection::Desc
+                } else {
+                    zero_ivm_rs::types::SortDirection::Asc
+                },
+            })
+            .collect()
+    }
+
+    fn parse_predicate(value: &serde_json::Value) -> Result<Predicate, String> {
+        use zero_ivm_rs::filter::Value;
+        let obj = value.as_object().ok_or("predicate must be an object")?;
+        if let Some(field) = obj.get("field") {
+            let field = field.as_str().ok_or("field must be a string")?.to_string();
+            if let Some(val) = obj.get("eq") {
+                return Ok(Predicate::Eq(field, Value::from_json(val)));
+            }
+            if let Some(val) = obj.get("gt") {
+                return Ok(Predicate::Gt(field, Value::from_json(val)));
+            }
+            if let Some(val) = obj.get("lt") {
+                return Ok(Predicate::Lt(field, Value::from_json(val)));
+            }
+            if let Some(val) = obj.get("gte") {
+                return Ok(Predicate::Gte(field, Value::from_json(val)));
+            }
+            if let Some(val) = obj.get("lte") {
+                return Ok(Predicate::Lte(field, Value::from_json(val)));
+            }
+            return Err(format!("unknown predicate operator for field {field}"));
+        }
+        if let Some(arr) = obj.get("and") {
+            let preds: Result<Vec<Predicate>, String> = arr
+                .as_array()
+                .ok_or("and must be an array")?
+                .iter()
+                .map(parse_predicate)
+                .collect();
+            return Ok(Predicate::And(preds?));
+        }
+        if let Some(arr) = obj.get("or") {
+            let preds: Result<Vec<Predicate>, String> = arr
+                .as_array()
+                .ok_or("or must be an array")?
+                .iter()
+                .map(parse_predicate)
+                .collect();
+            return Ok(Predicate::Or(preds?));
+        }
+        Err("unknown predicate format".to_string())
+    }
+
+    match config {
+        OperatorConfig::Source { .. } => {
+            Err("unexpected Source in non-root position".to_string())
+        }
+        OperatorConfig::Filter { predicate } => {
+            let pred = parse_predicate(predicate)?;
+            Ok(Box::new(FilterOperator::new(input, pred)))
+        }
+        OperatorConfig::Join {
+            parent_key,
+            child_key,
+            relationship_name,
+            child,
+        } => {
+            // Build child operator tree with LiveTableSource for fetch during push
+            let child_source = make_child_source(&source, child)
+                .ok_or("failed to create child source for join")?;
+            let child_op = build_operator_with_live_source(Arc::new(child_source), child)?;
+            Ok(Box::new(JoinOperator::new(
+                input,
+                child_op,
+                parent_key.clone(),
+                child_key.clone(),
+                relationship_name.clone(),
+            )))
+        }
+        OperatorConfig::Take {
+            limit,
+            sort,
+            partition_key,
+        } => {
+            let sort_specs = parse_sort(sort);
+            Ok(Box::new(TakeOperator::new(
+                input,
+                *limit,
+                sort_specs,
+                partition_key.clone(),
+            )))
+        }
+        OperatorConfig::Exists {
+            relationship_name,
+            not_exists,
+            parent_key,
+            child_key,
+            child,
+        } => {
+            let child_source = make_child_source(&source, child)
+                .ok_or("failed to create child source for exists")?;
+            let child_op = build_operator_with_live_source(Arc::new(child_source), child)?;
+            Ok(Box::new(ExistsOperator::new(
+                input,
+                child_op,
+                relationship_name.clone(),
+                *not_exists,
+                parent_key.clone(),
+                child_key.clone(),
+            )))
+        }
+        OperatorConfig::Skip {
+            bound_row,
+            exclusive,
+            sort,
+        } => {
+            let row: Row = serde_json::from_value(bound_row.clone())
+                .map_err(|e| format!("invalid bound_row: {e}"))?;
+            let sort_specs = parse_sort(sort);
+            let bound = Bound {
+                row,
+                exclusive: *exclusive,
+            };
+            Ok(Box::new(SkipOperator::new(input, bound, sort_specs)))
+        }
+        OperatorConfig::Cap {
+            limit,
+            primary_key,
+            partition_key,
+        } => Ok(Box::new(CapOperator::new(
+            input,
+            *limit,
+            primary_key.clone(),
+            partition_key.clone(),
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

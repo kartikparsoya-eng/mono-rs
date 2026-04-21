@@ -904,6 +904,138 @@ pub fn rust_advance_full(
         .map_err(|e| napi::Error::from_reason(format!("Failed to serialize result: {e}")))
 }
 
+// ─── Binary Serialization (Phase 25) ────────────────────────────────────────
+
+use napi::bindgen_prelude::Buffer;
+
+/// Encode a serde_json::Value into the binary buffer.
+/// Tags: 0=null, 1=i64(8B LE), 2=f64(8B LE), 3=text(u32 len + bytes),
+///       4=blob(u32 len + bytes), 5=bool(u8), 6=json fallback(u32 len + JSON bytes)
+fn encode_json_value(buf: &mut Vec<u8>, val: &serde_json::Value) {
+    match val {
+        serde_json::Value::Null => buf.push(0),
+        serde_json::Value::Bool(b) => {
+            buf.push(5);
+            buf.push(if *b { 1 } else { 0 });
+        }
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                buf.push(1);
+                buf.extend_from_slice(&i.to_le_bytes());
+            } else if let Some(f) = n.as_f64() {
+                buf.push(2);
+                buf.extend_from_slice(&f.to_le_bytes());
+            } else {
+                let s = n.to_string();
+                buf.push(6);
+                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+        }
+        serde_json::Value::String(s) => {
+            buf.push(3);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        _ => {
+            let s = serde_json::to_string(val).unwrap_or_default();
+            buf.push(6);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
+fn encode_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+pub fn encode_advance_result_buf(result: &AdvanceResult) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(result.changes.len() * 128);
+
+    buf.extend_from_slice(&(result.changes.len() as u32).to_le_bytes());
+
+    let has_error = result.error.is_some();
+    buf.push(if has_error { 1 } else { 0 });
+
+    if has_error {
+        encode_str(&mut buf, result.error.as_deref().unwrap_or(""));
+        encode_str(&mut buf, result.error_type.as_deref().unwrap_or(""));
+    }
+
+    for change in &result.changes {
+        let ct: u8 = match change.change_type.as_str() {
+            "add" => 0,
+            "remove" => 1,
+            "edit" => 2,
+            _ => 3,
+        };
+        buf.push(ct);
+        encode_str(&mut buf, &change.query_id);
+        encode_str(&mut buf, &change.table);
+        encode_json_value(&mut buf, &change.row_key);
+
+        match &change.row {
+            None => buf.push(0),
+            Some(row) => {
+                buf.push(1);
+                buf.extend_from_slice(&(row.len() as u16).to_le_bytes());
+                for (col_name, col_value) in row.iter() {
+                    encode_str(&mut buf, col_name);
+                    encode_json_value(&mut buf, col_value);
+                }
+            }
+        }
+    }
+
+    buf
+}
+
+#[napi]
+pub fn rust_fan_out_buf(
+    changes_json: String,
+    pipeline_configs_json: String,
+) -> napi::Result<Buffer> {
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+    let pipelines: Vec<PipelineConfig> = serde_json::from_str(&pipeline_configs_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse pipeline configs: {e}")))?;
+
+    let changes_arc = Arc::new(changes);
+    let row_changes: Vec<RowChange> = pipelines
+        .par_iter()
+        .flat_map(|pipeline| process_pipeline(pipeline, &changes_arc))
+        .collect();
+
+    let result = AdvanceResult {
+        changes: row_changes,
+        error: None,
+        error_type: None,
+    };
+    Ok(Buffer::from(encode_advance_result_buf(&result)))
+}
+
+#[napi]
+pub fn rust_advance_full_buf(
+    db_path: String,
+    changes_json: String,
+    pipeline_configs_json: String,
+) -> napi::Result<Buffer> {
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+    let pipelines: Vec<FullPipelineConfig> = serde_json::from_str(&pipeline_configs_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse pipeline_configs: {e}")))?;
+
+    let full_result = advance_pipelines_full(&db_path, &changes, &pipelines);
+    let result = AdvanceResult {
+        changes: full_result.changes,
+        error: full_result.error,
+        error_type: full_result.error_type,
+    };
+    Ok(Buffer::from(encode_advance_result_buf(&result)))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1938,5 +2070,66 @@ mod tests {
         assert_eq!(results[0].change_type, "remove");
         assert!(results[0].row.is_none());
         assert_eq!(results[0].row_key, serde_json::json!("u1"));
+    }
+
+    #[test]
+    fn test_encode_advance_result_buf_roundtrip() {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), serde_json::json!("u1"));
+        row.insert("name".to_string(), serde_json::json!("Alice"));
+        row.insert("age".to_string(), serde_json::json!(30));
+
+        let result = AdvanceResult {
+            changes: vec![
+                RowChange {
+                    query_id: "q1".to_string(),
+                    table: "users".to_string(),
+                    row_key: serde_json::json!("u1"),
+                    row: Some(row),
+                    change_type: "add".to_string(),
+                },
+                RowChange {
+                    query_id: "q2".to_string(),
+                    table: "users".to_string(),
+                    row_key: serde_json::json!("u2"),
+                    row: None,
+                    change_type: "remove".to_string(),
+                },
+            ],
+            error: None,
+            error_type: None,
+        };
+
+        let buf = encode_advance_result_buf(&result);
+
+        // Verify header
+        let change_count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(change_count, 2);
+        assert_eq!(buf[4], 0); // no error
+
+        // Verify first change starts at offset 5
+        assert_eq!(buf[5], 0); // change_type = add
+
+        // Verify buffer is non-trivially sized
+        assert!(buf.len() > 20);
+    }
+
+    #[test]
+    fn test_encode_advance_result_buf_with_error() {
+        let result = AdvanceResult {
+            changes: vec![],
+            error: Some("something broke".to_string()),
+            error_type: Some("RuntimeError".to_string()),
+        };
+
+        let buf = encode_advance_result_buf(&result);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+        assert_eq!(buf[4], 1); // has_error
+
+        // Error message length
+        let err_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
+        assert_eq!(err_len, 15); // "something broke"
+        let err_msg = std::str::from_utf8(&buf[7..7 + err_len]).unwrap();
+        assert_eq!(err_msg, "something broke");
     }
 }

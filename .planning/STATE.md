@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 23 complete, starting Phase 24
-last_updated: '2026-04-21T18:55:00.000Z'
+stopped_at: Phase 25 complete, starting Phase 26
+last_updated: '2026-04-21T19:35:00.000Z'
 last_activity: 2026-04-21
 progress:
   total_phases: 10
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 7
-  completed_plans: 8
-  percent: 50
+  completed_plans: 9
+  percent: 60
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** All SQLite I/O and row-level computation in Rust with multi-core parallelism
-**Current focus:** Phase 25 — Parallel Advance (Full Operator Tree)
+**Current focus:** Phase 26 — Pipeline-Driver TS Integration
 
 ## Current Position
 
-Phase: 25
+Phase: 26
 Plan: Not started
-Status: Phase 24 complete, advancing to Phase 25
+Status: Phase 25 complete, advancing to Phase 26
 Last activity: 2026-04-21
 
 ## Completed Milestones
@@ -45,7 +45,7 @@ Last activity: 2026-04-21
 | 22    | Parallel Multi-Pipeline Hydration      | 20, 21     | ✅ Complete |
 | 23    | Within-Pipeline Child Parallelism      | 22         | ✅ Complete |
 | 24    | Parallel Advance (Full Operator Tree)  | 20, 21     | ✅ Complete |
-| 25    | Serialization Format & FFI             | 22, 24     | Pending     |
+| 25    | Serialization Format & FFI             | 22, 24     | ✅ Complete |
 | 26    | Pipeline-Driver TS Integration         | 22, 24, 25 | Pending     |
 | 27    | Cross-ViewSyncer Poke Dispatch         | 24, 26     | Pending     |
 | 28    | E2E Validation & Benchmarks            | 26, 27     | Pending     |
@@ -75,6 +75,6 @@ All v3.0 decisions archived in `.planning/milestones/v3.0-ROADMAP.md`.
 
 ## Session Continuity
 
-Last session: 2026-04-21T18:55:00.000Z
-Stopped at: Phase 23 complete
-Resume: Run /gsd-discuss-phase 24 or /gsd-plan-phase 24
+Last session: 2026-04-21T19:35:00.000Z
+Stopped at: Phase 25 complete
+Resume: Run /gsd-discuss-phase 26 or /gsd-plan-phase 26
