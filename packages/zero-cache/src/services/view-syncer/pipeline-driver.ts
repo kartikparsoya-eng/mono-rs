@@ -621,7 +621,11 @@ export class PipelineDriver {
       });
 
       if (USE_RUST_HYDRATION && companionMeta.length === 0) {
-        yield* this.#rustHydrate(queryID, resolvedQuery);
+        if (isDualExecEnabled()) {
+          yield* this.#dualExecHydrate(queryID, resolvedQuery, input);
+        } else {
+          yield* this.#rustHydrate(queryID, resolvedQuery);
+        }
       } else {
         yield* hydrateInternal(
           input,
@@ -803,7 +807,7 @@ export class PipelineDriver {
       }
     }
     if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
-      if (isDualExecEnabled) {
+      if (isDualExecEnabled()) {
         // Dual-exec: run both Rust and TS, compare results
         return this.#dualExecAdvance(timer);
       }
@@ -1007,8 +1011,19 @@ export class PipelineDriver {
       USE_RUST_ADVANCE &&
       this.#pipelines.size > 0 &&
       this.#pipelineConfigs.size === this.#pipelines.size &&
-      [...this.#pipelineConfigs.values()].every(c =>
-        c.operators.every(op => op.type === 'filter'),
+      // When dual-exec is enabled, allow ALL operator types through
+      // so they get compared. In production, restrict to filter-only.
+      (isDualExecEnabled() ||
+        [...this.#pipelineConfigs.values()].every(c =>
+          c.operators.every(op => op.type === 'filter'),
+        )) &&
+      // Rust advance cannot monitor companion pipelines (scalar subquery
+      // change detection requires pushing through TS IVM).
+      [...this.#pipelines.values()].every(p => p.companions.length === 0) &&
+      // Rust fan-out is stateless per-change and cannot correctly handle
+      // unique key conflicts that span multiple diff entries.
+      [...this.#tableSpecs.values()].every(
+        s => s.tableSpec.uniqueKeys.length <= 1,
       );
   }
 
@@ -1159,6 +1174,27 @@ export class PipelineDriver {
       numChanges,
       changes: this.#convertRustChanges(result.changes),
     };
+  }
+
+  *#dualExecHydrate(
+    queryID: string,
+    resolvedQuery: AST,
+    input: Input,
+  ): Iterable<RowChange> {
+    // Run both Rust and TS hydration paths and compare results.
+    const rustChanges = materializeChanges(
+      this.#rustHydrate(queryID, resolvedQuery),
+    );
+    const tsChanges = materializeChanges(
+      hydrateInternal(
+        input,
+        queryID,
+        must(this.#primaryKeys),
+        this.#tableSpecs,
+      ),
+    );
+    const result = dualExecCompare('hydrate', tsChanges, rustChanges, this.#lc);
+    yield* result;
   }
 
   *#rustHydrate(

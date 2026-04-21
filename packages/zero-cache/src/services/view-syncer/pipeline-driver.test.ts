@@ -1,5 +1,13 @@
 import type {LogContext} from '@rocicorp/logger';
-import {afterEach, beforeEach, describe, expect, test} from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'vitest';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import type {AST} from '../../../../zero-protocol/src/ast.ts';
@@ -38,6 +46,13 @@ const NO_TIME_ADVANCEMENT_TIMER: Timer = {
 };
 
 describe('view-syncer/pipeline-driver', () => {
+  beforeAll(() => {
+    process.env['ZERO_DUAL_EXEC'] = 'strict';
+  });
+  afterAll(() => {
+    delete process.env['ZERO_DUAL_EXEC'];
+  });
+
   const shardID: ShardID = {appID: 'zeroz', shardNum: 1};
   const mutationsTableName = `${upstreamSchema(shardID)}.mutations`;
   let dbFile: DbFile;
@@ -2328,5 +2343,244 @@ describe('view-syncer/pipeline-driver', () => {
     );
 
     expect(() => changes()).toThrowError(ResetPipelinesSignal);
+  });
+
+  describe('queries with limit', () => {
+    // AST: SELECT * FROM issues ORDER BY id ASC LIMIT 2
+    const ISSUES_WITH_LIMIT: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      limit: 2,
+    };
+
+    test('hydration with limit returns correct subset', () => {
+      pipelines.init(clientSchema);
+
+      const result = [
+        ...pipelines.addQuery(
+          'hash-limit',
+          'queryLimit',
+          ISSUES_WITH_LIMIT,
+          startTimer(),
+        ),
+      ];
+
+      // DB has issues 1, 2, 3. ORDER BY id ASC LIMIT 2 => issues 1 and 2.
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '1'},
+          }),
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '2'},
+          }),
+        ]),
+      );
+      // Should NOT contain issue 3
+      expect(result.filter(r => r.table === 'issues')).toHaveLength(2);
+    });
+
+    test('advance maintains limit window when new row enters top-N', () => {
+      pipelines.init(clientSchema);
+
+      [
+        ...pipelines.addQuery(
+          'hash-limit',
+          'queryLimit',
+          ISSUES_WITH_LIMIT,
+          startTimer(),
+        ),
+      ];
+
+      // Insert issue '0' which should be first in ORDER BY id ASC,
+      // pushing issue '2' out of the limit window.
+      replicator.processTransaction(
+        '134',
+        messages.insert('issues', {id: '0', closed: 0}),
+      );
+
+      const result = changes();
+      // Expect ADD for issue '0' (enters window)
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '0'},
+          }),
+        ]),
+      );
+      // Expect REMOVE for issue '2' (falls out of window)
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 1,
+            rowKey: {id: '2'},
+          }),
+        ]),
+      );
+    });
+
+    test('advance maintains limit window when top-N row is deleted', () => {
+      pipelines.init(clientSchema);
+
+      [
+        ...pipelines.addQuery(
+          'hash-limit',
+          'queryLimit',
+          ISSUES_WITH_LIMIT,
+          startTimer(),
+        ),
+      ];
+
+      // Delete issue '1' — it's in the top-2, so issue '3' should enter
+      replicator.processTransaction(
+        '134',
+        messages.delete('issues', {id: '1'}),
+      );
+
+      const result = changes();
+      // Expect REMOVE for issue '1'
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 1,
+            rowKey: {id: '1'},
+          }),
+        ]),
+      );
+      // Expect ADD for issue '3' (enters window)
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '3'},
+          }),
+        ]),
+      );
+    });
+  });
+
+  describe('NOT EXISTS advance', () => {
+    // AST: SELECT * FROM issues WHERE NOT EXISTS
+    //   (SELECT 1 FROM comments WHERE comments.issueID = issues.id)
+    // ORDER BY id ASC
+    const ISSUES_WITHOUT_COMMENTS: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'correlatedSubquery',
+        op: 'NOT EXISTS',
+        related: {
+          system: 'client',
+          correlation: {
+            parentField: ['id'],
+            childField: ['issueID'],
+          },
+          subquery: {
+            table: 'comments',
+            alias: 'comments',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      },
+    };
+
+    test('hydration returns only issues without comments', () => {
+      pipelines.init(clientSchema);
+
+      const result = [
+        ...pipelines.addQuery(
+          'hash-notexists',
+          'queryNotExists',
+          ISSUES_WITHOUT_COMMENTS,
+          startTimer(),
+        ),
+      ];
+
+      // Issue 1 has comment 10, issue 2 has comments 20/21/22, issue 3 has no comments.
+      // NOT EXISTS => only issue 3 should appear.
+      expect(result.filter(r => r.table === 'issues')).toHaveLength(1);
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '3'},
+          }),
+        ]),
+      );
+    });
+
+    test('advance removes issue when comment is added', () => {
+      pipelines.init(clientSchema);
+
+      [
+        ...pipelines.addQuery(
+          'hash-notexists',
+          'queryNotExists',
+          ISSUES_WITHOUT_COMMENTS,
+          startTimer(),
+        ),
+      ];
+
+      // Add a comment to issue 3 — it should be removed from NOT EXISTS results
+      replicator.processTransaction(
+        '134',
+        messages.insert('comments', {
+          id: '30',
+          issueID: '3',
+          upvotes: BigInt(0),
+        }),
+      );
+
+      const result = changes();
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 1,
+            rowKey: {id: '3'},
+          }),
+        ]),
+      );
+    });
+
+    test('advance adds issue when all comments are deleted', () => {
+      pipelines.init(clientSchema);
+
+      [
+        ...pipelines.addQuery(
+          'hash-notexists',
+          'queryNotExists',
+          ISSUES_WITHOUT_COMMENTS,
+          startTimer(),
+        ),
+      ];
+
+      // Delete all comments for issue 1 (only comment 10)
+      replicator.processTransaction(
+        '134',
+        messages.delete('comments', {id: '10'}),
+      );
+
+      const result = changes();
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            table: 'issues',
+            type: 0,
+            rowKey: {id: '1'},
+          }),
+        ]),
+      );
+    });
   });
 });

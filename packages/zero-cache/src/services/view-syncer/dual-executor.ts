@@ -17,16 +17,20 @@ import type {RowChange} from './pipeline-driver.ts';
 
 // --- Configuration ---
 
-const DUAL_EXEC_ENV = process.env['ZERO_DUAL_EXEC'] ?? '';
+function getDualExecEnv(): string {
+  return process.env['ZERO_DUAL_EXEC'] ?? '';
+}
 
 /** Whether dual execution is enabled at all. */
-export const isDualExecEnabled =
-  DUAL_EXEC_ENV === '1' ||
-  DUAL_EXEC_ENV === 'strict' ||
-  DUAL_EXEC_ENV === 'log';
+export function isDualExecEnabled(): boolean {
+  const env = getDualExecEnv();
+  return env === '1' || env === 'strict' || env === 'log';
+}
 
 /** Whether mismatches throw (strict) or just log (log/1). */
-export const isDualExecStrict = DUAL_EXEC_ENV === 'strict';
+export function isDualExecStrict(): boolean {
+  return getDualExecEnv() === 'strict';
+}
 
 // --- Normalized change format for comparison ---
 
@@ -285,7 +289,7 @@ export function dualExecCompare(
   const detail = formatMismatches(label, result);
   stats.lastMismatchDetail = detail;
 
-  if (isDualExecStrict) {
+  if (isDualExecStrict()) {
     lc.error?.(detail);
     throw new DualExecMismatchError(detail);
   } else {
