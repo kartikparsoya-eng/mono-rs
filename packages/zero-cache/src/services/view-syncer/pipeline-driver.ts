@@ -46,6 +46,7 @@ import {
   decodeAdvanceResultBuf,
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
+import {decodeDispatchPokeBuf} from './decode-dispatch-buf.ts';
 import {
   isDualExecEnabled,
   dualExecCompare,
@@ -71,20 +72,32 @@ type RustFanOutFn = (
 
 type RustHydrateFn = (dbPath: string, queriesJson: string) => Buffer;
 
+type RustDispatchPokeFn = (
+  changesJson: string,
+  vsPipelinesJson: string,
+) => Buffer;
+
 let rustAdvanceFn: RustAdvanceFn | undefined;
 let rustFanOutFn: RustFanOutFn | undefined;
 let rustHydrateFn: RustHydrateFn | undefined;
+let rustDispatchPokeFn: RustDispatchPokeFn | undefined;
 try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unused-vars
   const bindings = require('zqlite-rs');
   rustAdvanceFn = bindings?.rustAdvance;
   rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
+  rustDispatchPokeFn = bindings?.rustDispatchPoke;
 } catch {
   rustAdvanceFn = undefined;
   rustFanOutFn = undefined;
   rustHydrateFn = undefined;
+  rustDispatchPokeFn = undefined;
 }
+
+const DISABLE_RUST_DISPATCH =
+  process.env.ZERO_DISABLE_RUST_DISPATCH === '1' ||
+  process.env.ZERO_DISABLE_RUST_DISPATCH === 'true';
 
 interface RustPipelineConfig {
   query_id: string;
@@ -762,7 +775,10 @@ export class PipelineDriver {
    *         `changes` must be iterated over in their entirety in order to
    *         advance the database snapshot.
    */
-  advance(timer: Timer): {
+  advance(
+    timer: Timer,
+    vsId?: string | undefined,
+  ): {
     version: string;
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
@@ -771,6 +787,21 @@ export class PipelineDriver {
       this.initialized(),
       'Pipeline driver must be initialized before advancing',
     );
+    // Try dispatch poke path first (Phase 27: cross-VS batching)
+    if (
+      vsId &&
+      !DISABLE_RUST_DISPATCH &&
+      rustDispatchPokeFn &&
+      this.#useRustAdvance &&
+      this.#pipelineConfigs.size > 0
+    ) {
+      try {
+        return this.#rustDispatchAdvance(vsId);
+      } catch (e) {
+        if (e instanceof ResetPipelinesSignal) throw e;
+        this.#lc.warn?.(`Rust dispatch advance failed, falling back: ${e}`);
+      }
+    }
     if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
       if (isDualExecEnabled) {
         // Dual-exec: run both Rust and TS, compare results
@@ -983,6 +1014,88 @@ export class PipelineDriver {
 
   #serializePipelineConfigs(): string {
     return JSON.stringify([...this.#pipelineConfigs.values()]);
+  }
+
+  #rustDispatchAdvance(vsId: string): {
+    version: string;
+    numChanges: number;
+    changes: Iterable<RowChange | 'yield'>;
+  } {
+    assert(rustDispatchPokeFn, 'Rust dispatch poke not available');
+
+    const diff = this.#snapshotter.advance(
+      this.#tableSpecs,
+      this.#allTableNames,
+    );
+    const {prev, curr, changes: numChanges} = diff;
+
+    this.#lc.debug?.(
+      `rust_dispatch_poke ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines, vs=${vsId}`,
+    );
+
+    // Collect changes from TS diff iterator
+    const collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }> = [];
+    for (const change of diff) {
+      collectedChanges.push(change);
+    }
+
+    const changesJson = JSON.stringify(collectedChanges);
+    const vsPipelinesJson = JSON.stringify([
+      {vs_id: vsId, pipelines: [...this.#pipelineConfigs.values()]},
+    ]);
+
+    const resultBuf = rustDispatchPokeFn(changesJson, vsPipelinesJson);
+    const vsResults = decodeDispatchPokeBuf(resultBuf);
+
+    // Find result for this VS
+    const vsResult = vsResults.find(r => r.vsId === vsId);
+    if (!vsResult) {
+      throw new Error(`No dispatch result for VS ${vsId}`);
+    }
+    if (vsResult.error) {
+      throw new ResetPipelinesSignal(
+        `Rust dispatch poke error for VS ${vsId}: ${vsResult.error}`,
+        'rust-dispatch-error',
+      );
+    }
+
+    // Update table DBs
+    for (const table of this.#tables.values()) {
+      table.setDB(curr.db.db);
+    }
+    this.#ensureCostModelExistsIfEnabled(curr.db.db);
+    this.#lc.debug?.(`Rust dispatch poke advanced to ${curr.version}`);
+
+    return {
+      version: curr.version,
+      numChanges,
+      changes: this.#convertDispatchChanges(vsResult.changes),
+    };
+  }
+
+  *#convertDispatchChanges(
+    changes: DecodedRowChange[],
+  ): Iterable<RowChange | 'yield'> {
+    for (const change of changes) {
+      const type =
+        change.type === 'add'
+          ? ChangeType.ADD
+          : change.type === 'edit'
+            ? ChangeType.EDIT
+            : ChangeType.REMOVE;
+      yield {
+        type,
+        queryID: change.queryID,
+        table: change.table,
+        rowKey: change.row_key,
+        row: change.row ?? (change.row_key as Row),
+      } as RowChange;
+    }
   }
 
   #rustAdvance(): {

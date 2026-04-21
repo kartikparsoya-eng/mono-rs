@@ -1017,6 +1017,112 @@ pub fn encode_advance_result_buf(result: &AdvanceResult) -> Vec<u8> {
     buf
 }
 
+// ─── Dispatch Poke (Phase 27) ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VSPipelineEntry {
+    pub vs_id: String,
+    pub pipelines: Vec<PipelineConfig>,
+}
+
+#[napi]
+/// Accepts pipeline configs from multiple ViewSyncers, runs Rayon fan-out
+/// for all of them in parallel, and returns per-VS results in binary buffer format.
+///
+/// Binary format (little-endian):
+///   [u32] vs_count
+///   Per VS:
+///     [u16 + bytes] vs_id
+///     [u8] has_error (0=ok, 1=error)
+///     If has_error:
+///       [u16 + bytes] error message
+///     Else:
+///       [u32] change_count
+///       Per change: same layout as encode_advance_result_buf changes
+pub fn rust_dispatch_poke(
+    changes_json: String,
+    vs_pipelines_json: String,
+) -> napi::Result<Buffer> {
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+    let vs_entries: Vec<VSPipelineEntry> = serde_json::from_str(&vs_pipelines_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse vs_pipelines: {e}")))?;
+
+    let changes_arc = Arc::new(changes);
+
+    // Process all VS entries in parallel with error isolation
+    let vs_results: Vec<(String, Result<Vec<RowChange>, String>)> = vs_entries
+        .par_iter()
+        .map(|entry| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let row_changes: Vec<RowChange> = entry
+                    .pipelines
+                    .par_iter()
+                    .flat_map(|pipeline| process_pipeline(pipeline, &changes_arc))
+                    .collect();
+                row_changes
+            }));
+            let vs_id = entry.vs_id.clone();
+            match result {
+                Ok(changes) => (vs_id, Ok(changes)),
+                Err(panic) => {
+                    let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic in dispatch_poke".to_string()
+                    };
+                    (vs_id, Err(msg))
+                }
+            }
+        })
+        .collect();
+
+    // Encode to binary buffer
+    let mut buf = Vec::with_capacity(vs_results.len() * 256);
+    buf.extend_from_slice(&(vs_results.len() as u32).to_le_bytes());
+
+    for (vs_id, result) in &vs_results {
+        encode_str(&mut buf, vs_id);
+        match result {
+            Err(err_msg) => {
+                buf.push(1); // has_error
+                encode_str(&mut buf, err_msg);
+            }
+            Ok(changes) => {
+                buf.push(0); // no error
+                buf.extend_from_slice(&(changes.len() as u32).to_le_bytes());
+                for change in changes {
+                    let ct: u8 = match change.change_type.as_str() {
+                        "add" => 0,
+                        "remove" => 1,
+                        "edit" => 2,
+                        _ => 3,
+                    };
+                    buf.push(ct);
+                    encode_str(&mut buf, &change.query_id);
+                    encode_str(&mut buf, &change.table);
+                    encode_json_value(&mut buf, &change.row_key);
+                    match &change.row {
+                        None => buf.push(0),
+                        Some(row) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&(row.len() as u16).to_le_bytes());
+                            for (col_name, col_value) in row.iter() {
+                                encode_str(&mut buf, col_name);
+                                encode_json_value(&mut buf, col_value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Buffer::from(buf))
+}
+
 #[napi]
 pub fn rust_fan_out_buf(
     changes_json: String,

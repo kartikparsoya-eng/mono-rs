@@ -2182,7 +2182,10 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const start = performance.now();
 
       const timer = new TimeSliceTimer(lc);
-      const {version, numChanges, changes} = this.#pipelines.advance(timer);
+      const {version, numChanges, changes} = this.#pipelines.advance(
+        timer,
+        this.id,
+      );
       lc = lc.withContext('newVersion', version);
 
       // Probably need a new updater type. CVRAdvancementUpdater?
