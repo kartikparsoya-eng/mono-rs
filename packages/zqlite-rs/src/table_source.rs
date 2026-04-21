@@ -97,6 +97,10 @@ impl RustTableSource {
         })
     }
 
+    pub fn db_path(&self) -> &str {
+        self.pool.path()
+    }
+
     pub fn connect(
         &mut self,
         ordering: Option<Ordering>,

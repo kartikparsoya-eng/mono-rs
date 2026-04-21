@@ -82,6 +82,269 @@ impl Operator for LiveTableSource {
 
 unsafe impl Send for LiveTableSource {}
 
+/// Free function for parallel child fetching (avoids capturing &self in par_iter closures).
+fn fetch_children_for_row_static(
+    source: &Arc<RustTableSource>,
+    child_config: &[OperatorConfig],
+    parent_key: &[String],
+    child_key: &[String],
+    parent_row: &zero_ivm_rs::types::Row,
+) -> Vec<Node> {
+    use zero_ivm_rs::filter::{Value, compare_values};
+    let constraint = if !parent_key.is_empty() && !child_key.is_empty() {
+        parent_row.get(&parent_key[0]).map(|v| {
+            zero_ivm_rs::types::Constraint {
+                key: child_key[0].clone(),
+                value: v.clone(),
+            }
+        })
+    } else {
+        None
+    };
+    let child_source = make_child_source(source, child_config);
+    let child_source = match child_source {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let mut child_op = match build_operator_with_live_source(Arc::new(child_source), child_config) {
+        Ok(op) => op,
+        Err(_) => return vec![],
+    };
+    let child_nodes = child_op.fetch(&FetchRequest {
+        constraint,
+        start: None,
+        reverse: false,
+    });
+    if parent_key.len() > 1 {
+        child_nodes
+            .into_iter()
+            .filter(|cn| {
+                parent_key.iter().zip(child_key.iter()).all(|(pk, ck)| {
+                    let pv = parent_row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
+                    let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+                    !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
+                        && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
+                })
+            })
+            .collect()
+    } else {
+        child_nodes
+    }
+}
+
+fn fetch_child_count_static(
+    source: &Arc<RustTableSource>,
+    child_config: &[OperatorConfig],
+    parent_key: &[String],
+    child_key: &[String],
+    parent_row: &zero_ivm_rs::types::Row,
+) -> usize {
+    let constraint = if !parent_key.is_empty() && !child_key.is_empty() {
+        parent_row.get(&parent_key[0]).map(|v| {
+            zero_ivm_rs::types::Constraint {
+                key: child_key[0].clone(),
+                value: v.clone(),
+            }
+        })
+    } else {
+        None
+    };
+    let child_source = make_child_source(source, child_config);
+    let child_source = match child_source {
+        Some(s) => s,
+        None => return 0,
+    };
+    let mut child_op = match build_operator_with_live_source(Arc::new(child_source), child_config) {
+        Ok(op) => op,
+        Err(_) => return 0,
+    };
+    child_op.fetch(&FetchRequest {
+        constraint,
+        start: None,
+        reverse: false,
+    }).len()
+}
+
+/// Create a RustTableSource for the child table based on the child config's Source entry.
+fn make_child_source(
+    parent_source: &Arc<RustTableSource>,
+    child_config: &[OperatorConfig],
+) -> Option<RustTableSource> {
+    if child_config.is_empty() {
+        return None;
+    }
+    match &child_config[0] {
+        OperatorConfig::Source {
+            table_name,
+            columns,
+            primary_key,
+            sort,
+        } => {
+            let mut ct = HashMap::new();
+            for c in columns {
+                ct.insert(c.clone(), ColumnType::String);
+            }
+            let mut src = RustTableSource::new(
+                parent_source.db_path(),
+                2,
+                table_name.clone(),
+                columns.clone(),
+                ct,
+                primary_key.clone(),
+            ).ok()?;
+            let ordering: Vec<(String, String)> = sort.clone();
+            src.connect(Some(ordering), None, None);
+            Some(src)
+        }
+        _ => None,
+    }
+}
+
+/// A Join operator that fetches children in parallel across parent rows.
+/// Instead of holding a single mutable child operator, it holds the child
+/// operator config and rebuilds the child tree per parent row on Rayon threads.
+pub struct ParallelJoinOperator {
+    parent: Box<dyn Operator>,
+    child_config: Vec<OperatorConfig>,
+    source: Arc<RustTableSource>,
+    parent_key: Vec<String>,
+    child_key: Vec<String>,
+    relationship_name: String,
+}
+
+impl ParallelJoinOperator {
+    pub fn new(
+        parent: Box<dyn Operator>,
+        child_config: Vec<OperatorConfig>,
+        source: Arc<RustTableSource>,
+        parent_key: Vec<String>,
+        child_key: Vec<String>,
+        relationship_name: String,
+    ) -> Self {
+        Self {
+            parent,
+            child_config,
+            source,
+            parent_key,
+            child_key,
+            relationship_name,
+        }
+    }
+}
+
+unsafe impl Send for ParallelJoinOperator {}
+
+impl Operator for ParallelJoinOperator {
+    fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        let parent_nodes = self.parent.fetch(req);
+        let rel_name = &self.relationship_name;
+
+        // Extract fields for the parallel closure so we don't capture &self
+        let source = &self.source;
+        let child_config = &self.child_config;
+        let parent_key = &self.parent_key;
+        let child_key = &self.child_key;
+
+        let children_per_parent: Vec<Vec<Node>> = parent_nodes
+            .par_iter()
+            .map(|node| {
+                fetch_children_for_row_static(
+                    source, child_config, parent_key, child_key, &node.row,
+                )
+            })
+            .collect();
+
+        parent_nodes
+            .into_iter()
+            .zip(children_per_parent)
+            .map(|(mut node, children)| {
+                node.relationships.insert(rel_name.clone(), children);
+                node
+            })
+            .collect()
+    }
+
+    fn push(&mut self, _change: Change) -> Vec<Change> {
+        // Push path not used during hydration
+        vec![]
+    }
+
+    fn op_type(&self) -> &'static str {
+        "parallel_join"
+    }
+}
+
+/// A parallel Exists operator that checks child existence in parallel across parent rows.
+pub struct ParallelExistsOperator {
+    input: Box<dyn Operator>,
+    child_config: Vec<OperatorConfig>,
+    source: Arc<RustTableSource>,
+    not_exists: bool,
+    parent_key: Vec<String>,
+    child_key: Vec<String>,
+}
+
+impl ParallelExistsOperator {
+    pub fn new(
+        input: Box<dyn Operator>,
+        child_config: Vec<OperatorConfig>,
+        source: Arc<RustTableSource>,
+        not_exists: bool,
+        parent_key: Vec<String>,
+        child_key: Vec<String>,
+    ) -> Self {
+        Self {
+            input,
+            child_config,
+            source,
+            not_exists,
+            parent_key,
+            child_key,
+        }
+    }
+}
+
+unsafe impl Send for ParallelExistsOperator {}
+
+impl Operator for ParallelExistsOperator {
+    fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        let parent_nodes = self.input.fetch(req);
+        let not_exists = self.not_exists;
+
+        // Extract fields for the parallel closure so we don't capture &self
+        let source = &self.source;
+        let child_config = &self.child_config;
+        let parent_key = &self.parent_key;
+        let child_key = &self.child_key;
+
+        let counts: Vec<usize> = parent_nodes
+            .par_iter()
+            .map(|node| {
+                fetch_child_count_static(
+                    source, child_config, parent_key, child_key, &node.row,
+                )
+            })
+            .collect();
+
+        parent_nodes
+            .into_iter()
+            .zip(counts)
+            .filter(|(_, count)| {
+                if not_exists { *count == 0 } else { *count > 0 }
+            })
+            .map(|(node, _)| node)
+            .collect()
+    }
+
+    fn push(&mut self, _change: Change) -> Vec<Change> {
+        vec![]
+    }
+
+    fn op_type(&self) -> &'static str {
+        "parallel_exists"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HydratePipelineConfig {
     pub pipeline_id: String,
@@ -241,10 +504,10 @@ fn build_next_operator(
             relationship_name,
             child,
         } => {
-            let child_op = build_operator_with_live_source(source, child)?;
-            Ok(Box::new(JoinOperator::new(
+            Ok(Box::new(ParallelJoinOperator::new(
                 input,
-                child_op,
+                child.clone(),
+                source,
                 parent_key.clone(),
                 child_key.clone(),
                 relationship_name.clone(),
@@ -270,11 +533,10 @@ fn build_next_operator(
             child_key,
             child,
         } => {
-            let child_op = build_operator_with_live_source(source, child)?;
-            Ok(Box::new(ExistsOperator::new(
+            Ok(Box::new(ParallelExistsOperator::new(
                 input,
-                child_op,
-                relationship_name.clone(),
+                child.clone(),
+                source,
                 *not_exists,
                 parent_key.clone(),
                 child_key.clone(),
@@ -579,5 +841,310 @@ mod tests {
 
         let results = hydrate_pipelines(arc_src, configs);
         assert!(results[0].nodes.is_err());
+    }
+
+    fn setup_join_test_db() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let conn = rusqlite::Connection::open(file.path()).expect("open");
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE users (
+                 id TEXT PRIMARY KEY,
+                 name TEXT
+             );
+             CREATE TABLE posts (
+                 id TEXT PRIMARY KEY,
+                 user_id TEXT,
+                 title TEXT
+             );
+             INSERT INTO users VALUES ('1', 'Alice');
+             INSERT INTO users VALUES ('2', 'Bob');
+             INSERT INTO users VALUES ('3', 'Carol');
+             INSERT INTO posts VALUES ('p1', '1', 'Post A1');
+             INSERT INTO posts VALUES ('p2', '1', 'Post A2');
+             INSERT INTO posts VALUES ('p3', '2', 'Post B1');
+             INSERT INTO posts VALUES ('p4', '3', 'Post C1');
+             INSERT INTO posts VALUES ('p5', '3', 'Post C2');
+             INSERT INTO posts VALUES ('p6', '3', 'Post C3');",
+        )
+        .expect("setup");
+        drop(conn);
+        file
+    }
+
+    fn make_join_source(
+        db: &tempfile::NamedTempFile,
+        table: &str,
+        columns: Vec<&str>,
+        pk: &str,
+        pool_size: usize,
+    ) -> RustTableSource {
+        let mut ct = HashMap::new();
+        for c in &columns {
+            ct.insert(c.to_string(), ColumnType::String);
+        }
+        RustTableSource::new(
+            db.path().to_str().unwrap(),
+            pool_size,
+            table.into(),
+            columns.iter().map(|s| s.to_string()).collect(),
+            ct,
+            vec![pk.into()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_parallel_join_fetches_children() {
+        let db = setup_join_test_db();
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        // Build a pipeline: Source(users) -> ParallelJoin(posts on user_id)
+        let config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("id".into(), "asc".into())],
+            },
+            OperatorConfig::Join {
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                relationship_name: "posts".into(),
+                child: vec![OperatorConfig::Source {
+                    table_name: "posts".into(),
+                    columns: vec!["id".into(), "user_id".into(), "title".into()],
+                    primary_key: vec!["id".into()],
+                    sort: vec![("id".into(), "asc".into())],
+                }],
+            },
+        ];
+
+        let result = hydrate_single_pipeline(arc_src, config);
+        assert!(result.is_ok());
+        let nodes = result.unwrap();
+        assert_eq!(nodes.len(), 3);
+
+        // Alice has 2 posts
+        assert_eq!(nodes[0].row.get("name").unwrap(), &json!("Alice"));
+        assert_eq!(nodes[0].relationships["posts"].len(), 2);
+
+        // Bob has 1 post
+        assert_eq!(nodes[1].row.get("name").unwrap(), &json!("Bob"));
+        assert_eq!(nodes[1].relationships["posts"].len(), 1);
+
+        // Carol has 3 posts
+        assert_eq!(nodes[2].row.get("name").unwrap(), &json!("Carol"));
+        assert_eq!(nodes[2].relationships["posts"].len(), 3);
+    }
+
+    #[test]
+    fn test_parallel_join_null_key_no_children() {
+        let db = setup_join_test_db();
+        // Add a user with NULL-like id
+        let conn = rusqlite::Connection::open(db.path()).expect("open");
+        conn.execute("INSERT INTO users VALUES (NULL, 'Nobody')", []).unwrap();
+        drop(conn);
+
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("name".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        let config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("name".into(), "asc".into())],
+            },
+            OperatorConfig::Join {
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                relationship_name: "posts".into(),
+                child: vec![OperatorConfig::Source {
+                    table_name: "posts".into(),
+                    columns: vec!["id".into(), "user_id".into(), "title".into()],
+                    primary_key: vec!["id".into()],
+                    sort: vec![("id".into(), "asc".into())],
+                }],
+            },
+        ];
+
+        let result = hydrate_single_pipeline(arc_src, config).unwrap();
+        let nobody = result.iter().find(|n| n.row.get("name").unwrap() == &json!("Nobody"));
+        assert!(nobody.is_some());
+        assert_eq!(nobody.unwrap().relationships["posts"].len(), 0);
+    }
+
+    #[test]
+    fn test_parallel_join_multiple_pipelines() {
+        let db = setup_join_test_db();
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        let join_config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("id".into(), "asc".into())],
+            },
+            OperatorConfig::Join {
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                relationship_name: "posts".into(),
+                child: vec![OperatorConfig::Source {
+                    table_name: "posts".into(),
+                    columns: vec!["id".into(), "user_id".into(), "title".into()],
+                    primary_key: vec!["id".into()],
+                    sort: vec![("id".into(), "asc".into())],
+                }],
+            },
+        ];
+
+        let configs: Vec<HydratePipelineConfig> = (0..4)
+            .map(|i| HydratePipelineConfig {
+                pipeline_id: format!("p{i}"),
+                operator_config: join_config.clone(),
+            })
+            .collect();
+
+        let results = hydrate_pipelines(arc_src, configs);
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            let nodes = r.nodes.as_ref().unwrap();
+            assert_eq!(nodes.len(), 3);
+            assert_eq!(nodes[0].relationships["posts"].len(), 2);
+            assert_eq!(nodes[2].relationships["posts"].len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_parallel_exists_filters_correctly() {
+        let db = setup_join_test_db();
+        // Remove posts for Bob so exists filter excludes him
+        let conn = rusqlite::Connection::open(db.path()).expect("open");
+        conn.execute("DELETE FROM posts WHERE user_id = '2'", []).unwrap();
+        drop(conn);
+
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        // exists: users who have posts
+        let config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("id".into(), "asc".into())],
+            },
+            OperatorConfig::Exists {
+                relationship_name: "posts".into(),
+                not_exists: false,
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                child: vec![OperatorConfig::Source {
+                    table_name: "posts".into(),
+                    columns: vec!["id".into(), "user_id".into(), "title".into()],
+                    primary_key: vec!["id".into()],
+                    sort: vec![("id".into(), "asc".into())],
+                }],
+            },
+        ];
+
+        let result = hydrate_single_pipeline(arc_src, config).unwrap();
+        // Alice and Carol have posts, Bob doesn't
+        assert_eq!(result.len(), 2);
+        let names: Vec<&str> = result.iter().map(|n| n.row.get("name").unwrap().as_str().unwrap()).collect();
+        assert!(names.contains(&"Alice"));
+        assert!(names.contains(&"Carol"));
+        assert!(!names.contains(&"Bob"));
+    }
+
+    #[test]
+    fn test_parallel_not_exists() {
+        let db = setup_join_test_db();
+        let conn = rusqlite::Connection::open(db.path()).expect("open");
+        conn.execute("DELETE FROM posts WHERE user_id = '2'", []).unwrap();
+        drop(conn);
+
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        let config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("id".into(), "asc".into())],
+            },
+            OperatorConfig::Exists {
+                relationship_name: "posts".into(),
+                not_exists: true,
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                child: vec![OperatorConfig::Source {
+                    table_name: "posts".into(),
+                    columns: vec!["id".into(), "user_id".into(), "title".into()],
+                    primary_key: vec!["id".into()],
+                    sort: vec![("id".into(), "asc".into())],
+                }],
+            },
+        ];
+
+        let result = hydrate_single_pipeline(arc_src, config).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].row.get("name").unwrap(), &json!("Bob"));
+    }
+
+    #[test]
+    fn test_parallel_join_with_filter_on_children() {
+        let db = setup_join_test_db();
+        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
+        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+        let arc_src = Arc::new(src);
+
+        // Join with filter on child: only posts with title containing "A"
+        let config = vec![
+            OperatorConfig::Source {
+                table_name: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                primary_key: vec!["id".into()],
+                sort: vec![("id".into(), "asc".into())],
+            },
+            OperatorConfig::Join {
+                parent_key: vec!["id".into()],
+                child_key: vec!["user_id".into()],
+                relationship_name: "posts".into(),
+                child: vec![
+                    OperatorConfig::Source {
+                        table_name: "posts".into(),
+                        columns: vec!["id".into(), "user_id".into(), "title".into()],
+                        primary_key: vec!["id".into()],
+                        sort: vec![("id".into(), "asc".into())],
+                    },
+                    OperatorConfig::Filter {
+                        predicate: json!({"field": "title", "eq": "Post A1"}),
+                    },
+                ],
+            },
+        ];
+
+        let result = hydrate_single_pipeline(arc_src, config).unwrap();
+        assert_eq!(result.len(), 3);
+        // Alice should have 1 matching post
+        assert_eq!(result[0].relationships["posts"].len(), 1);
+        assert_eq!(
+            result[0].relationships["posts"][0].row.get("title").unwrap(),
+            &json!("Post A1")
+        );
+        // Bob and Carol have 0 matching posts
+        assert_eq!(result[1].relationships["posts"].len(), 0);
+        assert_eq!(result[2].relationships["posts"].len(), 0);
     }
 }

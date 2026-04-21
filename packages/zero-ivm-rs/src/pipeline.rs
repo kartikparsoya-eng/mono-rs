@@ -15,7 +15,7 @@ use crate::types::{
     Change, Constraint, FetchRequest, Node, Row, SortDirection, SortSpec, compare_rows,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum OperatorConfig {
     #[serde(rename = "source")]
