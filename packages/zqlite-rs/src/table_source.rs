@@ -64,6 +64,14 @@ pub struct RustTableSource {
     push_epoch: u64,
 }
 
+// SAFETY: RustTableSource is safe to share across threads during hydration:
+// - ConnectionPool uses Arc<Mutex<Vec<Connection>>> internally
+// - `connections` (Vec<Connection>) is read-only after setup (immutable borrows only)
+// - `write_conn` is only used for push/overlay on the NAPI thread, never during parallel hydration
+// - All other fields (table_name, columns, column_types, primary_key) are immutable
+unsafe impl Send for RustTableSource {}
+unsafe impl Sync for RustTableSource {}
+
 impl RustTableSource {
     pub fn new(
         db_path: &str,

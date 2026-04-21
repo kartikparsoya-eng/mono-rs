@@ -14,3 +14,4 @@ mod types;
 // napi-rs generates index.js and index.d.ts with all exported classes/functions.
 pub mod overlay;
 pub mod table_source;
+pub mod hydrate;
