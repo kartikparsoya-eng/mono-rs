@@ -151,6 +151,13 @@ As Rust operators expand beyond filter-only, update `fuzz-ivm.test.ts` to cover 
 
 **Depends on:** Phase 22, Phase 24, Phase 25
 
+**Plans:** 2 plans
+
+Plans:
+
+- [ ] 26-01-PLAN.md — Rust hydration integration in addQuery() + ZERO_DISABLE_RUST_HYDRATION feature flag
+- [ ] 26-02-PLAN.md — Expand Rust advance to handle full operator tree (joins, limits, exists)
+
 **Success Criteria:**
 
 1. `pipeline-driver.ts` `addQuery()` calls `rust_hydrate()` instead of `buildPipeline()` + `input.fetch()`
