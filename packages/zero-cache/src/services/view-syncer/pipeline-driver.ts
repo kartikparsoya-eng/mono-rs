@@ -71,6 +71,31 @@ const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
 const USE_RUST_ADVANCE = USE_RUST_IVM && rustAdvanceFn !== undefined;
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
+
+function collectExistsTypes(
+  condition: Condition | undefined,
+  map: Map<string, 'EXISTS' | 'NOT EXISTS'> = new Map(),
+): Map<string, 'EXISTS' | 'NOT EXISTS'> {
+  if (!condition) return map;
+  switch (condition.type) {
+    case 'correlatedSubquery':
+      map.set(
+        condition.related.subquery.alias ?? condition.related.subquery.table,
+        condition.op,
+      );
+      collectExistsTypes(condition.related.subquery.where, map);
+      break;
+    case 'and':
+    case 'or':
+      for (const c of condition.conditions) {
+        collectExistsTypes(c, map);
+      }
+      break;
+    case 'simple':
+      break;
+  }
+  return map;
+}
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
 import {
   reloadPermissionsIfChanged,
@@ -476,6 +501,8 @@ export class PipelineDriver {
         companionInputs,
       } = this.#resolveScalarSubqueries(query);
 
+      const existsTypes = collectExistsTypes(resolvedQuery.where);
+
       const input = buildPipeline(
         resolvedQuery,
         {
@@ -504,7 +531,7 @@ export class PipelineDriver {
                     input as FilterOperator,
                     relationshipName,
                     rel.correlation.parentField,
-                    'EXISTS',
+                    existsTypes.get(relationshipName) ?? 'EXISTS',
                   );
                 }
               }
