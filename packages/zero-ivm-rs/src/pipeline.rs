@@ -414,6 +414,166 @@ mod tests {
         assert_eq!(result[2].row.get("id").unwrap(), &serde_json::json!(3));
     }
 
+    fn make_node(pairs: &[(&str, serde_json::Value)]) -> Node {
+        Node {
+            row: pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            relationships: HashMap::new(),
+        }
+    }
+
+    fn id_sort() -> Vec<SortSpec> {
+        vec![SortSpec {
+            field: "id".to_string(),
+            direction: SortDirection::Asc,
+        }]
+    }
+
+    #[test]
+    fn test_integration_filter_pipeline() {
+        let rows: Vec<Node> = (1..=5)
+            .map(|i| {
+                make_node(&[
+                    ("id", serde_json::json!(i)),
+                    ("status", serde_json::json!(if i % 2 == 0 { "active" } else { "inactive" })),
+                ])
+            })
+            .collect();
+        let source = Box::new(SourceOperator::new(rows, id_sort()));
+        let pred = Predicate::Eq("status".to_string(), Value::String("active".to_string()));
+        let mut pipeline = FilterOperator::new(source, pred);
+
+        let result = pipeline.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(2));
+        assert_eq!(result[1].row.get("id").unwrap(), &serde_json::json!(4));
+    }
+
+    #[test]
+    fn test_integration_join_pipeline() {
+        let parents = vec![
+            make_node(&[("id", serde_json::json!(1)), ("name", serde_json::json!("Alice"))]),
+            make_node(&[("id", serde_json::json!(2)), ("name", serde_json::json!("Bob"))]),
+            make_node(&[("id", serde_json::json!(3)), ("name", serde_json::json!("Carol"))]),
+        ];
+        let children = vec![
+            make_node(&[("id", serde_json::json!(10)), ("parentId", serde_json::json!(1))]),
+            make_node(&[("id", serde_json::json!(11)), ("parentId", serde_json::json!(1))]),
+            make_node(&[("id", serde_json::json!(20)), ("parentId", serde_json::json!(2))]),
+            make_node(&[("id", serde_json::json!(21)), ("parentId", serde_json::json!(2))]),
+            make_node(&[("id", serde_json::json!(30)), ("parentId", serde_json::json!(3))]),
+            make_node(&[("id", serde_json::json!(31)), ("parentId", serde_json::json!(3))]),
+        ];
+        let parent_source = Box::new(SourceOperator::new(parents, id_sort()));
+        let child_source = Box::new(SourceOperator::new(children, id_sort()));
+        let mut pipeline = JoinOperator::new(
+            parent_source,
+            child_source,
+            vec!["id".to_string()],
+            vec!["parentId".to_string()],
+            "items".to_string(),
+        );
+
+        let result = pipeline.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].relationships["items"].len(), 2);
+        assert_eq!(result[1].relationships["items"].len(), 2);
+        assert_eq!(result[2].relationships["items"].len(), 2);
+    }
+
+    #[test]
+    fn test_integration_take_pipeline() {
+        let rows: Vec<Node> = (1..=5)
+            .map(|i| make_node(&[("id", serde_json::json!(i))]))
+            .collect();
+        let source = Box::new(SourceOperator::new(rows, id_sort()));
+        let mut pipeline = TakeOperator::new(source, 2, id_sort(), None);
+
+        let result = pipeline.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+        assert_eq!(result[1].row.get("id").unwrap(), &serde_json::json!(2));
+
+        // Push add of id=0 (before bound=2) -> displaces bound
+        let changes = pipeline.push(Change::Add(make_node(&[("id", serde_json::json!(0))])));
+        assert!(changes.len() >= 2);
+        let has_remove = changes.iter().any(|c| matches!(c, Change::Remove(_)));
+        assert!(has_remove, "should displace bound row");
+    }
+
+    #[test]
+    fn test_integration_exists_pipeline() {
+        let parents = vec![
+            make_node(&[("id", serde_json::json!(1))]),
+            make_node(&[("id", serde_json::json!(2))]),
+            make_node(&[("id", serde_json::json!(3))]),
+        ];
+        // Only parents 1 and 3 have children
+        let children = vec![
+            make_node(&[("id", serde_json::json!(10)), ("pid", serde_json::json!(1))]),
+            make_node(&[("id", serde_json::json!(30)), ("pid", serde_json::json!(3))]),
+        ];
+        let parent_source = Box::new(SourceOperator::new(parents, id_sort()));
+        let child_source = Box::new(SourceOperator::new(children, id_sort()));
+        let mut pipeline = ExistsOperator::new(
+            parent_source,
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["pid".to_string()],
+        );
+
+        let result = pipeline.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+        assert_eq!(result[1].row.get("id").unwrap(), &serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_integration_filter_take_push() {
+        let rows: Vec<Node> = (1..=10)
+            .map(|i| {
+                make_node(&[
+                    ("id", serde_json::json!(i)),
+                    ("status", serde_json::json!(if i % 2 == 0 { "active" } else { "inactive" })),
+                ])
+            })
+            .collect();
+        let source = Box::new(SourceOperator::new(rows, id_sort()));
+        let pred = Predicate::Eq("status".to_string(), Value::String("active".to_string()));
+        let filter: Box<dyn Operator> = Box::new(FilterOperator::new(source, pred));
+        let mut pipeline = TakeOperator::new(filter, 2, id_sort(), None);
+
+        // Fetch: should get first 2 active rows (id=2, id=4)
+        let result = pipeline.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(2));
+        assert_eq!(result[1].row.get("id").unwrap(), &serde_json::json!(4));
+
+        // Push an active Add with id=1 -> filter passes, take processes
+        let add = Change::Add(make_node(&[
+            ("id", serde_json::json!(1)),
+            ("status", serde_json::json!("active")),
+        ]));
+        let changes = pipeline.push(add);
+        // id=1 is before bound (id=4), so should displace
+        assert!(!changes.is_empty());
+
+        // Demonstrate filter-level push: inactive row is dropped by filter
+        // before it ever reaches take. In the current architecture, push
+        // propagation is the caller's responsibility.
+        let mut filter_only = FilterOperator::new(
+            Box::new(SourceOperator::new(vec![], id_sort())),
+            Predicate::Eq("status".to_string(), Value::String("active".to_string())),
+        );
+        let add_inactive = Change::Add(make_node(&[
+            ("id", serde_json::json!(0)),
+            ("status", serde_json::json!("inactive")),
+        ]));
+        let filter_result = filter_only.push(add_inactive);
+        assert!(filter_result.is_empty(), "filter should drop inactive row");
+    }
+
     #[test]
     fn test_source_operator_fetch_with_constraint() {
         let rows = vec![
