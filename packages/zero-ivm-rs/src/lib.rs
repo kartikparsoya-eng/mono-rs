@@ -11,3 +11,5 @@ pub mod filter_op;
 pub mod skip_op;
 pub mod cap_op;
 pub mod join_op;
+pub mod take_op;
+pub mod exists_op;
