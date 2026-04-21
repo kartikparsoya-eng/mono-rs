@@ -44,18 +44,16 @@ impl Operator for SkipOperator {
                 } else {
                     Some(start.clone())
                 }
-            } else {
-                if cmp == std::cmp::Ordering::Greater {
-                    return vec![];
-                } else if cmp == std::cmp::Ordering::Equal {
-                    if !self.bound.exclusive && start.basis == "at" {
-                        Some(bound_start)
-                    } else {
-                        return vec![];
-                    }
+            } else if cmp == std::cmp::Ordering::Greater {
+                return vec![];
+            } else if cmp == std::cmp::Ordering::Equal {
+                if !self.bound.exclusive && start.basis == "at" {
+                    Some(bound_start)
                 } else {
-                    Some(start.clone())
+                    return vec![];
                 }
+            } else {
+                Some(start.clone())
             }
         } else if req.reverse {
             None
