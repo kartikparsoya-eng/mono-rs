@@ -140,6 +140,31 @@ const USE_RUST_HYDRATION =
   rustHydrateFn !== undefined;
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 
+function collectExistsCorrelations(
+  condition: Condition | undefined,
+  map: Map<string, readonly string[]> = new Map(),
+): Map<string, readonly string[]> {
+  if (!condition) return map;
+  switch (condition.type) {
+    case 'correlatedSubquery': {
+      const name =
+        condition.related.subquery.alias ?? condition.related.subquery.table;
+      map.set(name, condition.related.correlation.parentField);
+      collectExistsCorrelations(condition.related.subquery.where, map);
+      break;
+    }
+    case 'and':
+    case 'or':
+      for (const c of condition.conditions) {
+        collectExistsCorrelations(c, map);
+      }
+      break;
+    case 'simple':
+      break;
+  }
+  return map;
+}
+
 function collectExistsTypes(
   condition: Condition | undefined,
   map: Map<string, 'EXISTS' | 'NOT EXISTS'> = new Map(),
@@ -570,14 +595,28 @@ export class PipelineDriver {
       } = this.#resolveScalarSubqueries(query);
 
       const existsTypes = collectExistsTypes(resolvedQuery.where);
+      const existsCorrelations = collectExistsCorrelations(
+        resolvedQuery.where,
+      );
 
+      // Capture Take storage reference so we can initialize it after Rust hydration.
+      let takeStorage: Storage | null = null;
       const input = buildPipeline(
         resolvedQuery,
         {
           debug: debugDelegate,
           enableNotExists: true, // Server-side can handle NOT EXISTS
           getSource: name => this.#getSource(name),
-          createStorage: () => this.#createStorage(),
+          createStorage: (name: string) => {
+            const storage = this.#createStorage();
+            // Capture only the top-level Take storage (name === ':take').
+            // Child Takes in .related() subqueries have names like '.comments:take'
+            // and are partitioned — they don't need this initialization.
+            if (name === ':take') {
+              takeStorage = storage;
+            }
+            return storage;
+          },
           decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
             new MeasurePushOperator(
               input,
@@ -592,13 +631,13 @@ export class PipelineDriver {
               const match = name.match(RUST_EXISTS_NAME_RE);
               if (match) {
                 const relationshipName = match[1];
-                const schema = input.getSchema();
-                const rel = schema.relationships[relationshipName];
-                if (rel) {
+                const parentField =
+                  existsCorrelations.get(relationshipName);
+                if (parentField) {
                   return createRustExistsWrapper(
                     input as FilterOperator,
                     relationshipName,
-                    rel.correlation.parentField,
+                    parentField,
                     existsTypes.get(relationshipName) ?? 'EXISTS',
                   );
                 }
@@ -621,10 +660,38 @@ export class PipelineDriver {
       });
 
       if (USE_RUST_HYDRATION && companionMeta.length === 0) {
+        let hydratedRowCount = 0;
+        let lastHydratedRow: Row | undefined;
         if (isDualExecEnabled()) {
-          yield* this.#dualExecHydrate(queryID, resolvedQuery, input);
+          for (const item of this.#dualExecHydrate(
+            queryID,
+            resolvedQuery,
+            input,
+          )) {
+            if (item.type === ChangeType.ADD) {
+              hydratedRowCount++;
+              lastHydratedRow = item.row;
+            }
+            yield item;
+          }
         } else {
-          yield* this.#rustHydrate(queryID, resolvedQuery);
+          for (const item of this.#rustHydrate(queryID, resolvedQuery)) {
+            if (item !== 'yield' && item.type === ChangeType.ADD) {
+              hydratedRowCount++;
+              lastHydratedRow = item.row;
+            }
+            yield item;
+          }
+        }
+        // After Rust hydration, initialize Take state so TS advance works.
+        // Rust hydration bypasses input.fetch(), leaving Take's storage empty.
+        // Without this, Take.push() silently drops all changes (non-reactive).
+        if (takeStorage && resolvedQuery.limit !== undefined) {
+          initializeTakeState(
+            takeStorage,
+            hydratedRowCount,
+            lastHydratedRow,
+          );
         }
       } else {
         yield* hydrateInternal(
@@ -1645,6 +1712,35 @@ export function* hydrateInternal(
     toAdds(res),
   );
   yield* streamer.stream();
+}
+
+/**
+ * Initializes Take operator storage after Rust hydration.
+ *
+ * Rust hydration bypasses the TS operator pipeline (specifically input.fetch()),
+ * which means Take's #initialFetch never runs and its storage stays empty.
+ * When Take.push() sees empty storage, it silently drops all changes — making
+ * the query non-reactive after initial hydration.
+ *
+ * This function writes the same state that Take.#initialFetch would have written:
+ * - TakeState {size, bound} under the take state key
+ * - MAX_BOUND_KEY with the bound row (for partitioned takes / nested fetches)
+ *
+ * For non-partitioned queries (the common case with Rust hydration),
+ * the take state key is simply '["take"]'.
+ */
+function initializeTakeState(
+  storage: Storage,
+  size: number,
+  bound: Row | undefined,
+): void {
+  // The take state key for non-partitioned queries.
+  // See getTakeStateKey() in take.ts — with no partition key, it's JSON.stringify(['take']).
+  const takeStateKey = JSON.stringify(['take']);
+  storage.set(takeStateKey, {size, bound} as unknown as JSONValue);
+  if (bound !== undefined) {
+    storage.set('maxBound', bound as unknown as JSONValue);
+  }
 }
 
 function buildPrimaryKeys(
