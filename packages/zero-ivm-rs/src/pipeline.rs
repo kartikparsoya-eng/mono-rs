@@ -1,3 +1,4 @@
+use napi_derive::napi;
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -74,7 +75,7 @@ fn parse_sort(sort: &[(String, String)]) -> Vec<SortSpec> {
         .collect()
 }
 
-fn parse_predicate(value: &serde_json::Value) -> Result<Predicate, String> {
+fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, String> {
     let obj = value.as_object().ok_or("predicate must be an object")?;
 
     if let Some(field) = obj.get("field") {
@@ -173,7 +174,7 @@ impl Operator for SourceOperator {
     }
 }
 
-pub fn build_operator(configs: &[OperatorConfig]) -> Result<Box<dyn Operator>, String> {
+pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn Operator>, String> {
     if configs.is_empty() {
         return Err("empty operator config".to_string());
     }
@@ -271,6 +272,41 @@ pub fn build_operator(configs: &[OperatorConfig]) -> Result<Box<dyn Operator>, S
     }
 
     current.ok_or("no operator built".to_string())
+}
+
+#[napi]
+pub struct Pipeline {
+    operator: Box<dyn Operator>,
+}
+
+#[napi]
+impl Pipeline {
+    #[napi(factory)]
+    pub fn build(config_json: String) -> napi::Result<Self> {
+        let configs: Vec<OperatorConfig> = serde_json::from_str(&config_json)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid pipeline config: {}", e)))?;
+        let operator = build_operator(&configs)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to build pipeline: {}", e)))?;
+        Ok(Self { operator })
+    }
+
+    #[napi]
+    pub fn fetch(&mut self, request_json: String) -> napi::Result<String> {
+        let req: FetchRequest = serde_json::from_str(&request_json)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid fetch request: {}", e)))?;
+        let nodes = self.operator.fetch(&req);
+        serde_json::to_string(&nodes)
+            .map_err(|e| napi::Error::from_reason(format!("Serialization error: {}", e)))
+    }
+
+    #[napi]
+    pub fn push(&mut self, change_json: String) -> napi::Result<String> {
+        let change: Change = serde_json::from_str(&change_json)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid change: {}", e)))?;
+        let changes = self.operator.push(change);
+        serde_json::to_string(&changes)
+            .map_err(|e| napi::Error::from_reason(format!("Serialization error: {}", e)))
+    }
 }
 
 #[cfg(test)]
