@@ -358,6 +358,80 @@ describe('pipeline-driver edge cases', () => {
     );
   });
 
+  // Regression test: Ensures takeStorage captures only the top-level Take
+  // (name === ':take'), not a child Take from .related() (e.g. '.comments:take').
+  // If takeStorage were overwritten by a child's partitioned storage,
+  // initializeTakeState would write to the wrong storage and the top-level
+  // Take would remain non-reactive.
+  test('LIMIT with .related() child LIMIT remains reactive', () => {
+    // Top-level: LIMIT 2 on issues, child: LIMIT 1 on comments per issue
+    const ISSUES_WITH_RELATED_LIMIT: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      limit: 2,
+      related: [
+        {
+          system: 'client',
+          correlation: {
+            parentField: ['id'],
+            childField: ['issueID'],
+          },
+          subquery: {
+            table: 'comments',
+            alias: 'comments',
+            orderBy: [['id', 'asc']],
+            limit: 1,
+          },
+        },
+      ],
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-related-limit',
+        'queryRelatedLimit',
+        ISSUES_WITH_RELATED_LIMIT,
+        startTimer(),
+      ),
+    ];
+
+    // Hydration: top-level LIMIT 2 → issues '1' and '2'
+    const hydratedIssues = hydrated.filter(r => r.table === 'issues');
+    expect(hydratedIssues).toHaveLength(2);
+    expect(hydratedIssues.map(r => r.rowKey)).toEqual(
+      expect.arrayContaining([{id: '1'}, {id: '2'}]),
+    );
+
+    // Child LIMIT 1 per issue: issue '1' has comment '10', issue '2' has '20'
+    const hydratedComments = hydrated.filter(r => r.table === 'comments');
+    expect(hydratedComments).toHaveLength(2); // 1 per parent issue
+
+    // Insert issue '0' — enters top-level window, pushes issue '2' out
+    replicator.processTransaction(
+      '134',
+      messages.insert('issues', {id: '0', closed: 0}),
+    );
+
+    const result = changes();
+    const issueChanges = result.filter(
+      c => c.queryID === 'queryRelatedLimit' && c.table === 'issues',
+    );
+
+    // Top-level Take must still be reactive — issue '0' enters, issue '2' exits
+    expect(issueChanges.length).toBeGreaterThanOrEqual(1);
+    expect(issueChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 0, rowKey: {id: '0'}}),
+      ]),
+    );
+    expect(issueChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 1, rowKey: {id: '2'}}),
+      ]),
+    );
+  });
+
   test('ZERO_DISABLE_RUST_IVM=1 forces TS path and produces correct output', () => {
     const origEnv = process.env.ZERO_DISABLE_RUST_IVM;
     try {
