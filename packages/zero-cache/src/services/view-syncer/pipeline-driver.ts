@@ -42,6 +42,11 @@ import {
   type CompanionSubquery,
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
+import {
+  isDualExecEnabled,
+  dualExecCompare,
+  materializeChanges,
+} from './dual-executor.ts';
 import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
 import {isRustJoinAvailable} from './rust-join.ts';
 
@@ -735,6 +740,10 @@ export class PipelineDriver {
       'Pipeline driver must be initialized before advancing',
     );
     if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
+      if (isDualExecEnabled) {
+        // Dual-exec: run both Rust and TS, compare results
+        return this.#dualExecAdvance(timer);
+      }
       try {
         return this.#rustAdvance();
       } catch (e) {
@@ -988,6 +997,90 @@ export class PipelineDriver {
         row: change.row ?? change.row_key,
       } as RowChange;
     }
+  }
+
+  /**
+   * Dual-execution advance: runs both TS and Rust fan-out on the SAME diff,
+   * then compares results. TS is the source of truth.
+   *
+   * Uses one snapshotter.advance() call. The diff is materialized once and
+   * fed to both Rust (via rust_fan_out JSON) and TS (via #advance with a
+   * synthetic iterable). The TS #advance path handles db state updates.
+   */
+  #dualExecAdvance(timer: Timer): {
+    version: string;
+    numChanges: number;
+    changes: Iterable<RowChange | 'yield'>;
+  } {
+    assert(rustFanOutFn, 'Rust fan-out not available');
+
+    // 1. Get diff once, materialize changes
+    const diff = this.#snapshotter.advance(
+      this.#tableSpecs,
+      this.#allTableNames,
+    );
+    const {prev, curr, changes: numChanges} = diff;
+
+    const collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }> = [];
+    for (const change of diff) {
+      collectedChanges.push(change);
+    }
+
+    // 2. Run Rust fan-out on collected changes
+    let rustChanges: RowChange[] = [];
+    try {
+      const changesJson = JSON.stringify(collectedChanges);
+      const pipelineConfigsJson = this.#serializePipelineConfigs();
+      const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
+      const result = JSON.parse(resultJson) as {
+        changes: Array<{
+          queryID: string;
+          table: string;
+          row_key: Row;
+          row: Row | null;
+          type: string;
+        }>;
+        error?: string;
+      };
+      if (!result.error) {
+        rustChanges = materializeChanges(
+          this.#convertRustChanges(result.changes),
+        );
+      } else {
+        this.#lc.warn?.(`[dual-exec] Rust fan-out error: ${result.error}`);
+      }
+    } catch (e) {
+      this.#lc.warn?.(`[dual-exec] Rust fan-out exception: ${e}`);
+    }
+
+    // 3. Run TS path on the same collected changes via synthetic diff
+    const syntheticDiff = Object.assign(collectedChanges[Symbol.iterator](), {
+      prev,
+      curr,
+      changes: numChanges,
+    }) as unknown as SnapshotDiff;
+    const tsChanges = materializeChanges(
+      this.#advance(syntheticDiff, timer, numChanges),
+    );
+
+    // 4. Compare
+    const verified = dualExecCompare(
+      'advance',
+      tsChanges,
+      rustChanges,
+      this.#lc,
+    );
+
+    return {
+      version: curr.version,
+      numChanges,
+      changes: verified,
+    };
   }
 
   /** Implements `BuilderDelegate.getSource()` */
