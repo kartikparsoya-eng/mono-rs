@@ -66,7 +66,7 @@ pub fn serde_json_to_js(env: &Env, value: &serde_json::Value) -> Result<napi::sy
             unsafe {
                 napi::sys::napi_create_string_utf8(
                     env.raw(),
-                    s.as_ptr() as *const i8,
+                    s.as_ptr() as *const std::ffi::c_char,
                     s.len() as isize,
                     &mut result,
                 )
@@ -172,7 +172,7 @@ pub fn row_to_typed_js_object(
                         unsafe {
                             napi::sys::napi_create_string_utf8(
                                 env.raw(),
-                                s.as_ptr() as *const i8,
+                                s.as_ptr() as *const std::ffi::c_char,
                                 s.len() as isize,
                                 &mut v,
                             )
@@ -329,7 +329,7 @@ pub fn napi_value_to_sqlite_param(env: &Env, raw: napi::sys::napi_value) -> Resu
                 napi::sys::napi_get_value_string_utf8(
                     env.raw(),
                     raw,
-                    buf.as_mut_ptr() as *mut i8,
+                    buf.as_mut_ptr() as *mut std::ffi::c_char,
                     buf.len(),
                     &mut copied,
                 );
@@ -398,7 +398,7 @@ pub fn intern_column_keys(env: &Env, columns: &[String]) -> Result<Vec<napi::sys
         let status = unsafe {
             napi::sys::napi_create_string_utf8(
                 env.raw(),
-                col.as_ptr() as *const i8,
+                col.as_ptr() as *const std::ffi::c_char,
                 col.len() as isize,
                 &mut key,
             )
@@ -472,7 +472,7 @@ fn sqlite_value_to_raw_napi(
             unsafe {
                 napi::sys::napi_create_string_utf8(
                     env.raw(),
-                    s.as_ptr() as *const i8,
+                    s.as_ptr() as *const std::ffi::c_char,
                     s.len() as isize,
                     &mut v,
                 )

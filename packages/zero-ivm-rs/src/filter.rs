@@ -485,7 +485,7 @@ fn get_property_value(env: &Env, obj: &JsObject, key: &str) -> Result<Value> {
                 napi::sys::napi_get_value_string_utf8(
                     env.raw(),
                     result,
-                    buf.as_mut_ptr() as *mut i8,
+                    buf.as_mut_ptr() as *mut std::ffi::c_char,
                     len + 1,
                     &mut written,
                 )

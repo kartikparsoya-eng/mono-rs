@@ -51,6 +51,11 @@ impl Database {
         }
         .map_err(|e| Error::from_reason(format!("{e}")))?;
 
+        // Match better-sqlite3's default busy timeout (5s) so concurrent
+        // readers wait instead of immediately failing with "database is locked".
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(|e| Error::from_reason(format!("Failed to set busy_timeout: {e}")))?;
+
         let page_size: i64 = conn
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .map_err(|e| Error::from_reason(format!("Failed to read page_size: {e}")))?;
@@ -107,6 +112,13 @@ impl Database {
 
     #[napi]
     pub fn prepare(&self, sql: String) -> Result<Statement> {
+        // BEGIN CONCURRENT is a custom SQLite extension in @rocicorp/zero-sqlite3.
+        // Standard SQLite doesn't support it; fall back to BEGIN IMMEDIATE.
+        let sql = if sql.trim().eq_ignore_ascii_case("BEGIN CONCURRENT") {
+            "BEGIN IMMEDIATE".to_string()
+        } else {
+            sql
+        };
         {
             let conn = self.conn.borrow();
             conn.prepare(&sql)
@@ -117,7 +129,14 @@ impl Database {
 
     #[napi]
     pub fn close(&self) -> Result<()> {
-        // Optimize is handled by the TS wrapper for logging purposes
+        // Actually close the SQLite connection to release file locks.
+        // This is critical for locking_mode=EXCLUSIVE connections.
+        // Replace the connection with a closed in-memory one.
+        let old = self.conn.replace(
+            Connection::open_in_memory()
+                .map_err(|e| Error::from_reason(format!("close: {e}")))?
+        );
+        drop(old);
         Ok(())
     }
 
