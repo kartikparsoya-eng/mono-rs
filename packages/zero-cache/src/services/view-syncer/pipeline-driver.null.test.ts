@@ -44,7 +44,7 @@ describe('pipeline-driver NULL handling', () => {
   let db: DB;
   let lc: LogContext;
   let pipelines: PipelineDriver;
-  let replicator: FakeReplicator;
+  let _replicator: FakeReplicator;
 
   beforeEach(() => {
     lc = createSilentLogContext();
@@ -121,14 +121,14 @@ describe('pipeline-driver NULL handling', () => {
     }
 
     populateFromExistingTables(db, listTables(db, false));
-    replicator = fakeReplicator(lc, db);
+    _replicator = fakeReplicator(lc, db);
   });
 
   afterEach(() => {
     dbFile.delete();
   });
 
-  const messages = new ReplicationMessages({
+  const _messages = new ReplicationMessages({
     null_items: 'id',
     null_join_parents: 'id',
     null_join_children: 'id',
@@ -139,7 +139,7 @@ describe('pipeline-driver NULL handling', () => {
     return new TimeSliceTimer(lc).startWithoutYielding();
   }
 
-  function changes(timer: Timer = NO_TIME_ADVANCEMENT_TIMER) {
+  function _changes(timer: Timer = NO_TIME_ADVANCEMENT_TIMER) {
     return [...pipelines.advance(timer).changes];
   }
 
