@@ -246,9 +246,9 @@ describe('pipeline-driver join topologies', () => {
 
     const result = changes();
     const memberChanges = result.filter(c => c.table === 'members');
-    expect(
-      memberChanges.some(c => c.row?.id === 'm4' && c.type === 0),
-    ).toBe(true);
+    expect(memberChanges.some(c => c.row?.id === 'm4' && c.type === 0)).toBe(
+      true,
+    );
   });
 
   test('3-level join reacts to middle-level delete', () => {
@@ -300,15 +300,20 @@ describe('pipeline-driver join topologies', () => {
 
     const result = changes();
     const projectChanges = result.filter(c => c.table === 'projects');
-    expect(
-      projectChanges.some(c => c.row?.id === 'pr3' && c.type === 0),
-    ).toBe(true);
+    expect(projectChanges.some(c => c.row?.id === 'pr3' && c.type === 0)).toBe(
+      true,
+    );
   });
 
   test('exists-on-child hydration', () => {
     pipelines.init(clientSchema);
     const hydration = [
-      ...pipelines.addQuery('hash1', 'q1', ORGS_WITH_TEAMS_EXISTS, startTimer()),
+      ...pipelines.addQuery(
+        'hash1',
+        'q1',
+        ORGS_WITH_TEAMS_EXISTS,
+        startTimer(),
+      ),
     ];
 
     // Both o1 and o2 have teams
@@ -318,14 +323,23 @@ describe('pipeline-driver join topologies', () => {
 
   test('exists-on-child reacts to last child removal', () => {
     pipelines.init(clientSchema);
-    [...pipelines.addQuery('hash1', 'q1', ORGS_WITH_TEAMS_EXISTS, startTimer())];
+    [
+      ...pipelines.addQuery(
+        'hash1',
+        'q1',
+        ORGS_WITH_TEAMS_EXISTS,
+        startTimer(),
+      ),
+    ];
 
     // Delete t3 (o2's only team)
     replicator.processTransaction('134', messages.delete('teams', {id: 't3'}));
 
     const result = changes();
     // o2 should be removed from results
-    const orgChanges = result.filter(c => c.table === 'orgs' && c.queryID === 'q1');
+    const orgChanges = result.filter(
+      c => c.table === 'orgs' && c.queryID === 'q1',
+    );
     expect(
       orgChanges.some(
         c => (c.row?.id === 'o2' || c.rowKey?.id === 'o2') && c.type === 1,

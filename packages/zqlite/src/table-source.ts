@@ -161,9 +161,7 @@ export class TableSource implements Source {
         const msg = e.message;
         // Convert Rust errors to UnsupportedValueError for API compatibility
         if (msg.includes('is outside of supported bounds')) {
-          throw new UnsupportedValueError(
-            msg.replace(RE_STRIP_SQL_SUFFIX, ''),
-          );
+          throw new UnsupportedValueError(msg.replace(RE_STRIP_SQL_SUFFIX, ''));
         }
         if (msg.includes('invalid json value for column')) {
           const m = msg.match(RE_INVALID_JSON);

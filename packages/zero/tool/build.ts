@@ -13,15 +13,24 @@ import * as workerUrls from '../../zero-cache/src/server/worker-urls.ts';
 
 const forBundleSizeDashboard = process.argv.includes('--bundle-sizes');
 const watchMode = process.argv.includes('--watch');
+const noDts = process.argv.includes('--no-dts');
 
-async function getExternal(): Promise<string[]> {
-  return [
+async function getExternal(): Promise<(string | RegExp)[]> {
+  const entries: (string | RegExp)[] = [
     ...(await getExternalFromPackageJSON(import.meta.url, true)),
     'node:*',
     'expo*',
     '@op-engineering/*',
+    // napi-rs native addons: keep external so the bundler doesn't follow
+    // require('./*.node') inside the auto-generated loader and choke on the binary.
+    // Match both bare specifiers and the relative-path imports used in source.
+    'zero-ivm-rs',
+    'zqlite-rs',
+    /[\\/]zero-ivm-rs[\\/]/,
+    /[\\/]zqlite-rs[\\/]/,
     ...builtinModules,
-  ].sort();
+  ];
+  return entries.sort((a, b) => String(a).localeCompare(String(b)));
 }
 
 const external = await getExternal();
@@ -250,11 +259,13 @@ async function build() {
   } else {
     // Normal build: use inline vite config + type declarations
     const viteConfig = await getViteConfig();
-    await Promise.all([
-      runViteBuild(viteConfig, 'vite build'),
-      exec('tsc -p tsconfig.client.json', 'client dts'),
-      exec('tsc -p tsconfig.server.json', 'server dts'),
-    ]);
+    const dtsTasks = noDts
+      ? []
+      : [
+          exec('tsc -p tsconfig.client.json', 'client dts'),
+          exec('tsc -p tsconfig.server.json', 'server dts'),
+        ];
+    await Promise.all([runViteBuild(viteConfig, 'vite build'), ...dtsTasks]);
 
     await makeBinFilesExecutable();
     await copyStaticFiles();

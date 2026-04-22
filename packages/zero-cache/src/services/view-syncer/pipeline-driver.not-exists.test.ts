@@ -185,7 +185,14 @@ describe('pipeline-driver NOT EXISTS', () => {
 
   test('NOT EXISTS reacts to child addition', () => {
     pipelines.init(clientSchema);
-    [...pipelines.addQuery('hash1', 'q1', PARENTS_WITHOUT_CHILDREN, startTimer())];
+    [
+      ...pipelines.addQuery(
+        'hash1',
+        'q1',
+        PARENTS_WITHOUT_CHILDREN,
+        startTimer(),
+      ),
+    ];
 
     // Add a child for p3 — p3 should be removed from NOT EXISTS results
     replicator.processTransaction(
@@ -207,10 +214,20 @@ describe('pipeline-driver NOT EXISTS', () => {
 
   test('NOT EXISTS reacts to child removal', () => {
     pipelines.init(clientSchema);
-    [...pipelines.addQuery('hash1', 'q1', PARENTS_WITHOUT_CHILDREN, startTimer())];
+    [
+      ...pipelines.addQuery(
+        'hash1',
+        'q1',
+        PARENTS_WITHOUT_CHILDREN,
+        startTimer(),
+      ),
+    ];
 
     // Remove p1's only child — p1 should appear in NOT EXISTS results
-    replicator.processTransaction('134', messages.delete('children', {id: 'c1'}));
+    replicator.processTransaction(
+      '134',
+      messages.delete('children', {id: 'c1'}),
+    );
 
     const result = changes();
     const parentChanges = result.filter(
@@ -225,10 +242,20 @@ describe('pipeline-driver NOT EXISTS', () => {
   test('EXISTS vs NOT EXISTS produce complementary results', () => {
     pipelines.init(clientSchema);
     const existsHydration = [
-      ...pipelines.addQuery('hash-e', 'qExists', PARENTS_WITH_CHILDREN, startTimer()),
+      ...pipelines.addQuery(
+        'hash-e',
+        'qExists',
+        PARENTS_WITH_CHILDREN,
+        startTimer(),
+      ),
     ];
     const notExistsHydration = [
-      ...pipelines.addQuery('hash-ne', 'qNotExists', PARENTS_WITHOUT_CHILDREN, startTimer()),
+      ...pipelines.addQuery(
+        'hash-ne',
+        'qNotExists',
+        PARENTS_WITHOUT_CHILDREN,
+        startTimer(),
+      ),
     ];
 
     const existsParents = existsHydration

@@ -4,19 +4,19 @@
  * Receives changes from main thread, pushes through its pipelines, returns results.
  */
 import {parentPort, workerData} from 'worker_threads';
-import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
+import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
+import type {AST} from '../../../../zero-protocol/src/ast.ts';
+import type {Schema} from '../../../../zero-schema/src/builder/schema-builder.ts';
 import {
   CREATE_STORAGE_TABLE,
   DatabaseStorage,
 } from '../../../../zqlite/src/database-storage.ts';
 import {Database} from '../../../../zqlite/src/db.ts';
-import {Snapshotter} from './snapshotter.ts';
-import {PipelineDriver, type Timer} from './pipeline-driver.ts';
 import {InspectorDelegate} from '../../server/inspector-delegate.ts';
-import type {AST} from '../../../../zero-protocol/src/ast.ts';
-import type {Schema} from '../../../../zero-schema/src/builder/schema-builder.ts';
 import type {ShardID} from '../../types/shards.ts';
+import {PipelineDriver, type Timer} from './pipeline-driver.ts';
+import {Snapshotter} from './snapshotter.ts';
 
 const NO_TIME_ADVANCEMENT_TIMER: Timer = {
   elapsedLap: () => 0,
@@ -49,7 +49,9 @@ const pipelines = new PipelineDriver(
   testLogConfig,
   new Snapshotter(lc, config.dbPath, {appID: config.shardID.appID}),
   config.shardID,
-  new DatabaseStorage(storage).createClientGroupStorage(`worker-${config.workerIndex}`),
+  new DatabaseStorage(storage).createClientGroupStorage(
+    `worker-${config.workerIndex}`,
+  ),
   `worker-${config.workerIndex}`,
   new InspectorDelegate(undefined),
   () => 200,

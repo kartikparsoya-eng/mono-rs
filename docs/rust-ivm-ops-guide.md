@@ -29,12 +29,13 @@ cargo test
 
 ## Enabling / Disabling
 
-| Environment Variable | Value | Effect |
-|---------------------|-------|--------|
-| `ZERO_DISABLE_RUST_IVM` | `1` | Disables all Rust IVM paths. Pure TypeScript pipeline is used. |
-| `ZERO_DISABLE_RUST_IVM` | unset or any other value | Rust IVM enabled (default). |
+| Environment Variable    | Value                    | Effect                                                         |
+| ----------------------- | ------------------------ | -------------------------------------------------------------- |
+| `ZERO_DISABLE_RUST_IVM` | `1`                      | Disables all Rust IVM paths. Pure TypeScript pipeline is used. |
+| `ZERO_DISABLE_RUST_IVM` | unset or any other value | Rust IVM enabled (default).                                    |
 
 When enabled, the system still falls back to TypeScript automatically if:
+
 - The native module failed to load.
 - Any pipeline in the client group is ineligible for Rust advancement.
 - A runtime error occurs during `rust_advance`.
@@ -61,15 +62,15 @@ identify fallback frequency.
 
 ## Troubleshooting
 
-| Symptom | Likely Cause | Fix |
-|---------|-------------|-----|
-| `Rust advance not available` assertion | Native module not built or not found in `node_modules`. | Run `cd packages/zqlite-rs && npm run build`. Verify the `.node` binary exists. |
-| `Failed to parse syncable_tables` | Table spec JSON mismatch between TS and Rust. | Ensure `zqlite-rs` is rebuilt after schema changes. |
-| `version mismatch: expected X, got Y` | Snapshot advanced between snapshot open and version check. | Automatically retried once. If persistent, check replicator throughput. |
-| `schema-change on table T` (reset) | A DDL change was detected in the changelog. | Expected behavior. Pipelines reset and re-hydrate. |
-| `truncation on table T` (truncate) | A TRUNCATE operation was detected. | Expected behavior. Pipelines reset and re-hydrate. |
-| All queries falling back to TS | One or more pipelines have `related`, `limit`, companions, or correlated subqueries. | Review query ASTs. Simplify queries or accept TS performance for those client groups. |
-| `Rust advance failed, falling back to TS` repeatedly | Runtime panic or SQLite error in Rust code. | Check full error message. May indicate corrupt replica or incompatible SQLite version. |
+| Symptom                                              | Likely Cause                                                                         | Fix                                                                                    |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `Rust advance not available` assertion               | Native module not built or not found in `node_modules`.                              | Run `cd packages/zqlite-rs && npm run build`. Verify the `.node` binary exists.        |
+| `Failed to parse syncable_tables`                    | Table spec JSON mismatch between TS and Rust.                                        | Ensure `zqlite-rs` is rebuilt after schema changes.                                    |
+| `version mismatch: expected X, got Y`                | Snapshot advanced between snapshot open and version check.                           | Automatically retried once. If persistent, check replicator throughput.                |
+| `schema-change on table T` (reset)                   | A DDL change was detected in the changelog.                                          | Expected behavior. Pipelines reset and re-hydrate.                                     |
+| `truncation on table T` (truncate)                   | A TRUNCATE operation was detected.                                                   | Expected behavior. Pipelines reset and re-hydrate.                                     |
+| All queries falling back to TS                       | One or more pipelines have `related`, `limit`, companions, or correlated subqueries. | Review query ASTs. Simplify queries or accept TS performance for those client groups.  |
+| `Rust advance failed, falling back to TS` repeatedly | Runtime panic or SQLite error in Rust code.                                          | Check full error message. May indicate corrupt replica or incompatible SQLite version. |
 
 ## Rollback
 

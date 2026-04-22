@@ -1,3 +1,4 @@
+import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
 /**
  * Rust IVM Benchmark Suite
  *
@@ -8,7 +9,6 @@
  *   node --experimental-strip-types --experimental-transform-types packages/zero-cache/src/services/view-syncer/rust-ivm-bench.ts
  */
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
 import type {AST} from '../../../../zero-protocol/src/ast.ts';
 import {createSchema} from '../../../../zero-schema/src/builder/schema-builder.ts';
 import {
@@ -29,10 +29,7 @@ import {DbFile} from '../../test/lite.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import {populateFromExistingTables} from '../replicator/schema/column-metadata.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
-import {
-  fakeReplicator,
-  ReplicationMessages,
-} from '../replicator/test-utils.ts';
+import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
 import {PipelineDriver, type RowChange, type Timer} from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
 
@@ -68,16 +65,27 @@ const QUERY_TEMPLATES: AST[] = [
   {
     table: 'issues',
     orderBy: [['id', 'desc']],
-    related: [{
-      system: 'client',
-      correlation: {parentField: ['id'], childField: ['issueID']},
-      subquery: {table: 'comments', alias: 'comments', orderBy: [['id', 'desc']]},
-    }],
+    related: [
+      {
+        system: 'client',
+        correlation: {parentField: ['id'], childField: ['issueID']},
+        subquery: {
+          table: 'comments',
+          alias: 'comments',
+          orderBy: [['id', 'desc']],
+        },
+      },
+    ],
   },
   {
     table: 'issues',
     orderBy: [['id', 'asc']],
-    where: {type: 'simple', left: {type: 'column', name: 'closed'}, op: '=', right: {type: 'literal', value: false}},
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'closed'},
+      op: '=',
+      right: {type: 'literal', value: false},
+    },
   },
   {
     table: 'issues',
@@ -90,7 +98,9 @@ const QUERY_TEMPLATES: AST[] = [
   },
 ];
 
-function generateQueries(count: number): Array<{hydrationID: string; queryID: string; ast: AST}> {
+function generateQueries(
+  count: number,
+): Array<{hydrationID: string; queryID: string; ast: AST}> {
   const queries = [];
   for (let i = 0; i < count; i++) {
     queries.push({
@@ -122,8 +132,12 @@ function setupDb(tag: string): {dbFile: DbFile; db: DB} {
     CREATE TABLE comments (id TEXT PRIMARY KEY, issueID TEXT, upvotes INTEGER, _0_version TEXT NOT NULL);
   `);
 
-  const insertIssue = db.prepare(`INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`);
-  const insertComment = db.prepare(`INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`);
+  const insertIssue = db.prepare(
+    `INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`,
+  );
+  const insertComment = db.prepare(
+    `INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`,
+  );
 
   db.exec('BEGIN');
   for (let i = 0; i < NUM_SEED_ROWS; i++) {
@@ -158,7 +172,9 @@ function runAdvance(
       testLogConfig,
       new Snapshotter(lc, dbFile.path, {appID: shardID.appID}),
       shardID,
-      new DatabaseStorage(storage).createClientGroupStorage(disableRust ? 'ts' : 'rs'),
+      new DatabaseStorage(storage).createClientGroupStorage(
+        disableRust ? 'ts' : 'rs',
+      ),
       disableRust ? 'ts-bench' : 'rs-bench',
       new InspectorDelegate(undefined),
       () => 200,
@@ -167,7 +183,14 @@ function runAdvance(
     pipelines.init(clientSchema);
     const queries = generateQueries(numPipelines);
     for (const q of queries) {
-      [...pipelines.addQuery(q.hydrationID, q.queryID, q.ast, NO_TIME_ADVANCEMENT_TIMER)];
+      [
+        ...pipelines.addQuery(
+          q.hydrationID,
+          q.queryID,
+          q.ast,
+          NO_TIME_ADVANCEMENT_TIMER,
+        ),
+      ];
     }
 
     // Push changes
@@ -179,8 +202,16 @@ function runAdvance(
     const replicator = fakeReplicator(lc, db);
     const insertMsgs = [];
     for (let i = 0; i < numInserts; i++) {
-      insertMsgs.push(messages.insert('issues', {id: `new-${i}`, closed: i % 2}));
-      insertMsgs.push(messages.insert('comments', {id: `nc-${i}`, issueID: `new-${i}`, upvotes: BigInt(i * 10)}));
+      insertMsgs.push(
+        messages.insert('issues', {id: `new-${i}`, closed: i % 2}),
+      );
+      insertMsgs.push(
+        messages.insert('comments', {
+          id: `nc-${i}`,
+          issueID: `new-${i}`,
+          upvotes: BigInt(i * 10),
+        }),
+      );
     }
     replicator.processTransaction('02', ...insertMsgs);
 
@@ -256,7 +287,9 @@ function runSweep(
     dbRs.delete();
 
     if (serializeChanges(ts.changes) !== serializeChanges(rs.changes)) {
-      console.error(`  CORRECTNESS MISMATCH at ${label} p=${pipelines} d=${diffSize} iter=${i}`);
+      console.error(
+        `  CORRECTNESS MISMATCH at ${label} p=${pipelines} d=${diffSize} iter=${i}`,
+      );
       correctnessPass = false;
     }
   }

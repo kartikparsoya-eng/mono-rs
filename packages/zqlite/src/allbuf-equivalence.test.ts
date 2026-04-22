@@ -63,7 +63,13 @@ describe('allBuf equivalence', () => {
     const db = makeDb();
     db.exec('CREATE TABLE t (val TEXT)');
     const stmt = db.prepare('INSERT INTO t VALUES (?)');
-    const texts = ['hello', '', '日本語テスト', 'émojis: 🎉🚀', 'line\nnewline'];
+    const texts = [
+      'hello',
+      '',
+      '日本語テスト',
+      'émojis: 🎉🚀',
+      'line\nnewline',
+    ];
     for (const t of texts) {
       stmt.run(t);
     }
@@ -98,17 +104,17 @@ describe('allBuf equivalence', () => {
     // Compare buffer contents (Buffer equality)
     expect(bufResult.length).toBe(allResult.length);
     for (let i = 0; i < allResult.length; i++) {
-      expect(Buffer.from(bufResult[i].data).equals(Buffer.from(allResult[i].data))).toBe(true);
+      expect(
+        Buffer.from(bufResult[i].data).equals(Buffer.from(allResult[i].data)),
+      ).toBe(true);
     }
   });
 
   test('nulls across all types', () => {
     const db = makeDb();
-    db.exec(
-      'CREATE TABLE t (i INTEGER, r REAL, t TEXT, b BLOB)',
-    );
+    db.exec('CREATE TABLE t (i INTEGER, r REAL, t TEXT, b BLOB)');
     db.exec('INSERT INTO t VALUES (NULL, NULL, NULL, NULL)');
-    db.exec('INSERT INTO t VALUES (1, 2.5, \'hi\', X\'FF\')');
+    db.exec("INSERT INTO t VALUES (1, 2.5, 'hi', X'FF')");
     db.exec('INSERT INTO t VALUES (NULL, 3.0, NULL, NULL)');
 
     const stmt = db.prepare('SELECT * FROM t');
@@ -136,21 +142,19 @@ describe('allBuf equivalence', () => {
     db.exec(
       'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, avatar BLOB, deleted INTEGER)',
     );
-    db.exec(
-      `INSERT INTO t VALUES (1, 'Alice', 99.5, X'CAFEBABE', 0)`,
-    );
-    db.exec(
-      `INSERT INTO t VALUES (2, 'Bob', NULL, NULL, 1)`,
-    );
-    db.exec(
-      `INSERT INTO t VALUES (3, '日本', 0.001, X'', 0)`,
-    );
+    db.exec(`INSERT INTO t VALUES (1, 'Alice', 99.5, X'CAFEBABE', 0)`);
+    db.exec(`INSERT INTO t VALUES (2, 'Bob', NULL, NULL, 1)`);
+    db.exec(`INSERT INTO t VALUES (3, '日本', 0.001, X'', 0)`);
 
     const stmt = db.prepare('SELECT * FROM t');
     const allResult = stmt.all<Record<string, unknown>>();
     const buf = stmt.allBuf();
     const bufResult = decodeBuf<Record<string, unknown>>(buf, [
-      'id', 'name', 'score', 'avatar', 'deleted',
+      'id',
+      'name',
+      'score',
+      'avatar',
+      'deleted',
     ]);
 
     expect(bufResult.length).toBe(allResult.length);

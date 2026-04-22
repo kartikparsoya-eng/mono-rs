@@ -19,9 +19,6 @@ import {
   ReplicationMessages,
   type FakeReplicator,
 } from '../replicator/test-utils.ts';
-import {PipelineDriver, type Timer} from './pipeline-driver.ts';
-import {Snapshotter} from './snapshotter.ts';
-import {TimeSliceTimer} from './view-syncer.ts';
 import {
   numberClientSchema,
   NUMBER_ROWS,
@@ -29,6 +26,9 @@ import {
   NUMBER_FILTER_QUERY,
   NUMBER_GT_QUERY,
 } from './pipeline-driver.fixtures.ts';
+import {PipelineDriver, type Timer} from './pipeline-driver.ts';
+import {Snapshotter} from './snapshotter.ts';
+import {TimeSliceTimer} from './view-syncer.ts';
 
 const NO_TIME_ADVANCEMENT_TIMER: Timer = {
   elapsedLap: () => 0,
@@ -189,12 +189,7 @@ describe('pipeline-driver boundary numbers', () => {
 
       pipelines2.init(numberClientSchema);
       const tsHydration = [
-        ...pipelines2.addQuery(
-          'hash1',
-          'q1',
-          NUMBER_ITEMS_QUERY,
-          startTimer(),
-        ),
+        ...pipelines2.addQuery('hash1', 'q1', NUMBER_ITEMS_QUERY, startTimer()),
       ];
 
       const rustRows = rustHydration

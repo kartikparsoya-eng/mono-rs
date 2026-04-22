@@ -14,11 +14,11 @@ rest of the view-syncer in TypeScript.
 
 Native napi module (`packages/zqlite-rs`) compiled as a cdylib.
 
-| File | Responsibility |
-|------|---------------|
-| `src/advance.rs` | `rust_advance` napi entry point. Deserializes pipeline configs, opens two read-only SQLite connections (prev/curr snapshots), reads the diff, fans out over pipelines with Rayon, and serializes the result as JSON. Also contains the full predicate AST and evaluation engine (reimplemented from zero-ivm-rs because cdylib cannot cross-link). |
-| `src/diff.rs` | Reads `_zero.changeLog2` in batches, fetches prev/curr rows by primary and unique keys, converts SQLite types to ZQL types (boolean 0/1 to bool, JSON strings to parsed values), and surfaces reset/truncate/unknown errors. |
-| `src/database.rs` | Lower-level SQLite helpers shared across the crate. |
+| File              | Responsibility                                                                                                                                                                                                                                                                                                                                     |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/advance.rs`  | `rust_advance` napi entry point. Deserializes pipeline configs, opens two read-only SQLite connections (prev/curr snapshots), reads the diff, fans out over pipelines with Rayon, and serializes the result as JSON. Also contains the full predicate AST and evaluation engine (reimplemented from zero-ivm-rs because cdylib cannot cross-link). |
+| `src/diff.rs`     | Reads `_zero.changeLog2` in batches, fetches prev/curr rows by primary and unique keys, converts SQLite types to ZQL types (boolean 0/1 to bool, JSON strings to parsed values), and surfaces reset/truncate/unknown errors.                                                                                                                       |
+| `src/database.rs` | Lower-level SQLite helpers shared across the crate.                                                                                                                                                                                                                                                                                                |
 
 ### zero-ivm-rs
 
@@ -31,12 +31,12 @@ Pure-Rust operator library (`packages/zero-ivm-rs`) providing:
 
 ### TypeScript Wrappers
 
-| File | Role |
-|------|------|
-| `pipeline-driver.ts` | Orchestrates Rust vs TS advancement. Builds `RustPipelineConfig` for each eligible query, calls `rust_advance` when all pipelines qualify, converts the JSON result back to `RowChange` objects. Falls back to TS on any error. |
-| `rust-join.ts` | Checks availability and wraps the Rust join operator. |
-| `rust-exists.ts` | Checks availability and wraps the Rust exists operator via `createRustExistsWrapper`. |
-| `zero-ivm-rs/ts/rust-take-storage.ts` | Adapts `RustStorage` to the IVM `Storage` interface for take operators. |
+| File                                  | Role                                                                                                                                                                                                                            |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pipeline-driver.ts`                  | Orchestrates Rust vs TS advancement. Builds `RustPipelineConfig` for each eligible query, calls `rust_advance` when all pipelines qualify, converts the JSON result back to `RowChange` objects. Falls back to TS on any error. |
+| `rust-join.ts`                        | Checks availability and wraps the Rust join operator.                                                                                                                                                                           |
+| `rust-exists.ts`                      | Checks availability and wraps the Rust exists operator via `createRustExistsWrapper`.                                                                                                                                           |
+| `zero-ivm-rs/ts/rust-take-storage.ts` | Adapts `RustStorage` to the IVM `Storage` interface for take operators.                                                                                                                                                         |
 
 ## Data Flow
 
@@ -61,19 +61,19 @@ connection and looks up rows on both connections.
 
 ## Operator Boundary
 
-| Layer | Runs in |
-|-------|---------|
-| Changelog reading, row fetching, type conversion | Rust (diff.rs) |
-| Predicate parsing and evaluation (filter) | Rust (advance.rs) |
-| Pipeline fan-out (Rayon `par_iter`) | Rust (advance.rs) |
-| Take storage (sort + limit state) | Rust (RustTakeStorage) |
-| Join correlation | Rust (when `isRustJoinAvailable`) |
-| Exists semi-join | Rust (when `isRustExistsAvailable`) |
-| Pipeline eligibility check | TypeScript (pipeline-driver.ts `#extractPipelineConfig`) |
-| Hydration (initial query fetch) | TypeScript (always) |
-| Scalar subquery resolution | TypeScript (always) |
-| Companion pipeline monitoring | TypeScript (always) |
-| Result streaming to client | TypeScript (always) |
+| Layer                                            | Runs in                                                  |
+| ------------------------------------------------ | -------------------------------------------------------- |
+| Changelog reading, row fetching, type conversion | Rust (diff.rs)                                           |
+| Predicate parsing and evaluation (filter)        | Rust (advance.rs)                                        |
+| Pipeline fan-out (Rayon `par_iter`)              | Rust (advance.rs)                                        |
+| Take storage (sort + limit state)                | Rust (RustTakeStorage)                                   |
+| Join correlation                                 | Rust (when `isRustJoinAvailable`)                        |
+| Exists semi-join                                 | Rust (when `isRustExistsAvailable`)                      |
+| Pipeline eligibility check                       | TypeScript (pipeline-driver.ts `#extractPipelineConfig`) |
+| Hydration (initial query fetch)                  | TypeScript (always)                                      |
+| Scalar subquery resolution                       | TypeScript (always)                                      |
+| Companion pipeline monitoring                    | TypeScript (always)                                      |
+| Result streaming to client                       | TypeScript (always)                                      |
 
 A pipeline is eligible for Rust advancement only when it has no `related`
 clauses, no `limit`, no companion subqueries, and no correlated subqueries
@@ -84,12 +84,12 @@ pipelines in the client group are eligible.
 
 The system is designed to degrade gracefully at every level:
 
-| Trigger | Behavior |
-|---------|----------|
-| `ZERO_DISABLE_RUST_IVM=1` env var | All Rust paths disabled at startup; pure TS pipeline used. |
-| `zqlite-rs` native module not built / `require('zqlite-rs')` fails | `rustAdvanceFn` remains `undefined`; `USE_RUST_ADVANCE` is false. |
-| Any pipeline is ineligible (related, limit, companions, correlated subquery) | `#reevaluateRustAdvance` sets `#useRustAdvance = false`; all pipelines advance via TS. |
-| Rust `rust_advance` throws at runtime | Caught in `advance()`, logs warning, sets `#useRustAdvance = false` for remainder of session, retries current advance via TS. |
-| `version_mismatch` error type in result JSON | Retries once with a fresh snapshot pair; if retry also fails, throws `ResetPipelinesSignal`. |
-| `reset` or `truncate` error type (schema change, table truncation) | Throws `ResetPipelinesSignal` -- view-syncer tears down and re-hydrates all pipelines. |
-| `unknown` error type | Propagated as a generic `Error`; caught by the outer fallback. |
+| Trigger                                                                      | Behavior                                                                                                                      |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `ZERO_DISABLE_RUST_IVM=1` env var                                            | All Rust paths disabled at startup; pure TS pipeline used.                                                                    |
+| `zqlite-rs` native module not built / `require('zqlite-rs')` fails           | `rustAdvanceFn` remains `undefined`; `USE_RUST_ADVANCE` is false.                                                             |
+| Any pipeline is ineligible (related, limit, companions, correlated subquery) | `#reevaluateRustAdvance` sets `#useRustAdvance = false`; all pipelines advance via TS.                                        |
+| Rust `rust_advance` throws at runtime                                        | Caught in `advance()`, logs warning, sets `#useRustAdvance = false` for remainder of session, retries current advance via TS. |
+| `version_mismatch` error type in result JSON                                 | Retries once with a fresh snapshot pair; if retry also fails, throws `ResetPipelinesSignal`.                                  |
+| `reset` or `truncate` error type (schema change, table truncation)           | Throws `ResetPipelinesSignal` -- view-syncer tears down and re-hydrates all pipelines.                                        |
+| `unknown` error type                                                         | Propagated as a generic `Error`; caught by the outer fallback.                                                                |

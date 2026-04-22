@@ -21,10 +21,7 @@ export class RustTakeStorage implements Storage {
   }
 
   set(key: string, value: JSONValue): void {
-    this.#store.set(
-      this.#prefix + ':' + key,
-      JSON.stringify(value),
-    );
+    this.#store.set(this.#prefix + ':' + key, JSON.stringify(value));
   }
 
   del(key: string): void {

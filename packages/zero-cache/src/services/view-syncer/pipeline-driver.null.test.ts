@@ -19,9 +19,6 @@ import {
   ReplicationMessages,
   type FakeReplicator,
 } from '../replicator/test-utils.ts';
-import {PipelineDriver, type Timer} from './pipeline-driver.ts';
-import {Snapshotter} from './snapshotter.ts';
-import {TimeSliceTimer} from './view-syncer.ts';
 import {
   nullClientSchema,
   NULL_FILTER_ROWS,
@@ -31,6 +28,9 @@ import {
   NULL_JOIN_PARENTS_DATA,
   NULL_JOIN_CHILDREN_DATA,
 } from './pipeline-driver.fixtures.ts';
+import {PipelineDriver, type Timer} from './pipeline-driver.ts';
+import {Snapshotter} from './snapshotter.ts';
+import {TimeSliceTimer} from './view-syncer.ts';
 
 const NO_TIME_ADVANCEMENT_TIMER: Timer = {
   elapsedLap: () => 0,

@@ -123,7 +123,12 @@ const QUERY_TEMPLATES: AST[] = [
   },
 ];
 
-function createDB(): {dbFile: DbFile; db: DB; replicator: FakeReplicator; messages: ReplicationMessages<Record<string, string | string[]>>} {
+function createDB(): {
+  dbFile: DbFile;
+  db: DB;
+  replicator: FakeReplicator;
+  messages: ReplicationMessages<Record<string, string | string[]>>;
+} {
   const lc = createSilentLogContext();
   const dbFile = new DbFile('parallel_push_bench');
   dbFile.connect(lc).pragma('journal_mode = wal2');
@@ -203,7 +208,9 @@ function createDB(): {dbFile: DbFile; db: DB; replicator: FakeReplicator; messag
   return {dbFile, db, replicator, messages};
 }
 
-function generateQueries(n: number): Array<{hash: string; id: string; ast: AST}> {
+function generateQueries(
+  n: number,
+): Array<{hash: string; id: string; ast: AST}> {
   const queries = [];
   for (let i = 0; i < n; i++) {
     const ast = QUERY_TEMPLATES[i % QUERY_TEMPLATES.length];
@@ -329,11 +336,14 @@ async function runParallel(): Promise<number> {
     const advancePromises = workers.map(
       worker =>
         new Promise<{elapsed: number; numChanges: number}>(resolve => {
-          worker.on('message', (msg: {type: string; elapsed: number; numChanges: number}) => {
-            if (msg.type === 'advance-done') {
-              resolve({elapsed: msg.elapsed, numChanges: msg.numChanges});
-            }
-          });
+          worker.on(
+            'message',
+            (msg: {type: string; elapsed: number; numChanges: number}) => {
+              if (msg.type === 'advance-done') {
+                resolve({elapsed: msg.elapsed, numChanges: msg.numChanges});
+              }
+            },
+          );
           worker.postMessage({type: 'advance'});
         }),
     );

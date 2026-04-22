@@ -1,3 +1,6 @@
+import {cpus} from 'os';
+import path from 'path';
+import {fileURLToPath} from 'url';
 /**
  * Parallel Fan-out POC Benchmark
  *
@@ -8,11 +11,8 @@
  *   node --experimental-strip-types --experimental-transform-types packages/zero-cache/src/services/view-syncer/parallel-fanout-bench.ts
  */
 import {Worker} from 'worker_threads';
-import {cpus} from 'os';
-import {fileURLToPath} from 'url';
-import path from 'path';
-import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
+import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import type {AST} from '../../../../zero-protocol/src/ast.ts';
 import {createSchema} from '../../../../zero-schema/src/builder/schema-builder.ts';
 import {
@@ -33,10 +33,7 @@ import {DbFile} from '../../test/lite.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import {populateFromExistingTables} from '../replicator/schema/column-metadata.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
-import {
-  fakeReplicator,
-  ReplicationMessages,
-} from '../replicator/test-utils.ts';
+import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
 import {PipelineDriver, type Timer} from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
 
@@ -73,17 +70,28 @@ const QUERY_TEMPLATES: AST[] = [
   {
     table: 'issues',
     orderBy: [['id', 'desc']],
-    related: [{
-      system: 'client',
-      correlation: {parentField: ['id'], childField: ['issueID']},
-      subquery: {table: 'comments', alias: 'comments', orderBy: [['id', 'desc']]},
-    }],
+    related: [
+      {
+        system: 'client',
+        correlation: {parentField: ['id'], childField: ['issueID']},
+        subquery: {
+          table: 'comments',
+          alias: 'comments',
+          orderBy: [['id', 'desc']],
+        },
+      },
+    ],
   },
   // Filter
   {
     table: 'issues',
     orderBy: [['id', 'asc']],
-    where: {type: 'simple', left: {type: 'column', name: 'closed'}, op: '=', right: {type: 'literal', value: false}},
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'closed'},
+      op: '=',
+      right: {type: 'literal', value: false},
+    },
   },
   // LIMIT
   {
@@ -98,7 +106,9 @@ const QUERY_TEMPLATES: AST[] = [
   },
 ];
 
-function generateQueries(count: number): Array<{hydrationID: string; queryID: string; ast: AST}> {
+function generateQueries(
+  count: number,
+): Array<{hydrationID: string; queryID: string; ast: AST}> {
   const queries = [];
   for (let i = 0; i < count; i++) {
     queries.push({
@@ -128,8 +138,12 @@ function setupDb(): {dbFile: DbFile; db: DB} {
     CREATE TABLE comments (id TEXT PRIMARY KEY, issueID TEXT, upvotes INTEGER, _0_version TEXT NOT NULL);
   `);
 
-  const insertIssue = db.prepare(`INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`);
-  const insertComment = db.prepare(`INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`);
+  const insertIssue = db.prepare(
+    `INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`,
+  );
+  const insertComment = db.prepare(
+    `INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`,
+  );
 
   db.exec('BEGIN');
   for (let i = 0; i < NUM_ROWS; i++) {
@@ -162,7 +176,14 @@ function runSequential(dbFile: DbFile, db: DB): number {
   pipelines.init(clientSchema);
   const queries = generateQueries(NUM_PIPELINES);
   for (const q of queries) {
-    [...pipelines.addQuery(q.hydrationID, q.queryID, q.ast, NO_TIME_ADVANCEMENT_TIMER)];
+    [
+      ...pipelines.addQuery(
+        q.hydrationID,
+        q.queryID,
+        q.ast,
+        NO_TIME_ADVANCEMENT_TIMER,
+      ),
+    ];
   }
 
   // Push changes
@@ -175,7 +196,13 @@ function runSequential(dbFile: DbFile, db: DB): number {
   const insertMsgs = [];
   for (let i = 0; i < NUM_INSERTS; i++) {
     insertMsgs.push(messages.insert('issues', {id: `new-${i}`, closed: i % 2}));
-    insertMsgs.push(messages.insert('comments', {id: `nc-${i}`, issueID: `new-${i}`, upvotes: BigInt(i * 10)}));
+    insertMsgs.push(
+      messages.insert('comments', {
+        id: `nc-${i}`,
+        issueID: `new-${i}`,
+        upvotes: BigInt(i * 10),
+      }),
+    );
   }
   replicator.processTransaction('02', ...insertMsgs);
 
@@ -199,7 +226,10 @@ async function runParallel(dbFile: DbFile, db: DB): Promise<number> {
   const readyPromises: Promise<void>[] = [];
 
   for (let i = 0; i < NUM_WORKERS; i++) {
-    const workerQueries = allQueries.slice(i * queriesPerWorker, (i + 1) * queriesPerWorker);
+    const workerQueries = allQueries.slice(
+      i * queriesPerWorker,
+      (i + 1) * queriesPerWorker,
+    );
     if (workerQueries.length === 0) continue;
 
     const worker = new Worker(workerPath, {
@@ -213,12 +243,14 @@ async function runParallel(dbFile: DbFile, db: DB): Promise<number> {
       execArgv: ['--import', 'tsx'],
     });
     workers.push(worker);
-    readyPromises.push(new Promise<void>((resolve, reject) => {
-      worker.on('message', (msg: {type: string}) => {
-        if (msg.type === 'ready') resolve();
-      });
-      worker.on('error', reject);
-    }));
+    readyPromises.push(
+      new Promise<void>((resolve, reject) => {
+        worker.on('message', (msg: {type: string}) => {
+          if (msg.type === 'ready') resolve();
+        });
+        worker.on('error', reject);
+      }),
+    );
   }
 
   // Wait for all workers to hydrate at version '01'
@@ -235,19 +267,26 @@ async function runParallel(dbFile: DbFile, db: DB): Promise<number> {
   const insertMsgs = [];
   for (let i = 0; i < NUM_INSERTS; i++) {
     insertMsgs.push(messages.insert('issues', {id: `new-${i}`, closed: i % 2}));
-    insertMsgs.push(messages.insert('comments', {id: `nc-${i}`, issueID: `new-${i}`, upvotes: BigInt(i * 10)}));
+    insertMsgs.push(
+      messages.insert('comments', {
+        id: `nc-${i}`,
+        issueID: `new-${i}`,
+        upvotes: BigInt(i * 10),
+      }),
+    );
   }
   replicator.processTransaction('02', ...insertMsgs);
 
   // Now measure: tell all workers to advance simultaneously
   const start = performance.now();
-  const donePromises = workers.map(w =>
-    new Promise<number>((resolve, reject) => {
-      w.on('message', (msg: {type: string; numChanges?: number}) => {
-        if (msg.type === 'done') resolve(msg.numChanges ?? 0);
-      });
-      w.on('error', reject);
-    }),
+  const donePromises = workers.map(
+    w =>
+      new Promise<number>((resolve, reject) => {
+        w.on('message', (msg: {type: string; numChanges?: number}) => {
+          if (msg.type === 'done') resolve(msg.numChanges ?? 0);
+        });
+        w.on('error', reject);
+      }),
   );
 
   // Fire all at once
@@ -259,7 +298,9 @@ async function runParallel(dbFile: DbFile, db: DB): Promise<number> {
   const elapsed = performance.now() - start;
 
   const totalChanges = results.reduce((a, b) => a + b, 0);
-  console.log(`  Parallel (${workers.length} workers): ${totalChanges} row changes produced`);
+  console.log(
+    `  Parallel (${workers.length} workers): ${totalChanges} row changes produced`,
+  );
 
   // Cleanup
   for (const w of workers) {
@@ -272,8 +313,12 @@ async function runParallel(dbFile: DbFile, db: DB): Promise<number> {
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`\nParallel Fan-out POC Benchmark`);
-  console.log(`  ${NUM_PIPELINES} pipelines, ${NUM_ROWS} seeded rows, ${NUM_INSERTS} inserts`);
-  console.log(`  ${NUM_WORKERS} worker threads (${cpus().length} CPUs available)`);
+  console.log(
+    `  ${NUM_PIPELINES} pipelines, ${NUM_ROWS} seeded rows, ${NUM_INSERTS} inserts`,
+  );
+  console.log(
+    `  ${NUM_WORKERS} worker threads (${cpus().length} CPUs available)`,
+  );
   console.log(`  ${ITERATIONS} iterations\n`);
 
   const seqTimes: number[] = [];

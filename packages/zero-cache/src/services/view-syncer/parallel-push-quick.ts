@@ -1,9 +1,9 @@
+import {createRequire} from 'node:module';
 /**
  * Quick standalone parallel push POC — no vitest, just runs and prints times.
  * Usage: npx tsx packages/zero-cache/src/services/view-syncer/parallel-push-quick.ts
  */
 import {cpus} from 'node:os';
-import {createRequire} from 'node:module';
 import {fileURLToPath} from 'node:url';
 import {Worker} from 'node:worker_threads';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
@@ -27,10 +27,7 @@ import {DbFile} from '../../test/lite.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import {populateFromExistingTables} from '../replicator/schema/column-metadata.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
-import {
-  fakeReplicator,
-  ReplicationMessages,
-} from '../replicator/test-utils.ts';
+import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
 import {PipelineDriver, type Timer} from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
 import {TimeSliceTimer} from './view-syncer.ts';
@@ -69,16 +66,27 @@ const QUERY_TEMPLATES: AST[] = [
   {
     table: 'issues',
     orderBy: [['id', 'desc']],
-    related: [{
-      system: 'client',
-      correlation: {parentField: ['id'], childField: ['issueID']},
-      subquery: {table: 'comments', alias: 'comments', orderBy: [['id', 'desc']]},
-    }],
+    related: [
+      {
+        system: 'client',
+        correlation: {parentField: ['id'], childField: ['issueID']},
+        subquery: {
+          table: 'comments',
+          alias: 'comments',
+          orderBy: [['id', 'desc']],
+        },
+      },
+    ],
   },
   {
     table: 'issues',
     orderBy: [['id', 'asc']],
-    where: {type: 'simple', left: {type: 'column', name: 'closed'}, op: '=', right: {type: 'literal', value: false}},
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'closed'},
+      op: '=',
+      right: {type: 'literal', value: false},
+    },
   },
   {
     table: 'issues',
@@ -88,7 +96,12 @@ const QUERY_TEMPLATES: AST[] = [
   {
     table: 'comments',
     orderBy: [['id', 'asc']],
-    where: {type: 'simple', left: {type: 'column', name: 'upvotes'}, op: '>', right: {type: 'literal', value: 50}},
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'upvotes'},
+      op: '>',
+      right: {type: 'literal', value: 50},
+    },
   },
 ];
 
@@ -109,10 +122,18 @@ function createDB() {
     CREATE TABLE "labels" (id TEXT PRIMARY KEY, name TEXT, _0_version TEXT NOT NULL);
   `);
 
-  const insertIssue = db.prepare(`INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`);
-  const insertComment = db.prepare(`INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`);
-  const insertLabel = db.prepare(`INSERT INTO labels (id, name, _0_version) VALUES (?, ?, '01')`);
-  const insertIssueLabel = db.prepare(`INSERT INTO "issueLabels" (issueID, labelID, legacyID, _0_version) VALUES (?, ?, ?, '01')`);
+  const insertIssue = db.prepare(
+    `INSERT INTO issues (id, closed, _0_version) VALUES (?, ?, '01')`,
+  );
+  const insertComment = db.prepare(
+    `INSERT INTO comments (id, issueID, upvotes, _0_version) VALUES (?, ?, ?, '01')`,
+  );
+  const insertLabel = db.prepare(
+    `INSERT INTO labels (id, name, _0_version) VALUES (?, ?, '01')`,
+  );
+  const insertIssueLabel = db.prepare(
+    `INSERT INTO "issueLabels" (issueID, labelID, legacyID, _0_version) VALUES (?, ?, ?, '01')`,
+  );
 
   db.exec('BEGIN');
   for (let i = 0; i < NUM_ROWS; i++) {
@@ -127,8 +148,11 @@ function createDB() {
   populateFromExistingTables(db, listTables(db, false));
 
   const messages = new ReplicationMessages({
-    issues: 'id', comments: 'id', issueLabels: ['issueID', 'labelID'],
-    labels: 'id', [mutationsTableName]: ['clientGroupID', 'clientID', 'mutationID'],
+    issues: 'id',
+    comments: 'id',
+    issueLabels: ['issueID', 'labelID'],
+    labels: 'id',
+    [mutationsTableName]: ['clientGroupID', 'clientID', 'mutationID'],
   });
   const replicator = fakeReplicator(lc, db);
   return {dbFile, db, replicator, messages};
@@ -136,7 +160,9 @@ function createDB() {
 
 function generateQueries(n: number) {
   return Array.from({length: n}, (_, i) => ({
-    hash: `h${i}`, id: `q${i}`, ast: QUERY_TEMPLATES[i % QUERY_TEMPLATES.length],
+    hash: `h${i}`,
+    id: `q${i}`,
+    ast: QUERY_TEMPLATES[i % QUERY_TEMPLATES.length],
   }));
 }
 
@@ -149,11 +175,14 @@ function runSequential(): number {
     const storage = new Database(lc, ':memory:');
     storage.prepare(CREATE_STORAGE_TABLE).run();
     const pipelines = new PipelineDriver(
-      lc, testLogConfig,
+      lc,
+      testLogConfig,
       new Snapshotter(lc, dbFile.path, {appID: shardID.appID}),
       shardID,
       new DatabaseStorage(storage).createClientGroupStorage('seq-cg'),
-      'seq', new InspectorDelegate(undefined), () => 200,
+      'seq',
+      new InspectorDelegate(undefined),
+      () => 200,
     );
     pipelines.init(clientSchema);
     const timer = new TimeSliceTimer(lc).startWithoutYielding();
@@ -164,8 +193,16 @@ function runSequential(): number {
     // Apply transaction
     const insertMsgs = [];
     for (let i = 0; i < NUM_INSERTS; i++) {
-      insertMsgs.push(messages.insert('issues', {id: `new-${i}`, closed: i % 2}));
-      insertMsgs.push(messages.insert('comments', {id: `nc-${i}`, issueID: `new-${i}`, upvotes: BigInt(i * 10)}));
+      insertMsgs.push(
+        messages.insert('issues', {id: `new-${i}`, closed: i % 2}),
+      );
+      insertMsgs.push(
+        messages.insert('comments', {
+          id: `nc-${i}`,
+          issueID: `new-${i}`,
+          upvotes: BigInt(i * 10),
+        }),
+      );
     }
     replicator.processTransaction('02', ...insertMsgs);
 
@@ -180,17 +217,26 @@ function runSequential(): number {
 
 // ─── Parallel ──────────────────────────────────────────────────────────────
 
-async function runParallel(): Promise<{wall: number; maxWorker: number; totalChanges: number}> {
+async function runParallel(): Promise<{
+  wall: number;
+  maxWorker: number;
+  totalChanges: number;
+}> {
   const {dbFile, replicator, messages} = createDB();
   try {
     const queries = generateQueries(NUM_PIPELINES);
-    const workerQueries: Array<typeof queries> = Array.from({length: NUM_WORKERS}, () => []);
+    const workerQueries: Array<typeof queries> = Array.from(
+      {length: NUM_WORKERS},
+      () => [],
+    );
     for (let i = 0; i < queries.length; i++) {
       workerQueries[i % NUM_WORKERS].push(queries[i]);
     }
 
     const esmRequire = createRequire(import.meta.url);
-    const workerPath = fileURLToPath(new URL('./parallel-push-worker.ts', import.meta.url));
+    const workerPath = fileURLToPath(
+      new URL('./parallel-push-worker.ts', import.meta.url),
+    );
     const workers: Worker[] = [];
     const readyPromises: Promise<void>[] = [];
 
@@ -198,15 +244,21 @@ async function runParallel(): Promise<{wall: number; maxWorker: number; totalCha
       const worker = new Worker(workerPath, {
         workerData: {dbPath: dbFile.path, queries: workerQueries[i], shardID},
         execArgv: [
-          '--require', esmRequire.resolve('tsx/preflight'),
-          '--import', 'tsx/esm',
+          '--require',
+          esmRequire.resolve('tsx/preflight'),
+          '--import',
+          'tsx/esm',
           '--no-warnings',
         ],
       });
       workers.push(worker);
-      readyPromises.push(new Promise<void>(resolve => {
-        worker.on('message', (msg: {type: string}) => { if (msg.type === 'ready') resolve(); });
-      }));
+      readyPromises.push(
+        new Promise<void>(resolve => {
+          worker.on('message', (msg: {type: string}) => {
+            if (msg.type === 'ready') resolve();
+          });
+        }),
+      );
     }
 
     await Promise.all(readyPromises);
@@ -214,24 +266,39 @@ async function runParallel(): Promise<{wall: number; maxWorker: number; totalCha
     // Apply transaction
     const insertMsgs = [];
     for (let i = 0; i < NUM_INSERTS; i++) {
-      insertMsgs.push(messages.insert('issues', {id: `new-${i}`, closed: i % 2}));
-      insertMsgs.push(messages.insert('comments', {id: `nc-${i}`, issueID: `new-${i}`, upvotes: BigInt(i * 10)}));
+      insertMsgs.push(
+        messages.insert('issues', {id: `new-${i}`, closed: i % 2}),
+      );
+      insertMsgs.push(
+        messages.insert('comments', {
+          id: `nc-${i}`,
+          issueID: `new-${i}`,
+          upvotes: BigInt(i * 10),
+        }),
+      );
     }
     replicator.processTransaction('02', ...insertMsgs);
 
     const start = performance.now();
-    const advancePromises = workers.map(worker =>
-      new Promise<{elapsed: number; numChanges: number}>(resolve => {
-        worker.on('message', (msg: {type: string; elapsed: number; numChanges: number}) => {
-          if (msg.type === 'advance-done') resolve({elapsed: msg.elapsed, numChanges: msg.numChanges});
-        });
-        worker.postMessage({type: 'advance'});
-      }),
+    const advancePromises = workers.map(
+      worker =>
+        new Promise<{elapsed: number; numChanges: number}>(resolve => {
+          worker.on(
+            'message',
+            (msg: {type: string; elapsed: number; numChanges: number}) => {
+              if (msg.type === 'advance-done')
+                resolve({elapsed: msg.elapsed, numChanges: msg.numChanges});
+            },
+          );
+          worker.postMessage({type: 'advance'});
+        }),
     );
     const results = await Promise.all(advancePromises);
     const wall = performance.now() - start;
 
-    for (const worker of workers) { worker.postMessage({type: 'shutdown'}); }
+    for (const worker of workers) {
+      worker.postMessage({type: 'shutdown'});
+    }
 
     return {
       wall,
@@ -247,7 +314,9 @@ async function runParallel(): Promise<{wall: number; maxWorker: number; totalCha
 
 async function main() {
   console.log(`\n=== Parallel Push POC ===`);
-  console.log(`Pipelines: ${NUM_PIPELINES} | Rows: ${NUM_ROWS} | Inserts: ${NUM_INSERTS} | Workers: ${NUM_WORKERS}\n`);
+  console.log(
+    `Pipelines: ${NUM_PIPELINES} | Rows: ${NUM_ROWS} | Inserts: ${NUM_INSERTS} | Workers: ${NUM_WORKERS}\n`,
+  );
 
   // Warmup
   console.log('Warming up...');
@@ -268,7 +337,9 @@ async function main() {
   for (let i = 0; i < 5; i++) {
     const {wall, maxWorker, totalChanges} = await runParallel();
     parTimes.push(wall);
-    console.log(`  Run ${i + 1}: wall=${wall.toFixed(1)}ms, maxWorker=${maxWorker.toFixed(1)}ms, changes=${totalChanges}`);
+    console.log(
+      `  Run ${i + 1}: wall=${wall.toFixed(1)}ms, maxWorker=${maxWorker.toFixed(1)}ms, changes=${totalChanges}`,
+    );
   }
   const parMean = parTimes.reduce((a, b) => a + b) / parTimes.length;
   console.log(`  Mean: ${parMean.toFixed(1)} ms\n`);
@@ -279,4 +350,7 @@ async function main() {
   console.log(`Speedup:         ${(seqMean / parMean).toFixed(2)}x`);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => {
+  console.error(e);
+  process.exit(1);
+});

@@ -14,22 +14,29 @@ const fs = require('node:fs');
 
 // ── Load both backends ──
 const BetterSqlite3 = require('@rocicorp/zero-sqlite3');
-const { Database: RustDatabase } = require(path.resolve(__dirname, '../index.js'));
+const {Database: RustDatabase} = require(
+  path.resolve(__dirname, '../index.js'),
+);
 
 // decodeBuf from db.ts (inline for benchmark)
 function decodeBuf(buf, colNames) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   let offset = 0;
-  const rowCount = dv.getUint32(offset, true); offset += 4;
-  const colCount = dv.getUint16(offset, true); offset += 2;
+  const rowCount = dv.getUint32(offset, true);
+  offset += 4;
+  const colCount = dv.getUint16(offset, true);
+  offset += 2;
   const rows = new Array(rowCount);
   const td = new TextDecoder();
   for (let r = 0; r < rowCount; r++) {
     const row = {};
     for (let c = 0; c < colCount; c++) {
-      const tag = dv.getUint8(offset); offset += 1;
+      const tag = dv.getUint8(offset);
+      offset += 1;
       switch (tag) {
-        case 0: row[colNames[c]] = null; break;
+        case 0:
+          row[colNames[c]] = null;
+          break;
         case 1: {
           const lo = dv.getUint32(offset, true);
           const hi = dv.getInt32(offset + 4, true);
@@ -43,13 +50,17 @@ function decodeBuf(buf, colNames) {
           offset += 8;
           break;
         case 3: {
-          const len = dv.getUint32(offset, true); offset += 4;
-          row[colNames[c]] = td.decode(new Uint8Array(buf.buffer, buf.byteOffset + offset, len));
+          const len = dv.getUint32(offset, true);
+          offset += 4;
+          row[colNames[c]] = td.decode(
+            new Uint8Array(buf.buffer, buf.byteOffset + offset, len),
+          );
           offset += len;
           break;
         }
         case 4: {
-          const len = dv.getUint32(offset, true); offset += 4;
+          const len = dv.getUint32(offset, true);
+          offset += 4;
           row[colNames[c]] = buf.slice(offset, offset + len);
           offset += len;
           break;
@@ -96,14 +107,19 @@ function bench(name, fn, iterations = ITERATIONS) {
 }
 
 function tmpDb(label) {
-  return path.join(os.tmpdir(), `bench-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  return path.join(
+    os.tmpdir(),
+    `bench-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+  );
 }
 
 // ── Setup helpers ──
 function setupOld(p) {
   const db = new BetterSqlite3(p);
   db.pragma('journal_mode=WAL');
-  db.exec(`CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, value REAL, data BLOB)`);
+  db.exec(
+    `CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, value REAL, data BLOB)`,
+  );
   db.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, val TEXT)`);
   return db;
 }
@@ -111,23 +127,31 @@ function setupOld(p) {
 function setupNew(p) {
   const db = new RustDatabase(p);
   db.exec('PRAGMA journal_mode=WAL');
-  db.exec(`CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, value REAL, data BLOB)`);
+  db.exec(
+    `CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, value REAL, data BLOB)`,
+  );
   db.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, val TEXT)`);
   return db;
 }
 
 function seedOld(db, n) {
-  const stmt = db.prepare('INSERT INTO bench (name, value, data) VALUES (?, ?, ?)');
+  const stmt = db.prepare(
+    'INSERT INTO bench (name, value, data) VALUES (?, ?, ?)',
+  );
   const tx = db.transaction(() => {
-    for (let i = 0; i < n; i++) stmt.run(`name-${i}`, Math.random() * 1000, Buffer.from(`data-${i}`));
+    for (let i = 0; i < n; i++)
+      stmt.run(`name-${i}`, Math.random() * 1000, Buffer.from(`data-${i}`));
   });
   tx();
 }
 
 function seedNew(db, n) {
-  const stmt = db.prepare('INSERT INTO bench (name, value, data) VALUES (?, ?, ?)');
+  const stmt = db.prepare(
+    'INSERT INTO bench (name, value, data) VALUES (?, ?, ?)',
+  );
   db.exec('BEGIN');
-  for (let i = 0; i < n; i++) stmt.run([`name-${i}`, Math.random() * 1000, Buffer.from(`data-${i}`)]);
+  for (let i = 0; i < n; i++)
+    stmt.run([`name-${i}`, Math.random() * 1000, Buffer.from(`data-${i}`)]);
   db.exec('COMMIT');
 }
 
@@ -142,7 +166,7 @@ const results = [];
 const sections = [];
 
 function section(name) {
-  sections.push({ name, startIdx: results.length });
+  sections.push({name, startIdx: results.length});
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -152,72 +176,142 @@ section('Statement API (generic)');
 
 // ── 1a. INSERT single row ──
 {
-  const p1 = tmpDb('old-ins'), p2 = tmpDb('new-ins');
-  const old = setupOld(p1), neo = setupNew(p2);
+  const p1 = tmpDb('old-ins'),
+    p2 = tmpDb('new-ins');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
   const s1 = old.prepare('INSERT INTO kv (key, val) VALUES (?, ?)');
   const s2 = neo.prepare('INSERT INTO kv (key, val) VALUES (?, ?)');
-  let c1 = 0, c2 = 0;
+  let c1 = 0,
+    c2 = 0;
 
-  results.push(bench('INSERT single  [sqlite3]', () => { s1.run(`k${c1++}`, 'v'); }));
-  results.push(bench('INSERT single  [rust]   ', () => { s2.run([`k${c2++}`, 'v']); }));
+  results.push(
+    bench('INSERT single  [sqlite3]', () => {
+      s1.run(`k${c1++}`, 'v');
+    }),
+  );
+  results.push(
+    bench('INSERT single  [rust]   ', () => {
+      s2.run([`k${c2++}`, 'v']);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 1b. INSERT with named params ──
 {
-  const p1 = tmpDb('old-named'), p2 = tmpDb('new-named');
-  const old = setupOld(p1), neo = setupNew(p2);
+  const p1 = tmpDb('old-named'),
+    p2 = tmpDb('new-named');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
   const s1 = old.prepare('INSERT INTO kv (key, val) VALUES (@key, @val)');
   const s2 = neo.prepare('INSERT INTO kv (key, val) VALUES (@key, @val)');
-  let c1 = 0, c2 = 0;
+  let c1 = 0,
+    c2 = 0;
 
-  results.push(bench('INSERT named   [sqlite3]', () => { s1.run({key: `k${c1++}`, val: 'v'}); }));
-  results.push(bench('INSERT named   [rust]   ', () => { s2.run([{key: `k${c2++}`, val: 'v'}]); }));
+  results.push(
+    bench('INSERT named   [sqlite3]', () => {
+      s1.run({key: `k${c1++}`, val: 'v'});
+    }),
+  );
+  results.push(
+    bench('INSERT named   [rust]   ', () => {
+      s2.run([{key: `k${c2++}`, val: 'v'}]);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 2. SELECT get (single row by PK) ──
 {
-  const p1 = tmpDb('old-get'), p2 = tmpDb('new-get');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 1000); seedNew(neo, 1000);
+  const p1 = tmpDb('old-get'),
+    p2 = tmpDb('new-get');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 1000);
+  seedNew(neo, 1000);
   const s1 = old.prepare('SELECT * FROM bench WHERE id = ?');
   const s2 = neo.prepare('SELECT * FROM bench WHERE id = ?');
 
-  results.push(bench('SELECT get     [sqlite3]', (i) => { s1.get((i % 1000) + 1); }));
-  results.push(bench('SELECT get     [rust]   ', (i) => { s2.get([(i % 1000) + 1]); }));
+  results.push(
+    bench('SELECT get     [sqlite3]', i => {
+      s1.get((i % 1000) + 1);
+    }),
+  );
+  results.push(
+    bench('SELECT get     [rust]   ', i => {
+      s2.get([(i % 1000) + 1]);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 3. SELECT all (100 rows) ──
 {
-  const p1 = tmpDb('old-all'), p2 = tmpDb('new-all');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 100); seedNew(neo, 100);
+  const p1 = tmpDb('old-all'),
+    p2 = tmpDb('new-all');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 100);
+  seedNew(neo, 100);
   const s1 = old.prepare('SELECT * FROM bench');
   const s2 = neo.prepare('SELECT * FROM bench');
 
-  results.push(bench('SELECT all(100)[sqlite3]', () => { s1.all(); }));
-  results.push(bench('SELECT all(100)[rust]   ', () => { s2.all([]); }));
+  results.push(
+    bench('SELECT all(100)[sqlite3]', () => {
+      s1.all();
+    }),
+  );
+  results.push(
+    bench('SELECT all(100)[rust]   ', () => {
+      s2.all([]);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 4. SELECT all (1000 rows) ──
 {
-  const p1 = tmpDb('old-1k'), p2 = tmpDb('new-1k');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 1000); seedNew(neo, 1000);
+  const p1 = tmpDb('old-1k'),
+    p2 = tmpDb('new-1k');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 1000);
+  seedNew(neo, 1000);
   const s1 = old.prepare('SELECT * FROM bench');
   const s2 = neo.prepare('SELECT * FROM bench');
 
-  results.push(bench('SELECT all(1K) [sqlite3]', () => { s1.all(); }, 2000));
-  results.push(bench('SELECT all(1K) [rust]   ', () => { s2.all([]); }, 2000));
+  results.push(
+    bench('SELECT all(1K) [sqlite3]', () => {
+      s1.all();
+    }, 2000),
+  );
+  results.push(
+    bench('SELECT all(1K) [rust]   ', () => {
+      s2.all([]);
+    }, 2000),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -227,47 +321,89 @@ section('allBuf protocol (binary transfer)');
 
 // ── 5. allBuf(100) vs all(100) ──
 {
-  const p1 = tmpDb('old-buf100'), p2 = tmpDb('new-buf100');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 100); seedNew(neo, 100);
+  const p1 = tmpDb('old-buf100'),
+    p2 = tmpDb('new-buf100');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 100);
+  seedNew(neo, 100);
   const s1 = old.prepare('SELECT * FROM bench');
   const s2 = neo.prepare('SELECT * FROM bench');
   const colNames = ['id', 'name', 'value', 'data'];
 
-  results.push(bench('all(100)       [sqlite3]', () => { s1.all(); }));
-  results.push(bench('allBuf(100)    [rust]   ', () => { decodeBuf(s2.allBuf([]), colNames); }));
+  results.push(
+    bench('all(100)       [sqlite3]', () => {
+      s1.all();
+    }),
+  );
+  results.push(
+    bench('allBuf(100)    [rust]   ', () => {
+      decodeBuf(s2.allBuf([]), colNames);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 6. allBuf(1K) vs all(1K) ──
 {
-  const p1 = tmpDb('old-buf1k'), p2 = tmpDb('new-buf1k');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 1000); seedNew(neo, 1000);
+  const p1 = tmpDb('old-buf1k'),
+    p2 = tmpDb('new-buf1k');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 1000);
+  seedNew(neo, 1000);
   const s1 = old.prepare('SELECT * FROM bench');
   const s2 = neo.prepare('SELECT * FROM bench');
   const colNames = ['id', 'name', 'value', 'data'];
 
-  results.push(bench('all(1K)        [sqlite3]', () => { s1.all(); }, 2000));
-  results.push(bench('allBuf(1K)     [rust]   ', () => { decodeBuf(s2.allBuf([]), colNames); }, 2000));
+  results.push(
+    bench('all(1K)        [sqlite3]', () => {
+      s1.all();
+    }, 2000),
+  );
+  results.push(
+    bench('allBuf(1K)     [rust]   ', () => {
+      decodeBuf(s2.allBuf([]), colNames);
+    }, 2000),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 7. allBuf(5K) vs all(5K) ──
 {
-  const p1 = tmpDb('old-buf5k'), p2 = tmpDb('new-buf5k');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 5000); seedNew(neo, 5000);
+  const p1 = tmpDb('old-buf5k'),
+    p2 = tmpDb('new-buf5k');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 5000);
+  seedNew(neo, 5000);
   const s1 = old.prepare('SELECT * FROM bench');
   const s2 = neo.prepare('SELECT * FROM bench');
   const colNames = ['id', 'name', 'value', 'data'];
 
-  results.push(bench('all(5K)        [sqlite3]', () => { s1.all(); }, 500));
-  results.push(bench('allBuf(5K)     [rust]   ', () => { decodeBuf(s2.allBuf([]), colNames); }, 500));
+  results.push(
+    bench('all(5K)        [sqlite3]', () => {
+      s1.all();
+    }, 500),
+  );
+  results.push(
+    bench('allBuf(5K)     [rust]   ', () => {
+      decodeBuf(s2.allBuf([]), colNames);
+    }, 500),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -277,49 +413,92 @@ section('Database methods (snapshotter hot path)');
 
 // ── 8. getRow (single PK lookup with type conversion) ──
 {
-  const p1 = tmpDb('old-getrow'), p2 = tmpDb('new-getrow');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 1000); seedNew(neo, 1000);
+  const p1 = tmpDb('old-getrow'),
+    p2 = tmpDb('new-getrow');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 1000);
+  seedNew(neo, 1000);
   const s1 = old.prepare('SELECT * FROM bench WHERE id = ?');
   const sql = 'SELECT * FROM bench WHERE id = ?';
-  const columnTypes = { value: 'FLOAT8' };
+  const columnTypes = {value: 'FLOAT8'};
 
-  results.push(bench('getRow(PK)     [sqlite3]', (i) => { s1.get((i % 1000) + 1); }));
-  results.push(bench('getRow(PK)     [rust]   ', (i) => { neo.getRow(sql, [(i % 1000) + 1], columnTypes, 'bench'); }));
+  results.push(
+    bench('getRow(PK)     [sqlite3]', i => {
+      s1.get((i % 1000) + 1);
+    }),
+  );
+  results.push(
+    bench('getRow(PK)     [rust]   ', i => {
+      neo.getRow(sql, [(i % 1000) + 1], columnTypes, 'bench');
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 9. getRowsBuf (multi-key OR query, snapshotter pattern) ──
 {
-  const p1 = tmpDb('old-getrows'), p2 = tmpDb('new-getrows');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 1000); seedNew(neo, 1000);
+  const p1 = tmpDb('old-getrows'),
+    p2 = tmpDb('new-getrows');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 1000);
+  seedNew(neo, 1000);
   // Simulate fetching 10 rows by PK (typical snapshotter batch)
-  const sql10 = 'SELECT * FROM bench WHERE id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=?';
+  const sql10 =
+    'SELECT * FROM bench WHERE id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=? OR id=?';
   const s1 = old.prepare(sql10);
   const colNames = ['id', 'name', 'value', 'data'];
   const params10 = [1, 50, 100, 200, 300, 400, 500, 600, 700, 800];
 
-  results.push(bench('getRows(10)    [sqlite3]', () => { s1.all(...params10); }));
-  results.push(bench('getRowsBuf(10) [rust]   ', () => { decodeBuf(neo.getRowsBuf(sql10, params10), colNames); }));
+  results.push(
+    bench('getRows(10)    [sqlite3]', () => {
+      s1.all(...params10);
+    }),
+  );
+  results.push(
+    bench('getRowsBuf(10) [rust]   ', () => {
+      decodeBuf(neo.getRowsBuf(sql10, params10), colNames);
+    }),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 10. queryAll (table-source with type conversion) ──
 {
-  const p1 = tmpDb('old-qa'), p2 = tmpDb('new-qa');
-  const old = setupOld(p1), neo = setupNew(p2);
-  seedOld(old, 500); seedNew(neo, 500);
+  const p1 = tmpDb('old-qa'),
+    p2 = tmpDb('new-qa');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  seedOld(old, 500);
+  seedNew(neo, 500);
   const s1 = old.prepare('SELECT * FROM bench LIMIT 100');
   const sql = 'SELECT * FROM bench LIMIT 100';
-  const columnTypes = { value: 'FLOAT8' };
+  const columnTypes = {value: 'FLOAT8'};
 
-  results.push(bench('queryAll(100)  [sqlite3]', () => { s1.all(); }, 5000));
-  results.push(bench('queryAll(100)  [rust]   ', () => { neo.queryAll(sql, [], columnTypes, 'bench'); }, 5000));
+  results.push(
+    bench('queryAll(100)  [sqlite3]', () => {
+      s1.all();
+    }, 5000),
+  );
+  results.push(
+    bench('queryAll(100)  [rust]   ', () => {
+      neo.queryAll(sql, [], columnTypes, 'bench');
+    }, 5000),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -329,44 +508,92 @@ section('Realistic workloads');
 
 // ── 11. changesSince pattern (read changelog + decode) ──
 {
-  const p1 = tmpDb('old-cl'), p2 = tmpDb('new-cl');
-  const old = setupOld(p1), neo = setupNew(p2);
+  const p1 = tmpDb('old-cl'),
+    p2 = tmpDb('new-cl');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
   // Create a changeLog-like table
-  old.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
-  neo.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
+  old.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
+  neo.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
   // Seed 500 entries
-  const ins1 = old.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  const ins1 = old.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   const tx1 = old.transaction(() => {
-    for (let i = 0; i < 500; i++) ins1.run(`0${String(i).padStart(3, '0')}`, i, 'users', `{"id":${i}}`, 's');
+    for (let i = 0; i < 500; i++)
+      ins1.run(
+        `0${String(i).padStart(3, '0')}`,
+        i,
+        'users',
+        `{"id":${i}}`,
+        's',
+      );
   });
   tx1();
-  const ins2 = neo.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  const ins2 = neo.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   neo.exec('BEGIN');
-  for (let i = 0; i < 500; i++) ins2.run([`0${String(i).padStart(3, '0')}`, i, 'users', `{"id":${i}}`, 's']);
+  for (let i = 0; i < 500; i++)
+    ins2.run([
+      `0${String(i).padStart(3, '0')}`,
+      i,
+      'users',
+      `{"id":${i}}`,
+      's',
+    ]);
   neo.exec('COMMIT');
 
-  const clSql = 'SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?';
+  const clSql =
+    'SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?';
   const s1 = old.prepare(clSql);
   const colNames = ['stateVersion', 'table', 'rowKey', 'op'];
 
-  results.push(bench('changeLog(500) [sqlite3]', () => { s1.all('0000', 500, 0); }, 2000));
-  results.push(bench('changesSince   [rust]   ', () => { decodeBuf(neo.changesSinceBuf('0000', 500, 0), colNames); }, 2000));
+  results.push(
+    bench('changeLog(500) [sqlite3]', () => {
+      s1.all('0000', 500, 0);
+    }, 2000),
+  );
+  results.push(
+    bench('changesSince   [rust]   ', () => {
+      decodeBuf(neo.changesSinceBuf('0000', 500, 0), colNames);
+    }, 2000),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 12. Mixed read pattern (simulates Diff iterator: 1 changesSince + N getRow) ──
 {
-  const p1 = tmpDb('old-mix'), p2 = tmpDb('new-mix');
-  const old = setupOld(p1), neo = setupNew(p2);
-  old.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, handle TEXT, "_0_version" TEXT)`);
-  neo.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, handle TEXT, "_0_version" TEXT)`);
-  old.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
-  neo.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
+  const p1 = tmpDb('old-mix'),
+    p2 = tmpDb('new-mix');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
+  old.exec(
+    `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, handle TEXT, "_0_version" TEXT)`,
+  );
+  neo.exec(
+    `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, handle TEXT, "_0_version" TEXT)`,
+  );
+  old.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
+  neo.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
 
   // Seed 100 users + 100 change log entries
   const insUser1 = old.prepare('INSERT INTO users VALUES (?, ?, ?, ?)');
-  const insCl1 = old.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  const insCl1 = old.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   const tx = old.transaction(() => {
     for (let i = 0; i < 100; i++) {
       insUser1.run(i, `user-${i}`, `handle-${i}`, '05');
@@ -376,7 +603,9 @@ section('Realistic workloads');
   tx();
 
   const insUser2 = neo.prepare('INSERT INTO users VALUES (?, ?, ?, ?)');
-  const insCl2 = neo.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  const insCl2 = neo.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   neo.exec('BEGIN');
   for (let i = 0; i < 100; i++) {
     insUser2.run([i, `user-${i}`, `handle-${i}`, '05']);
@@ -384,39 +613,50 @@ section('Realistic workloads');
   }
   neo.exec('COMMIT');
 
-  const clStmt = old.prepare('SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?');
+  const clStmt = old.prepare(
+    'SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?',
+  );
   const getStmt = old.prepare('SELECT * FROM users WHERE id = ?');
   const getRowSql = 'SELECT * FROM users WHERE id = ?';
   const clColNames = ['stateVersion', 'table', 'rowKey', 'op'];
   const columnTypes = {};
 
   // Simulates: read changeLog, then for each change, getRow
-  results.push(bench('diff(100)      [sqlite3]', () => {
-    const changes = clStmt.all('00', 100, 0);
-    for (const c of changes) {
-      const key = JSON.parse(c.rowKey);
-      getStmt.get(key.id);
-    }
-  }, 1000));
-  results.push(bench('diff(100)      [rust]   ', () => {
-    const changes = decodeBuf(neo.changesSinceBuf('00', 100, 0), clColNames);
-    for (const c of changes) {
-      const key = JSON.parse(c.rowKey);
-      neo.getRow(getRowSql, [key.id], columnTypes, 'users');
-    }
-  }, 1000));
+  results.push(
+    bench('diff(100)      [sqlite3]', () => {
+      const changes = clStmt.all('00', 100, 0);
+      for (const c of changes) {
+        const key = JSON.parse(c.rowKey);
+        getStmt.get(key.id);
+      }
+    }, 1000),
+  );
+  results.push(
+    bench('diff(100)      [rust]   ', () => {
+      const changes = decodeBuf(neo.changesSinceBuf('00', 100, 0), clColNames);
+      for (const c of changes) {
+        const key = JSON.parse(c.rowKey);
+        neo.getRow(getRowSql, [key.id], columnTypes, 'users');
+      }
+    }, 1000),
+  );
 
   // Also benchmark getRowsMultiBuf: batch all 100 getRow calls into one napi crossing
   const allIds = Array.from({length: 100}, (_, i) => i);
   const colNames = ['id', 'name', 'handle', '_0_version'];
-  results.push(bench('diff(100)multi [rust]   ', () => {
-    const changes = decodeBuf(neo.changesSinceBuf('00', 100, 0), clColNames);
-    const ids = changes.map(c => JSON.parse(c.rowKey).id);
-    decodeBuf(neo.getRowsMultiBuf(getRowSql, ids, 1), colNames);
-  }, 1000));
+  results.push(
+    bench('diff(100)multi [rust]   ', () => {
+      const changes = decodeBuf(neo.changesSinceBuf('00', 100, 0), clColNames);
+      const ids = changes.map(c => JSON.parse(c.rowKey).id);
+      decodeBuf(neo.getRowsMultiBuf(getRowSql, ids, 1), colNames);
+    }, 1000),
+  );
   results.push(null); // placeholder to maintain pairing
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ── 12b. View-syncer diff simulation (D-22: composite hot path) ──
@@ -424,21 +664,34 @@ section('Realistic workloads');
 // Uses 1000 changes across 5 tables to simulate realistic multi-table sync
 section('View-syncer diff simulation (composite)');
 {
-  const p1 = tmpDb('old-vs'), p2 = tmpDb('new-vs');
-  const old = setupOld(p1), neo = setupNew(p2);
+  const p1 = tmpDb('old-vs'),
+    p2 = tmpDb('new-vs');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
 
   const tables = ['users', 'issues', 'comments', 'labels', 'reactions'];
   for (const t of tables) {
-    old.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`);
-    neo.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`);
+    old.exec(
+      `CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`,
+    );
+    neo.exec(
+      `CREATE TABLE ${t} (id INTEGER PRIMARY KEY, data TEXT, extra TEXT, "_0_version" TEXT)`,
+    );
   }
-  old.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
-  neo.exec(`CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`);
+  old.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
+  neo.exec(
+    `CREATE TABLE "_zero.changeLog2" (stateVersion TEXT, pos INTEGER, "table" TEXT, rowKey TEXT, op TEXT)`,
+  );
 
   // Seed 1000 rows across 5 tables + 1000 changelog entries
   const insOld = {};
-  for (const t of tables) insOld[t] = old.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
-  const insClOld = old.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  for (const t of tables)
+    insOld[t] = old.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
+  const insClOld = old.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   old.transaction(() => {
     for (let i = 0; i < 1000; i++) {
       const t = tables[i % 5];
@@ -448,8 +701,11 @@ section('View-syncer diff simulation (composite)');
   })();
 
   const insNew = {};
-  for (const t of tables) insNew[t] = neo.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
-  const insClNew = neo.prepare('INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)');
+  for (const t of tables)
+    insNew[t] = neo.prepare(`INSERT INTO ${t} VALUES (?, ?, ?, ?)`);
+  const insClNew = neo.prepare(
+    'INSERT INTO "_zero.changeLog2" VALUES (?, ?, ?, ?, ?)',
+  );
   neo.exec('BEGIN');
   for (let i = 0; i < 1000; i++) {
     const t = tables[i % 5];
@@ -460,37 +716,47 @@ section('View-syncer diff simulation (composite)');
 
   const clColNames = ['stateVersion', 'table', 'rowKey', 'op'];
   const dataColNames = ['id', 'data', 'extra', '_0_version'];
-  const clStmt = old.prepare('SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?');
+  const clStmt = old.prepare(
+    'SELECT stateVersion, "table", rowKey, op FROM "_zero.changeLog2" WHERE stateVersion > ? ORDER BY stateVersion, pos LIMIT ? OFFSET ?',
+  );
   const getStmts = {};
-  for (const t of tables) getStmts[t] = old.prepare(`SELECT * FROM ${t} WHERE id = ?`);
+  for (const t of tables)
+    getStmts[t] = old.prepare(`SELECT * FROM ${t} WHERE id = ?`);
   const getRowSqls = {};
   for (const t of tables) getRowSqls[t] = `SELECT * FROM ${t} WHERE id = ?`;
 
   // TS path: changeLog query + per-row getRow
-  results.push(bench('vsDiff(1K)     [sqlite3]', () => {
-    const changes = clStmt.all('00', 1000, 0);
-    for (const c of changes) {
-      const key = JSON.parse(c.rowKey);
-      getStmts[c.table].get(key.id);
-    }
-  }, 500));
+  results.push(
+    bench('vsDiff(1K)     [sqlite3]', () => {
+      const changes = clStmt.all('00', 1000, 0);
+      for (const c of changes) {
+        const key = JSON.parse(c.rowKey);
+        getStmts[c.table].get(key.id);
+      }
+    }, 500),
+  );
 
   // Rust path: changesSinceBuf + getRowsMultiBuf (batched by table)
-  results.push(bench('vsDiff(1K)     [rust]   ', () => {
-    const changes = decodeBuf(neo.changesSinceBuf('00', 1000, 0), clColNames);
-    // Group by table, then batch fetch
-    const byTable = {};
-    for (const c of changes) {
-      const t = c.table;
-      if (!byTable[t]) byTable[t] = [];
-      byTable[t].push(JSON.parse(c.rowKey).id);
-    }
-    for (const [t, ids] of Object.entries(byTable)) {
-      decodeBuf(neo.getRowsMultiBuf(getRowSqls[t], ids, 1), dataColNames);
-    }
-  }, 500));
+  results.push(
+    bench('vsDiff(1K)     [rust]   ', () => {
+      const changes = decodeBuf(neo.changesSinceBuf('00', 1000, 0), clColNames);
+      // Group by table, then batch fetch
+      const byTable = {};
+      for (const c of changes) {
+        const t = c.table;
+        if (!byTable[t]) byTable[t] = [];
+        byTable[t].push(JSON.parse(c.rowKey).id);
+      }
+      for (const [t, ids] of Object.entries(byTable)) {
+        decodeBuf(neo.getRowsMultiBuf(getRowSqls[t], ids, 1), dataColNames);
+      }
+    }, 500),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -500,25 +766,38 @@ section('Transaction writes');
 
 // ── 13. Transaction batch (100 inserts per txn) ──
 {
-  const p1 = tmpDb('old-txn'), p2 = tmpDb('new-txn');
-  const old = setupOld(p1), neo = setupNew(p2);
+  const p1 = tmpDb('old-txn'),
+    p2 = tmpDb('new-txn');
+  const old = setupOld(p1),
+    neo = setupNew(p2);
   const s1 = old.prepare('INSERT INTO kv (key, val) VALUES (?, ?)');
   const s2 = neo.prepare('INSERT INTO kv (key, val) VALUES (?, ?)');
 
-  const oldTxn = old.transaction((base) => {
+  const oldTxn = old.transaction(base => {
     for (let j = 0; j < BATCH_SIZE; j++) s1.run(`k${base + j}`, `v${j}`);
   });
 
-  let c1 = 0, c2 = 0;
-  results.push(bench('Txn batch(100) [sqlite3]', () => { oldTxn(c1); c1 += BATCH_SIZE; }, 2000));
-  results.push(bench('Txn batch(100) [rust]   ', () => {
-    neo.exec('BEGIN');
-    for (let j = 0; j < BATCH_SIZE; j++) s2.run([`k${c2 + j}`, `v${j}`]);
-    neo.exec('COMMIT');
-    c2 += BATCH_SIZE;
-  }, 2000));
+  let c1 = 0,
+    c2 = 0;
+  results.push(
+    bench('Txn batch(100) [sqlite3]', () => {
+      oldTxn(c1);
+      c1 += BATCH_SIZE;
+    }, 2000),
+  );
+  results.push(
+    bench('Txn batch(100) [rust]   ', () => {
+      neo.exec('BEGIN');
+      for (let j = 0; j < BATCH_SIZE; j++) s2.run([`k${c2 + j}`, `v${j}`]);
+      neo.exec('COMMIT');
+      c2 += BATCH_SIZE;
+    }, 2000),
+  );
 
-  old.close(); neo.close(); fs.unlinkSync(p1); fs.unlinkSync(p2);
+  old.close();
+  neo.close();
+  fs.unlinkSync(p1);
+  fs.unlinkSync(p2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -526,8 +805,20 @@ section('Transaction writes');
 // ═══════════════════════════════════════════════════════════════
 console.log('');
 
-const SEP = '+' + '-'.repeat(40) + '+' + '-'.repeat(10) + '+' + '-'.repeat(12) + '+' + '-'.repeat(11) + '+' + '-'.repeat(10) + '+';
-const HDR = '| Test                                   | ops/sec  | total(ms)  | med(us)   | p99(us)  |';
+const SEP =
+  '+' +
+  '-'.repeat(40) +
+  '+' +
+  '-'.repeat(10) +
+  '+' +
+  '-'.repeat(12) +
+  '+' +
+  '-'.repeat(11) +
+  '+' +
+  '-'.repeat(10) +
+  '+';
+const HDR =
+  '| Test                                   | ops/sec  | total(ms)  | med(us)   | p99(us)  |';
 
 let sectionIdx = 0;
 for (let i = 0; i < results.length; i++) {
@@ -542,7 +833,9 @@ for (let i = 0; i < results.length; i++) {
   }
 
   const r = results[i];
-  if (!r) { continue; }
+  if (!r) {
+    continue;
+  }
   const n = r.name.padEnd(38);
   const ops = String(r.opsPerSec).padStart(8);
   const tot = String(r.totalMs).padStart(10);
@@ -556,7 +849,9 @@ for (let i = 0; i < results.length; i++) {
     const neo = results[i];
     const ratio = (neo.opsPerSec / old.opsPerSec).toFixed(2);
     const marker = ratio >= 1.0 ? `  ✓ ${ratio}x FASTER` : `  ✗ ${ratio}x`;
-    console.log(`|${marker.padEnd(40)}|${' '.repeat(10)}|${' '.repeat(12)}|${' '.repeat(11)}|${' '.repeat(10)}|`);
+    console.log(
+      `|${marker.padEnd(40)}|${' '.repeat(10)}|${' '.repeat(12)}|${' '.repeat(11)}|${' '.repeat(10)}|`,
+    );
     if (i < results.length - 1) console.log(SEP);
   }
 }
@@ -566,27 +861,38 @@ console.log(SEP);
 console.log('\n' + '═'.repeat(80));
 console.log('  SUMMARY: Rust/sqlite3 ratio (>1.0 = Rust faster)');
 console.log('═'.repeat(80));
-const wins = [], losses = [];
+const wins = [],
+  losses = [];
 for (let i = 0; i < results.length; i += 2) {
   const old = results[i];
   const neo = results[i + 1];
   if (!old || !neo) continue;
   const ratio = neo.opsPerSec / old.opsPerSec;
   const label = old.name.replace('[sqlite3]', '').trim();
-  const entry = { label, ratio: ratio.toFixed(2), oldOps: old.opsPerSec, newOps: neo.opsPerSec };
-  if (ratio >= 1.0) wins.push(entry); else losses.push(entry);
+  const entry = {
+    label,
+    ratio: ratio.toFixed(2),
+    oldOps: old.opsPerSec,
+    newOps: neo.opsPerSec,
+  };
+  if (ratio >= 1.0) wins.push(entry);
+  else losses.push(entry);
 }
 
 if (wins.length > 0) {
   console.log('\n  Rust WINS:');
   for (const w of wins) {
-    console.log(`    ${w.ratio}x  ${w.label} (${w.newOps} vs ${w.oldOps} ops/sec)`);
+    console.log(
+      `    ${w.ratio}x  ${w.label} (${w.newOps} vs ${w.oldOps} ops/sec)`,
+    );
   }
 }
 if (losses.length > 0) {
   console.log('\n  Rust SLOWER:');
   for (const l of losses.sort((a, b) => b.ratio - a.ratio)) {
-    console.log(`    ${l.ratio}x  ${l.label} (${l.newOps} vs ${l.oldOps} ops/sec)`);
+    console.log(
+      `    ${l.ratio}x  ${l.label} (${l.newOps} vs ${l.oldOps} ops/sec)`,
+    );
   }
 }
 console.log('');
@@ -699,12 +1005,24 @@ console.log('\n── Section 6: Initial-Sync INSERT Pattern ──');
   const napiOverheadMs = perCallOverheadMs * NUM_BATCHES;
   const napiOverheadPct = (napiOverheadMs / medianRustA) * 100;
 
-  console.log(`  ${TOTAL_ROWS} rows, ${COLS_PER_ROW} cols, batch=${BATCH_ROWS} → ${NUM_BATCHES} flush calls`);
-  console.log(`  Rust Statement.run() ×${NUM_BATCHES}: ${medianRustA.toFixed(3)} ms (median of ${RUNS})`);
-  console.log(`  better-sqlite3 ×${NUM_BATCHES}:      ${medianBsA.toFixed(3)} ms (median of ${RUNS})`);
-  console.log(`  Rust/BS ratio:                     ${(medianBsA / medianRustA).toFixed(2)}x`);
-  console.log(`  Per-call napi overhead:            ${(perCallOverheadMs * 1000).toFixed(1)} µs`);
-  console.log(`  Estimated napi overhead total:     ${napiOverheadMs.toFixed(3)} ms`);
+  console.log(
+    `  ${TOTAL_ROWS} rows, ${COLS_PER_ROW} cols, batch=${BATCH_ROWS} → ${NUM_BATCHES} flush calls`,
+  );
+  console.log(
+    `  Rust Statement.run() ×${NUM_BATCHES}: ${medianRustA.toFixed(3)} ms (median of ${RUNS})`,
+  );
+  console.log(
+    `  better-sqlite3 ×${NUM_BATCHES}:      ${medianBsA.toFixed(3)} ms (median of ${RUNS})`,
+  );
+  console.log(
+    `  Rust/BS ratio:                     ${(medianBsA / medianRustA).toFixed(2)}x`,
+  );
+  console.log(
+    `  Per-call napi overhead:            ${(perCallOverheadMs * 1000).toFixed(1)} µs`,
+  );
+  console.log(
+    `  Estimated napi overhead total:     ${napiOverheadMs.toFixed(3)} ms`,
+  );
   console.log(`  napi overhead: ${napiOverheadPct.toFixed(1)}% of flush time`);
   console.log('');
 
@@ -722,7 +1040,7 @@ console.log('\n── Section 6: Initial-Sync INSERT Pattern ──');
 // ── Regression assertions (run with --assert to enforce) ──
 if (process.argv.includes('--assert')) {
   const all = [...wins, ...losses];
-  const find = (label) => all.find(e => e.label.includes(label));
+  const find = label => all.find(e => e.label.includes(label));
   const assertions = [
     // Buffer protocol (must be faster)
     ['allBuf(1K)', 1.5, find('all(1K)')],
@@ -737,7 +1055,10 @@ if (process.argv.includes('--assert')) {
   ];
   let failed = 0;
   for (const [name, min, entry] of assertions) {
-    if (!entry) { console.log(`  SKIP: ${name} not found`); continue; }
+    if (!entry) {
+      console.log(`  SKIP: ${name} not found`);
+      continue;
+    }
     const ratio = parseFloat(entry.ratio);
     if (ratio < min) {
       console.error(`  FAIL: ${name} ratio ${ratio} < minimum ${min}`);

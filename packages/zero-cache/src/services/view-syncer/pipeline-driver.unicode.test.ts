@@ -19,9 +19,6 @@ import {
   ReplicationMessages,
   type FakeReplicator,
 } from '../replicator/test-utils.ts';
-import {PipelineDriver, type Timer} from './pipeline-driver.ts';
-import {Snapshotter} from './snapshotter.ts';
-import {TimeSliceTimer} from './view-syncer.ts';
 import {
   unicodeClientSchema,
   UNICODE_ROWS,
@@ -29,6 +26,9 @@ import {
   UNICODE_FILTER_EMOJI_QUERY,
   UNICODE_LIKE_QUERY,
 } from './pipeline-driver.fixtures.ts';
+import {PipelineDriver, type Timer} from './pipeline-driver.ts';
+import {Snapshotter} from './snapshotter.ts';
+import {TimeSliceTimer} from './view-syncer.ts';
 
 const NO_TIME_ADVANCEMENT_TIMER: Timer = {
   elapsedLap: () => 0,

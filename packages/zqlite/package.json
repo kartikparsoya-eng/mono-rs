@@ -23,8 +23,8 @@
     "@databases/escape-identifier": "^1.0.3",
     "@databases/sql": "^3.3.0",
     "@rocicorp/logger": "^5.4.0",
-    "zqlite-rs": "0.0.0",
-    "zql": "0.0.0"
+    "zql": "0.0.0",
+    "zqlite-rs": "0.0.0"
   },
   "devDependencies": {
     "@rocicorp/logger": "^5.4.0",
