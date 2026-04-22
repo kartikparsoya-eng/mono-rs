@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::filter::{Value, compare_values};
 use crate::operator::Operator;
 use crate::types::{Change, ChildData, FetchRequest, Node, Row};
 
@@ -43,7 +44,6 @@ impl ExistsOperator {
     }
 
     fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
-        // Build constraint from first parent_key -> child_key mapping
         let constraint = if !self.parent_key.is_empty() && !self.child_key.is_empty() {
             parent_row.get(&self.parent_key[0]).map(|v| {
                 crate::types::Constraint {
@@ -59,7 +59,27 @@ impl ExistsOperator {
             start: None,
             reverse: false,
         });
-        children.len()
+        // For compound keys, post-filter on all key columns (not just the first).
+        if self.parent_key.len() > 1 {
+            children.iter().filter(|cn| self.is_join_match(parent_row, &cn.row)).count()
+        } else {
+            children.len()
+        }
+    }
+
+    /// Check if a child row matches a parent row on all key columns.
+    fn is_join_match(&self, parent_row: &Row, child_row: &Row) -> bool {
+        for (pk, ck) in self.parent_key.iter().zip(self.child_key.iter()) {
+            let pv = parent_row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
+            let cv = child_row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+            if matches!(pv, Value::Null) || matches!(cv, Value::Null) {
+                return false;
+            }
+            if compare_values(&pv, &cv) != std::cmp::Ordering::Equal {
+                return false;
+            }
+        }
+        true
     }
 
     fn passes_filter(&self, count: usize) -> bool {

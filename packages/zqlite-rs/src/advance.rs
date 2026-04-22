@@ -1198,6 +1198,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
     let mut query_ids: Vec<String> = Vec::with_capacity(queries.len());
     let mut table_names: Vec<String> = Vec::with_capacity(queries.len());
     let mut primary_keys: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+    let mut rel_to_table_maps: Vec<HashMap<String, String>> = Vec::with_capacity(queries.len());
 
     for query in &queries {
         let operator_config = ast_to_operator_configs(
@@ -1216,6 +1217,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
         query_ids.push(query.query_id.clone());
         table_names.push(query.ast.table.clone());
         primary_keys.push(query.primary_key.clone());
+        rel_to_table_maps.push(collect_child_tables(&query.ast).into_iter().collect());
     }
     let ast_translate_us = t0.elapsed().as_micros();
 
@@ -1329,7 +1331,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
             match hr.nodes {
                 Ok(nodes) => {
                     let t0 = Instant::now();
-                    flatten_nodes_to_row_changes(&mut all_changes, qid, tbl, pk, &nodes, &all_pks, &queries[orig_idx].column_types);
+                    flatten_nodes_to_row_changes(&mut all_changes, qid, tbl, pk, &nodes, &all_pks, &queries[orig_idx].column_types, &rel_to_table_maps[orig_idx]);
                     total_flatten_us += t0.elapsed().as_micros();
                 }
                 Err(e) => {
@@ -1378,6 +1380,7 @@ fn flatten_nodes_to_row_changes(
     nodes: &[zero_ivm_rs::types::Node],
     all_pks: &HashMap<String, Vec<String>>,
     column_types: &Option<HashMap<String, HashMap<String, String>>>,
+    rel_to_table: &HashMap<String, String>,
 ) {
     for node in nodes {
         let row_key = {
@@ -1402,10 +1405,15 @@ fn flatten_nodes_to_row_changes(
         }
 
         for (rel_name, children) in &node.relationships {
-            let child_pk = all_pks.get(rel_name)
+            // Resolve actual table name from relationship name (H5 fix).
+            // When relationship name differs from table name (aliased joins),
+            // we must use the actual table name for coerce_row and PK lookup.
+            let child_table = rel_to_table.get(rel_name).map(|s| s.as_str()).unwrap_or(rel_name);
+            let child_pk = all_pks.get(child_table)
+                .or_else(|| all_pks.get(rel_name))
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            flatten_nodes_to_row_changes(out, query_id, rel_name, child_pk, children, all_pks, column_types);
+            flatten_nodes_to_row_changes(out, query_id, child_table, child_pk, children, all_pks, column_types, rel_to_table);
         }
     }
 }
