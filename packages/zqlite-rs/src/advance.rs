@@ -1180,6 +1180,209 @@ pub fn rust_advance_full_buf(
     Ok(Buffer::from(encode_advance_result_buf(&result)))
 }
 
+// ─── Hydration NAPI (AST → OperatorConfig → hydrate_pipelines) ──────────────
+
+#[napi]
+pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffer> {
+    use crate::ast_to_config::{HydrateQuery, SchemaCache, ast_to_operator_configs};
+    use crate::hydrate::{HydratePipelineConfig, hydrate_pipelines};
+    use crate::query_builder::ColumnType;
+    use crate::table_source::RustTableSource;
+    use std::time::Instant;
+
+    let profile = std::env::var("RUST_HYDRATE_PROFILE").unwrap_or_default() == "1";
+    let t_total = Instant::now();
+
+    let t0 = Instant::now();
+    let queries: Vec<HydrateQuery> = serde_json::from_str(&queries_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse queries JSON: {e}")))?;
+    let json_parse_us = t0.elapsed().as_micros();
+
+    let t0 = Instant::now();
+    let mut schema_cache = SchemaCache::new(&db_path);
+
+    let mut pipeline_configs = Vec::with_capacity(queries.len());
+    let mut query_ids: Vec<String> = Vec::with_capacity(queries.len());
+    let mut table_names: Vec<String> = Vec::with_capacity(queries.len());
+    let mut primary_keys: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+
+    for query in &queries {
+        let operator_config = ast_to_operator_configs(
+            &mut schema_cache,
+            &query.ast,
+            &query.primary_key,
+        )
+        .map_err(|e| napi::Error::from_reason(format!(
+            "AST translation failed for query '{}': {e}", query.query_id
+        )))?;
+
+        pipeline_configs.push(HydratePipelineConfig {
+            pipeline_id: query.query_id.clone(),
+            operator_config,
+        });
+        query_ids.push(query.query_id.clone());
+        table_names.push(query.ast.table.clone());
+        primary_keys.push(query.primary_key.clone());
+    }
+    let ast_translate_us = t0.elapsed().as_micros();
+
+    if pipeline_configs.is_empty() {
+        let result = AdvanceResult {
+            changes: vec![],
+            error: None,
+            error_type: None,
+        };
+        return Ok(Buffer::from(encode_advance_result_buf(&result)));
+    }
+
+    // Create a single shared connection pool for ALL queries.
+    // Rayon's thread pool determines the actual parallelism, so pool_size
+    // matches the Rayon thread count (or a reasonable default).
+    let t0 = Instant::now();
+    let pool_size = rayon::current_num_threads().max(4);
+    let shared_pool = crate::connection_pool::ConnectionPool::new(&db_path, pool_size)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create connection pool: {e}")))?;
+    let pool_create_us = t0.elapsed().as_micros();
+
+    // Group queries by table so each RustTableSource has the correct table metadata.
+    let mut table_groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, tbl) in table_names.iter().enumerate() {
+        table_groups.entry(tbl.clone()).or_default().push(i);
+    }
+
+    let mut all_changes: Vec<RowChange> = Vec::new();
+    let mut total_hydrate_us: u128 = 0;
+    let mut total_flatten_us: u128 = 0;
+
+    for (table_name, indices) in &table_groups {
+        let cols = schema_cache.get_columns(table_name)
+            .map_err(|e| napi::Error::from_reason(e))?;
+        let mut col_types = HashMap::new();
+        for c in &cols {
+            col_types.insert(c.clone(), ColumnType::String);
+        }
+
+        let group_pk = &primary_keys[indices[0]];
+        let mut source = RustTableSource::new_with_shared_pool(
+            shared_pool.clone(),
+            table_name.clone(),
+            cols,
+            col_types,
+            group_pk.clone(),
+        )
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create source for table '{table_name}': {e}")))?;
+
+        // Register connection 0 so LiveTableSource.fetch(conn_id=0, ...) succeeds.
+        let first_idx = indices[0];
+        let ordering = queries[first_idx].ast.order_by.clone();
+        source.connect(ordering, None, None);
+
+        let source_arc = Arc::new(source);
+        let group_configs: Vec<HydratePipelineConfig> = indices.iter().map(|&i| {
+            // Move the config out by swapping with a dummy
+            std::mem::replace(&mut pipeline_configs[i], HydratePipelineConfig {
+                pipeline_id: String::new(),
+                operator_config: vec![],
+            })
+        }).collect();
+
+        let t0 = Instant::now();
+        let hydrate_results = hydrate_pipelines(source_arc, group_configs);
+        total_hydrate_us += t0.elapsed().as_micros();
+
+        for (j, hr) in hydrate_results.into_iter().enumerate() {
+            let orig_idx = indices[j];
+            let qid = &query_ids[orig_idx];
+            let tbl = &table_names[orig_idx];
+            let pk = &primary_keys[orig_idx];
+            match hr.nodes {
+                Ok(nodes) => {
+                    let t0 = Instant::now();
+                    flatten_nodes_to_row_changes(&mut all_changes, qid, tbl, pk, &nodes);
+                    total_flatten_us += t0.elapsed().as_micros();
+                }
+                Err(e) => {
+                    let result = AdvanceResult {
+                        changes: vec![],
+                        error: Some(format!("Hydration failed for {qid}: {e}")),
+                        error_type: Some("hydration_error".to_string()),
+                    };
+                    return Ok(Buffer::from(encode_advance_result_buf(&result)));
+                }
+            }
+        }
+    }
+
+    let t0 = Instant::now();
+    let result = AdvanceResult {
+        changes: all_changes,
+        error: None,
+        error_type: None,
+    };
+    let encoded = encode_advance_result_buf(&result);
+    let encode_us = t0.elapsed().as_micros();
+
+    if profile {
+        let total_us = t_total.elapsed().as_micros();
+        eprintln!("[rust_hydrate profile] queries={} pool_size={} rayon_threads={}",
+            queries.len(), pool_size, rayon::current_num_threads());
+        eprintln!("  json_parse:    {:>8}us", json_parse_us);
+        eprintln!("  ast_translate: {:>8}us", ast_translate_us);
+        eprintln!("  pool_create:   {:>8}us", pool_create_us);
+        eprintln!("  hydrate:       {:>8}us", total_hydrate_us);
+        eprintln!("  flatten:       {:>8}us", total_flatten_us);
+        eprintln!("  encode:        {:>8}us", encode_us);
+        eprintln!("  TOTAL:         {:>8}us", total_us);
+        eprintln!("  result_bytes:  {:>8}", encoded.len());
+    }
+
+    Ok(Buffer::from(encoded))
+}
+
+fn flatten_nodes_to_row_changes(
+    out: &mut Vec<RowChange>,
+    query_id: &str,
+    table: &str,
+    primary_key: &[String],
+    nodes: &[zero_ivm_rs::types::Node],
+) {
+    for node in nodes {
+        let row_key = if primary_key.len() == 1 {
+            node.row
+                .get(&primary_key[0])
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        } else if primary_key.is_empty() {
+            // For relationship children, use entire row as key
+            let map: serde_json::Map<String, serde_json::Value> = node.row
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(map)
+        } else {
+            let map: serde_json::Map<String, serde_json::Value> = primary_key
+                .iter()
+                .filter_map(|k| node.row.get(k).map(|v| (k.clone(), v.clone())))
+                .collect();
+            serde_json::Value::Object(map)
+        };
+
+        let row: Row = node.row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        out.push(RowChange {
+            query_id: query_id.to_string(),
+            table: table.to_string(),
+            row_key,
+            row: Some(row),
+            change_type: "add".to_string(),
+        });
+
+        for (rel_name, children) in &node.relationships {
+            flatten_nodes_to_row_changes(out, query_id, rel_name, &[], children);
+        }
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

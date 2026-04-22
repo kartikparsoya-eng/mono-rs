@@ -54,7 +54,7 @@ pub struct Connection {
 
 pub struct RustTableSource {
     pool: ConnectionPool,
-    write_conn: rusqlite::Connection,
+    write_conn: Option<rusqlite::Connection>,
     table_name: String,
     columns: Vec<String>,
     column_types: HashMap<String, ColumnType>,
@@ -83,10 +83,31 @@ impl RustTableSource {
     ) -> Result<Self> {
         let pool = ConnectionPool::new(db_path, pool_size)?;
         let write_conn = rusqlite::Connection::open(db_path)?;
-        write_conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Ok(Self {
             pool,
-            write_conn,
+            write_conn: Some(write_conn),
+            table_name,
+            columns,
+            column_types,
+            primary_key,
+            connections: Vec::new(),
+            overlay: None,
+            push_epoch: 0,
+        })
+    }
+
+    /// Create a source that shares an existing connection pool (no new SQLite
+    /// connections are opened). Intended for hydration child sources.
+    pub fn new_with_shared_pool(
+        pool: ConnectionPool,
+        table_name: String,
+        columns: Vec<String>,
+        column_types: HashMap<String, ColumnType>,
+        primary_key: Vec<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            pool,
+            write_conn: None,
             table_name,
             columns,
             column_types,
@@ -99,6 +120,12 @@ impl RustTableSource {
 
     pub fn db_path(&self) -> &str {
         self.pool.path()
+    }
+
+    /// Returns a clone of the internal connection pool (cheap — shares the
+    /// underlying `Arc<Mutex<…>>`).
+    pub fn shared_pool(&self) -> ConnectionPool {
+        self.pool.clone()
     }
 
     pub fn connect(
@@ -199,6 +226,60 @@ impl RustTableSource {
         self.connections.get(id)
     }
 
+    /// Batch fetch: `SELECT ... WHERE child_key IN (v1, v2, ...)` returning
+    /// results grouped by the child_key value (as a canonical string key).
+    /// Used by batch join/exists to replace N+1 queries with a single query.
+    pub fn fetch_batch(
+        &self,
+        in_key: &str,
+        in_values: &[Value],
+        ordering: Option<&Vec<(String, String)>>,
+    ) -> Result<HashMap<String, Vec<Node>>> {
+        if in_values.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let col_list: Vec<String> = self.columns.iter().map(|c| format!("\"{}\"", c)).collect();
+        let mut sql = format!("SELECT {} FROM \"{}\"", col_list.join(", "), self.table_name);
+
+        let mut params: Vec<Value> = Vec::new();
+        let col_type = self.column_types.get(in_key).unwrap_or(&ColumnType::String);
+        let placeholders: Vec<&str> = in_values.iter().map(|_| "?").collect();
+        sql.push_str(&format!(" WHERE \"{}\" IN ({})", in_key, placeholders.join(", ")));
+        for v in in_values {
+            params.push(crate::query_builder::to_sqlite_type(v, col_type));
+        }
+
+        if let Some(order) = ordering {
+            let order_items: Vec<String> = order
+                .iter()
+                .map(|(field, dir)| format!("\"{}\" {}", field, dir))
+                .collect();
+            sql.push_str(&format!(" ORDER BY {}", order_items.join(", ")));
+        }
+
+        let pooled = self.pool.get()?;
+        let rows = execute_query(&pooled, &sql, &params)?;
+
+        let mut grouped: HashMap<String, Vec<Node>> = HashMap::new();
+        for row in rows {
+            let group_key = row.get(in_key)
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => "null".to_string(),
+                })
+                .unwrap_or_else(|| "null".to_string());
+            grouped.entry(group_key).or_default().push(Node {
+                row,
+                relationships: HashMap::new(),
+            });
+        }
+
+        Ok(grouped)
+    }
+
     pub fn push(&mut self, change: SourceChange) -> Result<Vec<Vec<Change>>> {
         self.push_epoch += 1;
         let epoch = self.push_epoch;
@@ -289,7 +370,9 @@ impl RustTableSource {
             self.table_name,
             where_clause.join(" AND ")
         );
-        let mut stmt = self.write_conn.prepare(&sql)?;
+        let wc = self.write_conn.as_ref()
+            .expect("write_conn required for push operations (not available in hydration-only sources)");
+        let mut stmt = wc.prepare(&sql)?;
         for (i, k) in self.primary_key.iter().enumerate() {
             let val = row.get(k).unwrap_or(&serde_json::Value::Null);
             bind_json_param(&mut stmt, i + 1, val)?;
@@ -311,7 +394,9 @@ impl RustTableSource {
                     cols.join(", "),
                     placeholders.join(", ")
                 );
-                let mut stmt = self.write_conn.prepare(&sql)?;
+                let wc = self.write_conn.as_ref()
+                    .expect("write_conn required for push operations");
+                let mut stmt = wc.prepare(&sql)?;
                 for (i, col) in self.columns.iter().enumerate() {
                     let val = row.get(col).unwrap_or(&serde_json::Value::Null);
                     bind_json_param(&mut stmt, i + 1, val)?;
@@ -330,7 +415,9 @@ impl RustTableSource {
                     self.table_name,
                     where_clause.join(" AND ")
                 );
-                let mut stmt = self.write_conn.prepare(&sql)?;
+                let wc = self.write_conn.as_ref()
+                    .expect("write_conn required for push operations");
+                let mut stmt = wc.prepare(&sql)?;
                 for (i, k) in self.primary_key.iter().enumerate() {
                     let val = row.get(k).unwrap_or(&serde_json::Value::Null);
                     bind_json_param(&mut stmt, i + 1, val)?;
@@ -373,7 +460,9 @@ impl RustTableSource {
                         set_clause.join(", "),
                         where_clause.join(" AND ")
                     );
-                    let mut stmt = self.write_conn.prepare(&sql)?;
+                    let wc = self.write_conn.as_ref()
+                        .expect("write_conn required for push operations");
+                    let mut stmt = wc.prepare(&sql)?;
                     let mut idx = 1;
                     for c in &non_pk_cols {
                         let val = row.get(c.as_str()).unwrap_or(&serde_json::Value::Null);

@@ -347,7 +347,10 @@ class Snapshot {
     const gen = generate();
     return {
       changes: gen,
-      cleanup: () => { gen.return(undefined); this.db.statementCache.return(cached); },
+      cleanup: () => {
+        gen.return(undefined);
+        this.db.statementCache.return(cached);
+      },
     };
   }
 

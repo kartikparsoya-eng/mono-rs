@@ -1,3 +1,4 @@
+import {createRequire} from 'node:module';
 import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
 import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
@@ -82,8 +83,8 @@ let rustFanOutFn: RustFanOutFn | undefined;
 let rustHydrateFn: RustHydrateFn | undefined;
 let rustDispatchPokeFn: RustDispatchPokeFn | undefined;
 try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unused-vars
-  const bindings = require('zqlite-rs');
+  const esmRequire = createRequire(import.meta.url);
+  const bindings = esmRequire('zqlite-rs');
   rustAdvanceFn = bindings?.rustAdvance;
   rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
@@ -595,9 +596,7 @@ export class PipelineDriver {
       } = this.#resolveScalarSubqueries(query);
 
       const existsTypes = collectExistsTypes(resolvedQuery.where);
-      const existsCorrelations = collectExistsCorrelations(
-        resolvedQuery.where,
-      );
+      const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
 
       // Capture Take storage reference so we can initialize it after Rust hydration.
       let takeStorage: Storage | null = null;
@@ -631,8 +630,7 @@ export class PipelineDriver {
               const match = name.match(RUST_EXISTS_NAME_RE);
               if (match) {
                 const relationshipName = match[1];
-                const parentField =
-                  existsCorrelations.get(relationshipName);
+                const parentField = existsCorrelations.get(relationshipName);
                 if (parentField) {
                   return createRustExistsWrapper(
                     input as FilterOperator,
@@ -687,11 +685,7 @@ export class PipelineDriver {
         // Rust hydration bypasses input.fetch(), leaving Take's storage empty.
         // Without this, Take.push() silently drops all changes (non-reactive).
         if (takeStorage && resolvedQuery.limit !== undefined) {
-          initializeTakeState(
-            takeStorage,
-            hydratedRowCount,
-            lastHydratedRow,
-          );
+          initializeTakeState(takeStorage, hydratedRowCount, lastHydratedRow);
         }
       } else {
         yield* hydrateInternal(
@@ -803,6 +797,306 @@ export class PipelineDriver {
       }
     } finally {
       this.#hydrateContext = null;
+    }
+  }
+
+  /**
+   * Batch-hydrate multiple queries in a single Rust NAPI call, enabling
+   * Rayon parallelism across all pipelines. Falls back to sequential
+   * {@link addQuery} when Rust hydration is unavailable or for queries
+   * with scalar subquery companions.
+   *
+   * @param queries The queries to hydrate.
+   * @param timer   Shared timer for the batch.
+   * @return The rows from the initial hydration of all queries.
+   */
+  *addQueries(
+    queries: ReadonlyArray<{
+      readonly transformationHash: string;
+      readonly queryID: string;
+      readonly ast: AST;
+    }>,
+    timer: Timer,
+  ): Iterable<RowChange | 'yield'> {
+    if (!USE_RUST_HYDRATION || queries.length === 0) {
+      for (const q of queries) {
+        yield* this.addQuery(q.transformationHash, q.queryID, q.ast, timer);
+      }
+      return;
+    }
+
+    assert(
+      this.initialized(),
+      'Pipeline driver must be initialized before adding queries',
+    );
+    assert(
+      this.#advanceContext === null,
+      'Cannot hydrate while advance is in progress',
+    );
+
+    // Phase 1: Build all TS pipelines and collect Rust hydration requests.
+    type PreparedQuery = {
+      queryID: string;
+      transformationHash: string;
+      resolvedQuery: AST;
+      companionRows: {table: string; row: Row}[];
+      companionMeta: CompanionSubquery[];
+      companionInputs: Input[];
+      existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
+      existsCorrelations: Map<string, readonly string[]>;
+      takeStorage: Storage | null;
+      input: Input;
+      debugDelegate: Debug | undefined;
+      rustEligible: boolean;
+    };
+
+    const prepared: PreparedQuery[] = [];
+    const rustPayloads: Array<{
+      query_id: string;
+      ast: AST;
+      primary_key: string[];
+    }> = [];
+
+    const costModel = this.#ensureCostModelExistsIfEnabled(
+      this.#snapshotter.current().db.db,
+    );
+
+    for (const q of queries) {
+      this.removeQuery(q.queryID);
+      const debugDelegate = runtimeDebugFlags.trackRowsVended
+        ? new Debug()
+        : undefined;
+
+      const {
+        ast: resolvedQuery,
+        companionRows,
+        companions: companionMeta,
+        companionInputs,
+      } = this.#resolveScalarSubqueries(q.ast);
+
+      const existsTypes = collectExistsTypes(resolvedQuery.where);
+      const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
+
+      let takeStorage: Storage | null = null;
+      const input = buildPipeline(
+        resolvedQuery,
+        {
+          debug: debugDelegate,
+          enableNotExists: true,
+          getSource: name => this.#getSource(name),
+          createStorage: (name: string) => {
+            const storage = this.#createStorage();
+            if (name === ':take') {
+              takeStorage = storage;
+            }
+            return storage;
+          },
+          decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
+            new MeasurePushOperator(
+              input,
+              q.queryID,
+              this.#inspectorDelegate,
+              'query-update-server',
+            ),
+          decorateInput: input => input,
+          addEdge() {},
+          decorateFilterInput: (input, name) => {
+            if (USE_RUST_EXISTS && name.includes(':exists(')) {
+              const match = name.match(RUST_EXISTS_NAME_RE);
+              if (match) {
+                const relationshipName = match[1];
+                const parentField = existsCorrelations.get(relationshipName);
+                if (parentField) {
+                  return createRustExistsWrapper(
+                    input as FilterOperator,
+                    relationshipName,
+                    parentField,
+                    existsTypes.get(relationshipName) ?? 'EXISTS',
+                  );
+                }
+              }
+            }
+            return input;
+          },
+        },
+        q.queryID,
+        costModel,
+      );
+      const schema = input.getSchema();
+      input.setOutput({
+        push: change => {
+          const streamer = this.#streamer;
+          assert(streamer, 'must #startAccumulating() before pushing changes');
+          streamer.accumulate(q.queryID, schema, [change]);
+          return [];
+        },
+      });
+
+      const rustEligible = companionMeta.length === 0;
+      if (rustEligible) {
+        const tableName = resolvedQuery.table ?? '';
+        const pk = this.#primaryKeys?.get(tableName) ?? [];
+        rustPayloads.push({
+          query_id: q.queryID,
+          ast: resolvedQuery,
+          primary_key: [...pk],
+        });
+      }
+
+      prepared.push({
+        queryID: q.queryID,
+        transformationHash: q.transformationHash,
+        resolvedQuery,
+        companionRows,
+        companionMeta,
+        companionInputs,
+        existsTypes,
+        existsCorrelations,
+        takeStorage,
+        input,
+        debugDelegate,
+        rustEligible,
+      });
+    }
+
+    // Phase 2: Single batch Rust hydration call.
+    let changesByQuery: Map<string, DecodedRowChange[]> | undefined;
+    if (rustPayloads.length > 0) {
+      assert(rustHydrateFn, 'Rust hydrate not available');
+      const db = this.#snapshotter.current().db;
+      const queriesJson = JSON.stringify(rustPayloads);
+      const resultBuf = rustHydrateFn(db.db.name, queriesJson);
+      const decoded = decodeAdvanceResultBuf(resultBuf);
+      if (decoded.error) {
+        throw new Error(`Rust batch hydration failed: ${decoded.error}`);
+      }
+      changesByQuery = new Map();
+      for (const change of decoded.changes) {
+        let arr = changesByQuery.get(change.queryID);
+        if (!arr) {
+          arr = [];
+          changesByQuery.set(change.queryID, arr);
+        }
+        arr.push(change);
+      }
+    }
+
+    // Phase 3: Yield results per-query and finalize pipelines.
+    for (const p of prepared) {
+      this.#hydrateContext = {timer};
+      try {
+        if (p.rustEligible && changesByQuery) {
+          const changes = changesByQuery.get(p.queryID) ?? [];
+          let hydratedRowCount = 0;
+          let lastHydratedRow: Row | undefined;
+          for (const item of this.#convertDecodedChanges(p.queryID, changes)) {
+            if (item !== 'yield' && item.type === ChangeType.ADD) {
+              hydratedRowCount++;
+              lastHydratedRow = item.row;
+            }
+            yield item;
+          }
+          if (p.takeStorage && p.resolvedQuery.limit !== undefined) {
+            initializeTakeState(
+              p.takeStorage,
+              hydratedRowCount,
+              lastHydratedRow,
+            );
+          }
+        } else {
+          yield* hydrateInternal(
+            p.input,
+            p.queryID,
+            must(this.#primaryKeys),
+            this.#tableSpecs,
+          );
+        }
+
+        for (const {table, row} of p.companionRows) {
+          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+          yield {
+            type: ChangeType.ADD,
+            queryID: p.queryID,
+            table,
+            rowKey: getRowKey(primaryKey, row),
+            row,
+          } as RowChange;
+        }
+
+        const hydrationTimeMs = timer.totalElapsed();
+        p.debugDelegate?.reset();
+
+        // Set up live companion pipelines for reactive scalar subquery monitoring.
+        const liveCompanions: CompanionPipeline[] = [];
+        for (let i = 0; i < p.companionMeta.length; i++) {
+          const meta = p.companionMeta[i];
+          const companionInput = p.companionInputs[i];
+          const companionSchema = companionInput.getSchema();
+          const {childField, resolvedValue} = meta;
+          companionInput.setOutput({
+            push: (change: Change) => {
+              let newValue: LiteralValue | null | undefined;
+              switch (change[ChangeIndex.TYPE]) {
+                case ChangeType.ADD:
+                case ChangeType.EDIT:
+                  newValue =
+                    (change[ChangeIndex.NODE].row[
+                      childField
+                    ] as LiteralValue) ?? null;
+                  break;
+                case ChangeType.REMOVE:
+                  newValue = undefined;
+                  break;
+                case ChangeType.CHILD:
+                  return [];
+              }
+              if (!scalarValuesEqual(newValue, resolvedValue)) {
+                throw new ResetPipelinesSignal(
+                  `Scalar subquery value changed for ${meta.ast.table}: ` +
+                    `${String(resolvedValue)} -> ${String(newValue)}`,
+                  'scalar-subquery',
+                );
+              }
+              const streamer = this.#streamer;
+              assert(
+                streamer,
+                'must #startAccumulating() before pushing changes',
+              );
+              streamer.accumulate(p.queryID, companionSchema, [change]);
+              return [];
+            },
+          });
+          liveCompanions.push({
+            input: companionInput,
+            childField,
+            resolvedValue,
+          });
+        }
+
+        this.#pipelines.set(p.queryID, {
+          input: p.input,
+          hydrationTimeMs,
+          transformedAst: p.resolvedQuery,
+          transformationHash: p.transformationHash,
+          companions: liveCompanions,
+        });
+
+        if (USE_RUST_ADVANCE) {
+          const config = this.#extractPipelineConfig(
+            p.queryID,
+            p.resolvedQuery,
+            liveCompanions,
+          );
+          if (config) {
+            this.#pipelineConfigs.set(p.queryID, config);
+          } else {
+            this.#pipelineConfigs.delete(p.queryID);
+          }
+          this.#reevaluateRustAdvance();
+        }
+      } finally {
+        this.#hydrateContext = null;
+      }
     }
   }
 

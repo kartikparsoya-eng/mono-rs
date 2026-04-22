@@ -1900,31 +1900,33 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       await yieldProcess(lc);
 
       function* generateRowChanges(slowHydrateThreshold: number) {
-        for (const q of addQueries) {
-          lc = lc
-            .withContext('hash', q.id)
-            .withContext('transformationHash', q.transformationHash);
-          lc.debug?.(`adding pipeline for query`, q.ast);
-
-          yield* pipelines.addQuery(
-            q.transformationHash,
-            q.id,
-            q.ast,
-            timer.startWithoutYielding(),
-          );
-          const elapsed = timer.stop();
-          totalProcessTime += elapsed;
-
-          self.#addQueryMaterializationServerMetric(q.id, elapsed);
-
-          if (elapsed > slowHydrateThreshold) {
-            lc.warn?.('Slow query materialization', elapsed, q.ast);
-          }
-          manualSpan(tracer, 'vs.addAndConsumeQuery', elapsed, {
-            hash: q.id,
+        const batchTimer = timer.startWithoutYielding();
+        yield* pipelines.addQueries(
+          addQueries.map(q => ({
             transformationHash: q.transformationHash,
-          });
+            queryID: q.id,
+            ast: q.ast,
+          })),
+          batchTimer,
+        );
+        const elapsed = timer.stop();
+        totalProcessTime += elapsed;
+
+        for (const q of addQueries) {
+          self.#addQueryMaterializationServerMetric(q.id, elapsed);
         }
+
+        if (elapsed > slowHydrateThreshold) {
+          lc.warn?.(
+            'Slow batch hydration',
+            elapsed,
+            addQueries.length,
+            'queries',
+          );
+        }
+        manualSpan(tracer, 'vs.addQueries.batch', elapsed, {
+          queryCount: addQueries.length,
+        });
         hydrations.add(1);
         hydrationTime.record(totalProcessTime / 1000);
       }

@@ -1,3 +1,4 @@
+import type {rustExistsPushBatch as RustExistsPushBatchFn} from '../../../../zero-ivm-rs/index.js';
 import type {CompoundKey} from '../../../../zero-protocol/src/ast.ts';
 import {ChangeIndex} from '../../../../zql/src/ivm/change-index.ts';
 import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
@@ -13,7 +14,6 @@ import type {
 } from '../../../../zql/src/ivm/filter-operators.ts';
 import type {SourceSchema} from '../../../../zql/src/ivm/schema.ts';
 import type {Stream} from '../../../../zql/src/ivm/stream.ts';
-import type {rustExistsPushBatch as RustExistsPushBatchFn} from '../../../../zero-ivm-rs/index.js';
 
 type RustBindings = {
   rustExistsPushBatch: typeof RustExistsPushBatchFn;
@@ -129,8 +129,7 @@ export function createRustExistsWrapper(
       const node = change[ChangeIndex.NODE];
       const size = yield* fetchSize(node, relationshipName);
 
-      const childTypeStr =
-        childType === ChangeType.ADD ? 'add' : 'remove';
+      const childTypeStr = childType === ChangeType.ADD ? 'add' : 'remove';
       const input = [
         {
           type: 'child',
@@ -176,9 +175,7 @@ export function createRustExistsWrapper(
                 row: node.row,
                 relationships: {
                   ...node.relationships,
-                  [relationshipName]: () => [
-                    childChange[ChangeIndex.NODE],
-                  ],
+                  [relationshipName]: () => [childChange[ChangeIndex.NODE]],
                 },
               }),
               wrapper,

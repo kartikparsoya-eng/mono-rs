@@ -5,10 +5,9 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use zero_ivm_rs::operator::Operator;
-use zero_ivm_rs::pipeline::{build_operator, OperatorConfig};
+use zero_ivm_rs::pipeline::OperatorConfig;
 use zero_ivm_rs::types::{Change, FetchRequest, Node};
 
-use crate::connection_pool::ConnectionPool;
 use crate::query_builder::ColumnType;
 use crate::source::{
     FetchRequest as SourceFetchRequest, Node as SourceNode,
@@ -82,90 +81,177 @@ impl Operator for LiveTableSource {
 
 unsafe impl Send for LiveTableSource {}
 
-/// Free function for parallel child fetching (avoids capturing &self in par_iter closures).
-fn fetch_children_for_row_static(
-    source: &Arc<RustTableSource>,
-    child_config: &[OperatorConfig],
-    parent_key: &[String],
-    child_key: &[String],
-    parent_row: &zero_ivm_rs::types::Row,
-) -> Vec<Node> {
-    use zero_ivm_rs::filter::{Value, compare_values};
-    let constraint = if !parent_key.is_empty() && !child_key.is_empty() {
-        parent_row.get(&parent_key[0]).map(|v| {
-            zero_ivm_rs::types::Constraint {
-                key: child_key[0].clone(),
-                value: v.clone(),
-            }
-        })
-    } else {
-        None
-    };
-    let child_source = make_child_source(source, child_config);
-    let child_source = match child_source {
-        Some(s) => s,
-        None => return vec![],
-    };
-    let mut child_op = match build_operator_with_live_source(Arc::new(child_source), child_config) {
-        Ok(op) => op,
-        Err(_) => return vec![],
-    };
-    let child_nodes = child_op.fetch(&FetchRequest {
-        constraint,
-        start: None,
-        reverse: false,
-    });
-    if parent_key.len() > 1 {
-        child_nodes
-            .into_iter()
-            .filter(|cn| {
-                parent_key.iter().zip(child_key.iter()).all(|(pk, ck)| {
-                    let pv = parent_row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
-                    let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
-                    !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
-                        && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
-                })
-            })
-            .collect()
-    } else {
-        child_nodes
+/// Canonical string key for grouping batch results — matches what
+/// `RustTableSource::fetch_batch` uses for its `HashMap` keys.
+fn value_to_group_key(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => "null".to_string(),
     }
 }
 
-fn fetch_child_count_static(
+/// An operator that yields pre-fetched nodes. Used to feed batch-fetched
+/// children through remaining child operators (Filter, Take, etc.).
+struct PreloadedSource {
+    nodes: Vec<Node>,
+}
+
+impl PreloadedSource {
+    fn new(nodes: Vec<Node>) -> Self {
+        Self { nodes }
+    }
+}
+
+impl Operator for PreloadedSource {
+    fn fetch(&mut self, _req: &FetchRequest) -> Vec<Node> {
+        std::mem::take(&mut self.nodes)
+    }
+    fn push(&mut self, _change: Change) -> Vec<Change> {
+        vec![]
+    }
+    fn op_type(&self) -> &'static str {
+        "preloaded_source"
+    }
+}
+
+unsafe impl Send for PreloadedSource {}
+
+/// Extract the Source config from the first element of a child operator config.
+/// Returns (table_name, columns, column_types, primary_key, sort) or None.
+fn extract_child_source_info(
+    child_config: &[OperatorConfig],
+) -> Option<(String, Vec<String>, HashMap<String, ColumnType>, Vec<String>, Vec<(String, String)>)> {
+    if child_config.is_empty() {
+        return None;
+    }
+    match &child_config[0] {
+        OperatorConfig::Source {
+            table_name,
+            columns,
+            primary_key,
+            sort,
+        } => {
+            let mut ct = HashMap::new();
+            for c in columns {
+                ct.insert(c.clone(), ColumnType::String);
+            }
+            Some((table_name.clone(), columns.clone(), ct, primary_key.clone(), sort.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Apply the non-Source portion of a child operator config to pre-fetched nodes.
+/// Builds a chain: PreloadedSource -> [Filter, Take, ...] and fetches.
+fn apply_child_operators(
+    source: &Arc<RustTableSource>,
+    child_config: &[OperatorConfig],
+    nodes: Vec<Node>,
+) -> Vec<Node> {
+    if child_config.len() <= 1 {
+        return nodes;
+    }
+    let mut current: Box<dyn Operator> = Box::new(PreloadedSource::new(nodes));
+    for config in &child_config[1..] {
+        current = match build_next_operator(source.clone(), current, config) {
+            Ok(op) => op,
+            Err(_) => return vec![],
+        };
+    }
+    current.fetch(&FetchRequest::default())
+}
+
+/// Batch fetch all children for a set of parent rows, returning a map from
+/// parent key value (as group key string) to the child nodes (with remaining
+/// child operators applied per group).
+fn batch_fetch_children(
     source: &Arc<RustTableSource>,
     child_config: &[OperatorConfig],
     parent_key: &[String],
     child_key: &[String],
-    parent_row: &zero_ivm_rs::types::Row,
-) -> usize {
-    let constraint = if !parent_key.is_empty() && !child_key.is_empty() {
-        parent_row.get(&parent_key[0]).map(|v| {
-            zero_ivm_rs::types::Constraint {
-                key: child_key[0].clone(),
-                value: v.clone(),
+    parent_nodes: &[Node],
+) -> HashMap<String, Vec<Node>> {
+    if parent_key.is_empty() || child_key.is_empty() {
+        return HashMap::new();
+    }
+    let info = match extract_child_source_info(child_config) {
+        Some(i) => i,
+        None => return HashMap::new(),
+    };
+    let (table_name, columns, column_types, _primary_key, sort) = info;
+
+    // Collect unique parent key values (first key only for the IN clause)
+    let pk0 = &parent_key[0];
+    let ck0 = &child_key[0];
+    let mut unique_vals: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for node in parent_nodes {
+        if let Some(v) = node.row.get(pk0) {
+            if !v.is_null() {
+                let key = value_to_group_key(v);
+                if seen.insert(key) {
+                    unique_vals.push(v.clone());
+                }
             }
-        })
-    } else {
-        None
+        }
+    }
+
+    if unique_vals.is_empty() {
+        return HashMap::new();
+    }
+
+    // Build a child source that shares the parent pool
+    let shared_pool = source.shared_pool();
+    let child_source = match RustTableSource::new_with_shared_pool(
+        shared_pool,
+        table_name,
+        columns,
+        column_types,
+        _primary_key,
+    ) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
     };
-    let child_source = make_child_source(source, child_config);
-    let child_source = match child_source {
-        Some(s) => s,
-        None => return 0,
+
+    let ordering = if sort.is_empty() { None } else { Some(&sort) };
+    let source_grouped = match child_source.fetch_batch(ck0, &unique_vals, ordering) {
+        Ok(g) => g,
+        Err(_) => return HashMap::new(),
     };
-    let mut child_op = match build_operator_with_live_source(Arc::new(child_source), child_config) {
-        Ok(op) => op,
-        Err(_) => return 0,
-    };
-    child_op.fetch(&FetchRequest {
-        constraint,
-        start: None,
-        reverse: false,
-    }).len()
+
+    // Convert source::Node -> zero_ivm_rs::types::Node
+    let mut grouped: HashMap<String, Vec<Node>> = source_grouped
+        .into_iter()
+        .map(|(k, nodes)| (k, nodes.into_iter().map(convert_source_node).collect()))
+        .collect();
+
+    // Apply remaining child operators (Filter, Take, etc.) per group
+    if child_config.len() > 1 {
+        let keys: Vec<String> = grouped.keys().cloned().collect();
+        for key in keys {
+            if let Some(nodes) = grouped.remove(&key) {
+                let filtered = apply_child_operators(source, child_config, nodes);
+                grouped.insert(key, filtered);
+            }
+        }
+    }
+
+    // Multi-key filtering: if parent_key has >1 columns, filter children
+    // to match all key columns (the IN clause only covers the first).
+    if parent_key.len() > 1 {
+        // Build a lookup from group_key -> vec of (parent_row_ref) to know
+        // which composite keys are valid. Actually, we need to filter per
+        // parent row at lookup time, so we leave grouped as-is and do the
+        // composite filtering at the call site.
+    }
+
+    grouped
 }
 
-/// Create a RustTableSource for the child table based on the child config's Source entry.
+/// Create a RustTableSource for the child table that shares the parent's
+/// connection pool (no new SQLite connections are opened).
 fn make_child_source(
     parent_source: &Arc<RustTableSource>,
     child_config: &[OperatorConfig],
@@ -184,9 +270,9 @@ fn make_child_source(
             for c in columns {
                 ct.insert(c.clone(), ColumnType::String);
             }
-            let mut src = RustTableSource::new(
-                parent_source.db_path(),
-                2,
+            let shared_pool = parent_source.shared_pool();
+            let mut src = RustTableSource::new_with_shared_pool(
+                shared_pool,
                 table_name.clone(),
                 columns.clone(),
                 ct,
@@ -236,28 +322,58 @@ unsafe impl Send for ParallelJoinOperator {}
 
 impl Operator for ParallelJoinOperator {
     fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        let profile = std::env::var("RUST_HYDRATE_PROFILE").unwrap_or_default() == "1";
+        let t0 = std::time::Instant::now();
         let parent_nodes = self.parent.fetch(req);
+        let parent_fetch_us = t0.elapsed().as_micros();
         let rel_name = &self.relationship_name;
 
-        // Extract fields for the parallel closure so we don't capture &self
-        let source = &self.source;
-        let child_config = &self.child_config;
+        let t0 = std::time::Instant::now();
+        // Batch fetch: ONE `WHERE child_key IN (...)` query replaces N individual queries.
+        let grouped = batch_fetch_children(
+            &self.source,
+            &self.child_config,
+            &self.parent_key,
+            &self.child_key,
+            &parent_nodes,
+        );
+        let children_fetch_us = t0.elapsed().as_micros();
+
+        if profile {
+            eprintln!("    [ParallelJoin] parent_rows={} parent_fetch={}us batch_children_fetch={}us",
+                parent_nodes.len(), parent_fetch_us, children_fetch_us);
+        }
+
         let parent_key = &self.parent_key;
         let child_key = &self.child_key;
 
-        let children_per_parent: Vec<Vec<Node>> = parent_nodes
-            .par_iter()
-            .map(|node| {
-                fetch_children_for_row_static(
-                    source, child_config, parent_key, child_key, &node.row,
-                )
-            })
-            .collect();
-
         parent_nodes
             .into_iter()
-            .zip(children_per_parent)
-            .map(|(mut node, children)| {
+            .map(|mut node| {
+                let children = if !parent_key.is_empty() {
+                    let pk0 = &parent_key[0];
+                    let group_key = node.row.get(pk0)
+                        .map(value_to_group_key)
+                        .unwrap_or_else(|| "null".to_string());
+                    let mut children = grouped.get(&group_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    // Multi-key filtering
+                    if parent_key.len() > 1 {
+                        use zero_ivm_rs::filter::{Value, compare_values};
+                        children.retain(|cn| {
+                            parent_key.iter().zip(child_key.iter()).all(|(pk, ck)| {
+                                let pv = node.row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
+                                let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+                                !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
+                                    && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
+                            })
+                        });
+                    }
+                    children
+                } else {
+                    vec![]
+                };
                 node.relationships.insert(rel_name.clone(), children);
                 node
             })
@@ -311,28 +427,45 @@ impl Operator for ParallelExistsOperator {
         let parent_nodes = self.input.fetch(req);
         let not_exists = self.not_exists;
 
-        // Extract fields for the parallel closure so we don't capture &self
-        let source = &self.source;
-        let child_config = &self.child_config;
+        // Batch fetch: ONE query, then count per group.
+        let grouped = batch_fetch_children(
+            &self.source,
+            &self.child_config,
+            &self.parent_key,
+            &self.child_key,
+            &parent_nodes,
+        );
+
         let parent_key = &self.parent_key;
         let child_key = &self.child_key;
 
-        let counts: Vec<usize> = parent_nodes
-            .par_iter()
-            .map(|node| {
-                fetch_child_count_static(
-                    source, child_config, parent_key, child_key, &node.row,
-                )
-            })
-            .collect();
-
         parent_nodes
             .into_iter()
-            .zip(counts)
-            .filter(|(_, count)| {
-                if not_exists { *count == 0 } else { *count > 0 }
+            .filter(|node| {
+                let count = if !parent_key.is_empty() {
+                    let pk0 = &parent_key[0];
+                    let group_key = node.row.get(pk0)
+                        .map(value_to_group_key)
+                        .unwrap_or_else(|| "null".to_string());
+                    let children = grouped.get(&group_key);
+                    if parent_key.len() > 1 {
+                        use zero_ivm_rs::filter::{Value, compare_values};
+                        children.map(|cs| cs.iter().filter(|cn| {
+                            parent_key.iter().zip(child_key.iter()).all(|(pk, ck)| {
+                                let pv = node.row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
+                                let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+                                !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
+                                    && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
+                            })
+                        }).count()).unwrap_or(0)
+                    } else {
+                        children.map(|cs| cs.len()).unwrap_or(0)
+                    }
+                } else {
+                    0
+                };
+                if not_exists { count == 0 } else { count > 0 }
             })
-            .map(|(node, _)| node)
             .collect()
     }
 
@@ -362,12 +495,20 @@ pub fn hydrate_pipelines(
     source: Arc<RustTableSource>,
     configs: Vec<HydratePipelineConfig>,
 ) -> Vec<HydrateResult> {
+    let profile = std::env::var("RUST_HYDRATE_PROFILE").unwrap_or_default() == "1";
     configs
         .into_par_iter()
         .map(|config| {
+            let pid = config.pipeline_id.clone();
+            let t0 = std::time::Instant::now();
             let result = hydrate_single_pipeline(source.clone(), config.operator_config);
+            if profile {
+                let us = t0.elapsed().as_micros();
+                let node_count = result.as_ref().map(|n| n.len()).unwrap_or(0);
+                eprintln!("  [pipeline {}] {}us  nodes={}", pid, us, node_count);
+            }
             HydrateResult {
-                pipeline_id: config.pipeline_id,
+                pipeline_id: pid,
                 nodes: result,
             }
         })
@@ -420,6 +561,71 @@ fn build_operator_with_live_source(
     Ok(current)
 }
 
+fn parse_predicate_json(value: &serde_json::Value) -> Result<zero_ivm_rs::filter::Predicate, String> {
+    use zero_ivm_rs::filter::{Predicate, Value};
+    let obj = value.as_object().ok_or("predicate must be an object")?;
+    if let Some(field) = obj.get("field") {
+        let field = field.as_str().ok_or("field must be a string")?.to_string();
+        if let Some(val) = obj.get("eq") {
+            return Ok(Predicate::Eq(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("neq") {
+            return Ok(Predicate::Neq(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("gt") {
+            return Ok(Predicate::Gt(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("lt") {
+            return Ok(Predicate::Lt(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("gte") {
+            return Ok(Predicate::Gte(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("lte") {
+            return Ok(Predicate::Lte(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("in") {
+            let arr = val.as_array().ok_or("'in' value must be an array")?;
+            let values: Vec<Value> = arr.iter().map(Value::from_json).collect();
+            return Ok(Predicate::In(field, values));
+        }
+        if let Some(val) = obj.get("like") {
+            let pattern = val.as_str().ok_or("'like' value must be a string")?.to_string();
+            return Ok(Predicate::Like(field, pattern));
+        }
+        if let Some(val) = obj.get("isNull") {
+            if val.as_bool().unwrap_or(false) {
+                return Ok(Predicate::IsNull(field));
+            }
+        }
+        if let Some(val) = obj.get("isNotNull") {
+            if val.as_bool().unwrap_or(false) {
+                return Ok(Predicate::IsNotNull(field));
+            }
+        }
+        return Err(format!("unknown predicate operator for field {field}"));
+    }
+    if let Some(arr) = obj.get("and") {
+        let preds: Result<Vec<Predicate>, String> = arr
+            .as_array()
+            .ok_or("and must be an array")?
+            .iter()
+            .map(parse_predicate_json)
+            .collect();
+        return Ok(Predicate::And(preds?));
+    }
+    if let Some(arr) = obj.get("or") {
+        let preds: Result<Vec<Predicate>, String> = arr
+            .as_array()
+            .ok_or("or must be an array")?
+            .iter()
+            .map(parse_predicate_json)
+            .collect();
+        return Ok(Predicate::Or(preds?));
+    }
+    Err("unknown predicate format".to_string())
+}
+
 fn build_next_operator(
     source: Arc<RustTableSource>,
     input: Box<dyn Operator>,
@@ -447,55 +653,12 @@ fn build_next_operator(
             .collect()
     }
 
-    fn parse_predicate(value: &serde_json::Value) -> Result<Predicate, String> {
-        use zero_ivm_rs::filter::Value;
-        let obj = value.as_object().ok_or("predicate must be an object")?;
-        if let Some(field) = obj.get("field") {
-            let field = field.as_str().ok_or("field must be a string")?.to_string();
-            if let Some(val) = obj.get("eq") {
-                return Ok(Predicate::Eq(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("gt") {
-                return Ok(Predicate::Gt(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("lt") {
-                return Ok(Predicate::Lt(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("gte") {
-                return Ok(Predicate::Gte(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("lte") {
-                return Ok(Predicate::Lte(field, Value::from_json(val)));
-            }
-            return Err(format!("unknown predicate operator for field {field}"));
-        }
-        if let Some(arr) = obj.get("and") {
-            let preds: Result<Vec<Predicate>, String> = arr
-                .as_array()
-                .ok_or("and must be an array")?
-                .iter()
-                .map(parse_predicate)
-                .collect();
-            return Ok(Predicate::And(preds?));
-        }
-        if let Some(arr) = obj.get("or") {
-            let preds: Result<Vec<Predicate>, String> = arr
-                .as_array()
-                .ok_or("or must be an array")?
-                .iter()
-                .map(parse_predicate)
-                .collect();
-            return Ok(Predicate::Or(preds?));
-        }
-        Err("unknown predicate format".to_string())
-    }
-
     match config {
         OperatorConfig::Source { .. } => {
             Err("unexpected Source in non-root position".to_string())
         }
         OperatorConfig::Filter { predicate } => {
-            let pred = parse_predicate(predicate)?;
+            let pred = parse_predicate_json(predicate)?;
             Ok(Box::new(FilterOperator::new(input, pred)))
         }
         OperatorConfig::Join {
@@ -653,55 +816,12 @@ fn build_push_next_operator(
             .collect()
     }
 
-    fn parse_predicate(value: &serde_json::Value) -> Result<Predicate, String> {
-        use zero_ivm_rs::filter::Value;
-        let obj = value.as_object().ok_or("predicate must be an object")?;
-        if let Some(field) = obj.get("field") {
-            let field = field.as_str().ok_or("field must be a string")?.to_string();
-            if let Some(val) = obj.get("eq") {
-                return Ok(Predicate::Eq(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("gt") {
-                return Ok(Predicate::Gt(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("lt") {
-                return Ok(Predicate::Lt(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("gte") {
-                return Ok(Predicate::Gte(field, Value::from_json(val)));
-            }
-            if let Some(val) = obj.get("lte") {
-                return Ok(Predicate::Lte(field, Value::from_json(val)));
-            }
-            return Err(format!("unknown predicate operator for field {field}"));
-        }
-        if let Some(arr) = obj.get("and") {
-            let preds: Result<Vec<Predicate>, String> = arr
-                .as_array()
-                .ok_or("and must be an array")?
-                .iter()
-                .map(parse_predicate)
-                .collect();
-            return Ok(Predicate::And(preds?));
-        }
-        if let Some(arr) = obj.get("or") {
-            let preds: Result<Vec<Predicate>, String> = arr
-                .as_array()
-                .ok_or("or must be an array")?
-                .iter()
-                .map(parse_predicate)
-                .collect();
-            return Ok(Predicate::Or(preds?));
-        }
-        Err("unknown predicate format".to_string())
-    }
-
     match config {
         OperatorConfig::Source { .. } => {
             Err("unexpected Source in non-root position".to_string())
         }
         OperatorConfig::Filter { predicate } => {
-            let pred = parse_predicate(predicate)?;
+            let pred = parse_predicate_json(predicate)?;
             Ok(Box::new(FilterOperator::new(input, pred)))
         }
         OperatorConfig::Join {

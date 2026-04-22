@@ -34,6 +34,7 @@ type Result<T> = std::result::Result<T, PoolError>;
 
 /// A lightweight pool of read-only SQLite connections pinned to the same WAL
 /// snapshot. Safe to share across threads (`Send + Sync`).
+#[derive(Clone)]
 pub struct ConnectionPool {
     connections: Arc<Mutex<Vec<Connection>>>,
     path: String,
@@ -66,13 +67,32 @@ impl ConnectionPool {
     /// Takes a connection from the pool. Returns `PoolError::Exhausted` if no
     /// connections are available (non-blocking).
     pub fn get(&self) -> Result<PooledConnection> {
+        use std::sync::atomic::{AtomicU64, Ordering as AO};
+        static POOL_GET_CALLS: AtomicU64 = AtomicU64::new(0);
+        static POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+        static POOL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+        POOL_GET_CALLS.fetch_add(1, AO::Relaxed);
+        let t0 = std::time::Instant::now();
         let mut conns = self.connections.lock().map_err(|_| PoolError::Poisoned)?;
+        POOL_WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
         match conns.pop() {
             Some(conn) => Ok(PooledConnection {
                 conn: Some(conn),
                 pool: Arc::clone(&self.connections),
             }),
-            None => Err(PoolError::Exhausted),
+            None => {
+                let exhausted = POOL_EXHAUSTED.fetch_add(1, AO::Relaxed) + 1;
+                let calls = POOL_GET_CALLS.load(AO::Relaxed);
+                if exhausted % 100 == 1 {
+                    let profile = std::env::var("RUST_HYDRATE_PROFILE").unwrap_or_default() == "1";
+                    if profile {
+                        eprintln!("      [pool] EXHAUSTED #{} (of {} calls, wait={}us)",
+                            exhausted, calls, POOL_WAIT_NS.load(AO::Relaxed) / 1000);
+                    }
+                }
+                Err(PoolError::Exhausted)
+            }
         }
     }
 

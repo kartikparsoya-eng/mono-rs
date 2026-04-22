@@ -1,11 +1,11 @@
-import type {Row} from '../../../../zero-protocol/src/data.ts';
-import type {CompoundKey} from '../../../../zero-protocol/src/ast.ts';
 import type {
   rustBuildJoinConstraint as RustBuildJoinConstraintFn,
   rustIsJoinMatch as RustIsJoinMatchFn,
   rustJoinPushChildBatch as RustJoinPushChildBatchFn,
   rustRowEqualsForCompoundKey as RustRowEqualsForCompoundKeyFn,
 } from '../../../../zero-ivm-rs/index.js';
+import type {CompoundKey} from '../../../../zero-protocol/src/ast.ts';
+import type {Row} from '../../../../zero-protocol/src/data.ts';
 
 type RustBindings = {
   rustBuildJoinConstraint: typeof RustBuildJoinConstraintFn;

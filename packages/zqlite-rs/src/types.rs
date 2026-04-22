@@ -144,6 +144,14 @@ pub fn row_to_typed_js_object(
                     v
                 }
                 _ => {
+                    const MAX_SAFE: i64 = 9007199254740991;
+                    const MIN_SAFE: i64 = -9007199254740991;
+                    if n > MAX_SAFE || n < MIN_SAFE {
+                        return Err(Error::from_reason(format!(
+                            "value {} (in {}.{}) is outside of supported bounds",
+                            n, table_name, &columns[i]
+                        )));
+                    }
                     let mut v = std::ptr::null_mut();
                     unsafe { napi::sys::napi_create_double(env.raw(), n as f64, &mut v) };
                     v

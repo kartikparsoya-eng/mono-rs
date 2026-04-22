@@ -15,3 +15,4 @@ mod types;
 pub mod overlay;
 pub mod table_source;
 pub mod hydrate;
+pub mod ast_to_config;
