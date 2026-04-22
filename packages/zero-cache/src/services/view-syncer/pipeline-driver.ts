@@ -1843,7 +1843,10 @@ export class PipelineDriver {
         queryID: change.queryID,
         table: change.table,
         rowKey: change.row_key,
-        row: change.row ?? change.row_key,
+        row:
+          type === ChangeType.REMOVE
+            ? undefined
+            : (change.row ?? change.row_key),
       } as RowChange;
     }
   }
@@ -1917,23 +1920,31 @@ export class PipelineDriver {
       curr,
       changes: numChanges,
     }) as unknown as SnapshotDiff;
-    const tsChanges = materializeChanges(
-      this.#advance(syntheticDiff, timer, numChanges),
-    );
-
-    // 4. Compare
-    const verified = dualExecCompare(
-      'advance',
-      tsChanges,
-      rustChanges,
-      this.#lc,
-    );
 
     return {
       version: curr.version,
       numChanges,
-      changes: verified,
+      changes: this.#dualExecYieldAndCompare(
+        this.#advance(syntheticDiff, timer, numChanges),
+        rustChanges,
+      ),
     };
+  }
+
+  *#dualExecYieldAndCompare(
+    tsGen: Iterable<RowChange | 'yield'>,
+    rustChanges: RowChange[],
+  ): Iterable<RowChange | 'yield'> {
+    const tsChanges: RowChange[] = [];
+    for (const item of tsGen) {
+      if (item !== 'yield') {
+        tsChanges.push(item);
+      }
+      yield item;
+    }
+    // Compare after all TS changes have been yielded.
+    // TS is always the source of truth; this validates Rust correctness.
+    dualExecCompare('advance', tsChanges, rustChanges, this.#lc);
   }
 
   /** Implements `BuilderDelegate.getSource()` */

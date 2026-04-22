@@ -374,24 +374,43 @@ fn process_change_for_pipeline(pipeline: &PipelineConfig, change: &Change) -> Ve
             for prev in &change.prev_values {
                 let is_matched = matched_prev.map_or(false, |m| std::ptr::eq(m, prev));
                 if is_matched {
-                    // Same row (PK match) — this is an edit
-                    if passes_filter(&pipeline.operators, next_value) {
-                        results.push(RowChange {
-                            query_id: pipeline.query_id.clone(),
-                            table: change.table.clone(),
-                            row_key: change.row_key.clone(),
-                            row: Some(next_value.clone()),
-                            change_type: "edit".to_string(),
-                        });
-                    } else if passes_filter(&pipeline.operators, prev) {
-                        // Was visible, now filtered out -> remove
-                        results.push(RowChange {
-                            query_id: pipeline.query_id.clone(),
-                            table: change.table.clone(),
-                            row_key: change.row_key.clone(),
-                            row: None,
-                            change_type: "remove".to_string(),
-                        });
+                    // Same row (PK match) — 4-way filter split
+                    let old_passes = passes_filter(&pipeline.operators, prev);
+                    let new_passes = passes_filter(&pipeline.operators, next_value);
+                    match (old_passes, new_passes) {
+                        (true, true) => {
+                            // Both visible — genuine edit
+                            results.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: change.table.clone(),
+                                row_key: change.row_key.clone(),
+                                row: Some(next_value.clone()),
+                                change_type: "edit".to_string(),
+                            });
+                        }
+                        (true, false) => {
+                            // Was visible, now hidden — remove
+                            results.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: change.table.clone(),
+                                row_key: change.row_key.clone(),
+                                row: None,
+                                change_type: "remove".to_string(),
+                            });
+                        }
+                        (false, true) => {
+                            // Was hidden, now visible — add (not edit)
+                            results.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: change.table.clone(),
+                                row_key: change.row_key.clone(),
+                                row: Some(next_value.clone()),
+                                change_type: "add".to_string(),
+                            });
+                        }
+                        (false, false) => {
+                            // Neither visible — drop
+                        }
                     }
                 } else {
                     // Non-matched prev rows are unique key conflicts — remove them
