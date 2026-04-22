@@ -674,6 +674,18 @@ export class PipelineDriver {
         if (takeStorage && resolvedQuery.limit !== undefined) {
           initializeTakeState(takeStorage, hydratedRowCount, lastHydratedRow);
         }
+        // Warm up the TS pipeline to initialize child Take operators
+        // (e.g., in EXISTS/JOIN subqueries). Rust hydration bypasses
+        // input.fetch(), so child Takes have empty storage and silently
+        // drop all pushes. Running a fetch through the pipeline triggers
+        // each child Take's #initialFetch, populating their partition state.
+        for (const node of input.fetch({})) {
+          if (node === 'yield') {
+            continue;
+          }
+          // Discard results — we only need the side effect of
+          // initializing Take state in child subquery pipelines.
+        }
       } else {
         yield* hydrateInternal(
           input,

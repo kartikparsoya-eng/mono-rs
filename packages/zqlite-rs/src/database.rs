@@ -142,11 +142,15 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("{e}")))?;
 
         // Call the JS function with no arguments using raw napi sys
+        let mut undefined_this = std::ptr::null_mut();
+        unsafe {
+            napi::sys::napi_get_undefined(env.raw(), &mut undefined_this);
+        }
         let mut result_raw = std::ptr::null_mut();
         let status = unsafe {
             napi::sys::napi_call_function(
                 env.raw(),
-                std::ptr::null_mut(), // undefined as `this`
+                undefined_this, // proper JS undefined as `this`
                 callback.raw(),
                 0,
                 std::ptr::null(),

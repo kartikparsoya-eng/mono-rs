@@ -171,8 +171,11 @@ export class Database implements Disposable {
     columnTypes: Record<string, string>,
     tableName: string,
   ): T | undefined {
-    return this.#run('getRow', sql, () =>
-      this.#db.getRow(sql, params, columnTypes, tableName),
+    return this.#run(
+      'getRow',
+      sql,
+      () =>
+        this.#db.getRow(sql, params, columnTypes, tableName) as T | undefined,
     );
   }
 

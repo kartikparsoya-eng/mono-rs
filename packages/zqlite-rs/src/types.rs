@@ -255,7 +255,7 @@ pub fn set_sqlite_value(
             obj.set_named_property(key, null_unknown)?;
         }
         ValueRef::Integer(i) => {
-            if safe_integers && (i >= 9_007_199_254_740_991 || i <= -9_007_199_254_740_991) {
+            if safe_integers {
                 let bigint = env.create_bigint_from_i64(i)?;
                 obj.set_named_property(key, bigint)?;
             } else {
@@ -454,7 +454,7 @@ fn sqlite_value_to_raw_napi(
             unsafe { napi::sys::napi_get_null(env.raw(), &mut v) };
         }
         ValueRef::Integer(i) => {
-            if safe_integers && (i >= 9_007_199_254_740_991 || i <= -9_007_199_254_740_991) {
+            if safe_integers {
                 let mut words = [0u64; 1];
                 let (sign, magnitude) = if i < 0 { (1, (-i) as u64) } else { (0, i as u64) };
                 words[0] = magnitude;

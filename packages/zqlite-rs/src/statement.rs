@@ -68,7 +68,7 @@ impl Statement {
     pub fn run(&self, env: Env, params: JsObject) -> Result<JsObject> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare_cached(&self.sql)
+            .prepare(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         let values = extract_params(&env, &params, &stmt)?;
 
@@ -108,10 +108,10 @@ impl Statement {
 
     /// Get a single row. Returns the row object or undefined if no rows.
     #[napi]
-    pub fn get(&self, env: Env, params: JsObject) -> Result<Option<JsObject>> {
+    pub fn get(&self, env: Env, params: JsObject) -> Result<JsObject> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare_cached(&self.sql)
+            .prepare(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
         let values = extract_params(&env, &params, &stmt)?;
 
@@ -129,9 +129,14 @@ impl Statement {
         match rows.next().map_err(|e| Error::from_reason(format!("{e}")))? {
             Some(row) => {
                 let raw = row_to_js_object_fast(&env, row, &interned_keys, self.safe_integers)?;
-                Ok(Some(unsafe { JsObject::from_raw_unchecked(env.raw(), raw) }))
+                Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), raw) })
             }
-            None => Ok(None),
+            None => {
+                // Return undefined (not null) to match better-sqlite3 behavior
+                let mut undefined_val = std::ptr::null_mut();
+                unsafe { napi::sys::napi_get_undefined(env.raw(), &mut undefined_val) };
+                Ok(unsafe { JsObject::from_raw_unchecked(env.raw(), undefined_val) })
+            }
         }
     }
 
@@ -140,7 +145,7 @@ impl Statement {
     pub fn all(&self, env: Env, params: JsObject) -> Result<JsObject> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare_cached(&self.sql)
+            .prepare(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
         let values = extract_params(&env, &params, &stmt)?;
 
@@ -176,7 +181,7 @@ impl Statement {
     pub fn all_buf(&self, env: Env, params: JsObject) -> Result<Buffer> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare_cached(&self.sql)
+            .prepare(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
         let values = extract_params(&env, &params, &stmt)?;
 
@@ -337,7 +342,7 @@ impl Statement {
     pub fn iterate(&self, env: Env, params: JsObject) -> Result<RowIterator> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare_cached(&self.sql)
+            .prepare(&self.sql)
             .map_err(|e| Error::from_reason(format!("{e}: {}", self.sql)))?;
         let values = extract_params(&env, &params, &stmt)?;
 
@@ -372,7 +377,7 @@ impl Statement {
 }
 
 /// Extract params from a JsObject (JS Array) into rusqlite Values.
-fn extract_params(env: &Env, params: &JsObject, stmt: &rusqlite::CachedStatement) -> Result<Vec<rusqlite::types::Value>> {
+fn extract_params(env: &Env, params: &JsObject, stmt: &rusqlite::Statement) -> Result<Vec<rusqlite::types::Value>> {
     let len = params.get_array_length()?;
     if len == 0 {
         return Ok(Vec::new());
@@ -422,7 +427,7 @@ fn extract_params(env: &Env, params: &JsObject, stmt: &rusqlite::CachedStatement
 fn extract_named_params(
     env: &Env,
     obj_raw: napi::sys::napi_value,
-    stmt: &rusqlite::CachedStatement,
+    stmt: &rusqlite::Statement,
 ) -> Result<Vec<rusqlite::types::Value>> {
     use crate::types::napi_value_to_sqlite_param;
 
@@ -472,16 +477,9 @@ impl Statement {
         }
     }
 
-    /// Get or compute cached column names.
+    /// Get column names from the prepared statement (no caching to handle schema changes).
     fn get_columns(&self, stmt: &rusqlite::Statement) -> Vec<String> {
-        let mut cache = self.cached_columns.borrow_mut();
-        if let Some(cols) = cache.as_ref() {
-            cols.clone()
-        } else {
-            let cols = get_column_names(stmt);
-            *cache = Some(cols.clone());
-            cols
-        }
+        get_column_names(stmt)
     }
 
     /// Ensure the raw scan statement is prepared for scanstatus calls.
