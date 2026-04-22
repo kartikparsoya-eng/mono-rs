@@ -1,6 +1,6 @@
-import type {JSONValue} from '../../../shared/src/json.ts';
-import type {Storage} from '../../../zql/src/ivm/operator.ts';
-import type {Stream} from '../../../zql/src/ivm/stream.ts';
+import type {JSONValue} from '../../shared/src/json.ts';
+import type {Storage} from '../../zql/src/ivm/operator.ts';
+import type {Stream} from '../../zql/src/ivm/stream.ts';
 import type {RustStorage} from '../index.js';
 
 export class RustTakeStorage implements Storage {

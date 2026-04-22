@@ -309,9 +309,33 @@ fn append_condition_configs(
                 append_condition_configs(schema, configs, sub, primary_key)?;
             }
         }
-        Condition::Or { .. } => {
-            let pred = condition_to_predicate_json(cond)?;
-            configs.push(OperatorConfig::Filter { predicate: pred });
+        Condition::Or { conditions } => {
+            let mut simple_conds = Vec::new();
+            let mut csq_conds = Vec::new();
+            for sub in conditions {
+                if has_csq(sub) {
+                    csq_conds.push(sub);
+                } else {
+                    simple_conds.push(sub);
+                }
+            }
+            if csq_conds.is_empty() {
+                let pred = condition_to_predicate_json(cond)?;
+                configs.push(OperatorConfig::Filter { predicate: pred });
+            } else {
+                let or_cond_json = if simple_conds.is_empty() {
+                    None
+                } else if simple_conds.len() == 1 {
+                    Some(condition_to_predicate_json(simple_conds[0])?)
+                } else {
+                    let preds: Result<Vec<serde_json::Value>, String> =
+                        simple_conds.iter().map(|c| condition_to_predicate_json(c)).collect();
+                    Some(serde_json::json!({ "or": preds? }))
+                };
+                for csq in &csq_conds {
+                    append_csq_as_exists(schema, configs, csq, primary_key, or_cond_json.clone())?;
+                }
+            }
         }
         Condition::CorrelatedSubquery { related, op, .. } => {
             let not_exists = op == "NOT EXISTS";
@@ -326,10 +350,50 @@ fn append_condition_configs(
                 parent_key: related.correlation.parent_field.clone(),
                 child_key: related.correlation.child_field.clone(),
                 child: child_configs,
+                or_condition: None,
             });
         }
     }
     Ok(())
+}
+
+fn has_csq(cond: &Condition) -> bool {
+    match cond {
+        Condition::CorrelatedSubquery { .. } => true,
+        Condition::And { conditions } | Condition::Or { conditions } => {
+            conditions.iter().any(has_csq)
+        }
+        Condition::Simple { .. } => false,
+    }
+}
+
+fn append_csq_as_exists(
+    schema: &mut SchemaCache,
+    configs: &mut Vec<OperatorConfig>,
+    cond: &Condition,
+    primary_key: &[String],
+    or_condition: Option<serde_json::Value>,
+) -> Result<(), String> {
+    match cond {
+        Condition::CorrelatedSubquery { related, op, .. } => {
+            let not_exists = op == "NOT EXISTS";
+            let child_configs = ast_to_operator_configs(
+                schema,
+                &related.subquery,
+                &related.correlation.child_field,
+            )?;
+            configs.push(OperatorConfig::Exists {
+                relationship_name: relationship_name(related),
+                not_exists,
+                parent_key: related.correlation.parent_field.clone(),
+                child_key: related.correlation.child_field.clone(),
+                child: child_configs,
+                or_condition,
+            });
+            Ok(())
+        }
+        _ => Err(format!("Expected CorrelatedSubquery, got {:?}", cond)),
+    }
 }
 
 fn condition_to_predicate_json(cond: &Condition) -> Result<serde_json::Value, String> {
@@ -373,6 +437,23 @@ fn condition_to_predicate_json(cond: &Condition) -> Result<serde_json::Value, St
                         serde_json::Value::Array(a) => a.clone(),
                         other => vec![other.clone()],
                     };
+                    // Empty array short-circuit:
+                    // `x IN ()` is always false, `x NOT IN ()` is always true.
+                    if arr.is_empty() {
+                        return if op == "NOT IN" {
+                            Ok(serde_json::json!({"and": []})) // always true
+                        } else {
+                            Ok(serde_json::json!({"or": []})) // always false
+                        };
+                    }
+                    if op == "NOT IN" {
+                        return Ok(serde_json::json!({
+                            "not": {
+                                "field": field,
+                                "in": arr,
+                            }
+                        }));
+                    }
                     Ok(serde_json::json!({
                         "field": field,
                         "in": arr,
@@ -380,10 +461,15 @@ fn condition_to_predicate_json(cond: &Condition) -> Result<serde_json::Value, St
                 }
                 "like" => {
                     let pattern = value.as_str().unwrap_or("").to_string();
-                    Ok(serde_json::json!({
+                    let like_pred = serde_json::json!({
                         "field": field,
                         "like": pattern,
-                    }))
+                    });
+                    if op == "NOT LIKE" || op == "NOT ILIKE" {
+                        Ok(serde_json::json!({"not": like_pred}))
+                    } else {
+                        Ok(like_pred)
+                    }
                 }
                 _ => {
                     if value.is_null() {

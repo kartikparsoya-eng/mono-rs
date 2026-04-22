@@ -10,19 +10,11 @@ use rusqlite::Connection;
 use crate::row_iterator::RowIterator;
 use crate::types::{get_column_names, intern_column_keys, js_array_params_to_sqlite, row_to_js_object, row_to_js_object_fast};
 
-// FFI declarations for scanstatus APIs.
-// These are compiled into the bundled SQLite (SQLITE_ENABLE_STMT_SCANSTATUS)
-// but not re-exported through the libsqlite3-sys pre-generated bindings.
-extern "C" {
-    fn sqlite3_stmt_scanstatus_v2(
-        pStmt: *mut libsqlite3_sys::sqlite3_stmt,
-        idx: c_int,
-        iScanStatusOp: c_int,
-        flags: c_int,
-        pOut: *mut c_void,
-    ) -> c_int;
-    fn sqlite3_stmt_scanstatus_reset(pStmt: *mut libsqlite3_sys::sqlite3_stmt);
-}
+// scanstatus APIs from bundled SQLite (SQLITE_ENABLE_STMT_SCANSTATUS).
+// Using libsqlite3_sys bindings ensures we call the bundled SQLite's
+// implementation rather than resolving to a different SQLite library
+// (e.g. @rocicorp/zero-sqlite3) via -undefined dynamic_lookup.
+use libsqlite3_sys::{sqlite3_stmt_scanstatus_v2, sqlite3_stmt_scanstatus_reset};
 
 /// Holds a raw SQLite prepared statement for scanstatus queries.
 /// The raw stmt is prepared via sqlite3_prepare_v2 (not rusqlite's cached statements)

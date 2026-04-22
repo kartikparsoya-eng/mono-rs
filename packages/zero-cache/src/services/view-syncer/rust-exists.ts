@@ -92,7 +92,7 @@ export function createRustExistsWrapper(
 
     *push(change: Change): Stream<'yield'> {
       if (!rustBindings || !capturedOutput) {
-        yield* original.push(change);
+        yield* original.push(change, wrapper);
         return;
       }
 
@@ -103,12 +103,12 @@ export function createRustExistsWrapper(
         changeType === ChangeType.EDIT ||
         changeType === ChangeType.REMOVE
       ) {
-        yield* original.push(change);
+        yield* original.push(change, wrapper);
         return;
       }
 
       if (changeType !== ChangeType.CHILD) {
-        yield* original.push(change);
+        yield* original.push(change, wrapper);
         return;
       }
 
@@ -122,7 +122,7 @@ export function createRustExistsWrapper(
         childType === ChangeType.EDIT ||
         childType === ChangeType.CHILD
       ) {
-        yield* original.push(change);
+        yield* original.push(change, wrapper);
         return;
       }
 
@@ -148,7 +148,7 @@ export function createRustExistsWrapper(
       const action = actions[0];
 
       if (!action) {
-        yield* original.push(change);
+        yield* original.push(change, wrapper);
         return;
       }
 
@@ -193,7 +193,7 @@ export function createRustExistsWrapper(
         }
 
         default:
-          yield* original.push(change);
+          yield* original.push(change, wrapper);
           return;
       }
     },

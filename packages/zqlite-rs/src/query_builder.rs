@@ -196,8 +196,17 @@ fn filters_to_sql(filters: &Condition, params: &mut Vec<Value>) -> std::string::
                 other => other,
             };
             if sql_op == "IN" || sql_op == "NOT IN" {
-                let left_sql = value_position_to_sql(left, params);
                 if let ValuePosition::Literal { value } = right {
+                    // Empty array short-circuit:
+                    // `x IN ()` is always false, `x NOT IN ()` is always true.
+                    if value.as_array().map_or(false, |a| a.is_empty()) {
+                        return if sql_op == "IN" {
+                            "0".to_string()
+                        } else {
+                            "1".to_string()
+                        };
+                    }
+                    let left_sql = value_position_to_sql(left, params);
                     let json_str = serde_json::to_string(value).unwrap_or_default();
                     params.push(Value::String(json_str));
                     return format!(

@@ -10,7 +10,7 @@
  */
 
 import type {LogContext} from '@rocicorp/logger';
-import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
+import {type JSONValue} from '../../../../shared/src/json.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import type {RowChange} from './pipeline-driver.ts';

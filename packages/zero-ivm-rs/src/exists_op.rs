@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::filter::{Value, compare_values};
+use crate::filter::{Predicate, Value, compare_values, evaluate_json_row};
 use crate::operator::Operator;
 use crate::types::{Change, ChildData, FetchRequest, Node, Row};
 
@@ -12,6 +12,7 @@ pub struct ExistsOperator {
     parent_key: Vec<String>,
     child_key: Vec<String>,
     parent_sizes: HashMap<String, usize>,
+    or_predicate: Option<Predicate>,
 }
 
 impl ExistsOperator {
@@ -31,6 +32,20 @@ impl ExistsOperator {
             parent_key,
             child_key,
             parent_sizes: HashMap::new(),
+            or_predicate: None,
+        }
+    }
+
+    pub fn with_or_predicate(mut self, pred: Option<Predicate>) -> Self {
+        self.or_predicate = pred;
+        self
+    }
+
+    fn or_condition_matches(&self, row: &Row) -> bool {
+        if let Some(ref pred) = self.or_predicate {
+            evaluate_json_row(pred, row)
+        } else {
+            false
         }
     }
 
@@ -97,6 +112,12 @@ impl Operator for ExistsOperator {
         let mut result = Vec::new();
 
         for node in parent_nodes {
+            if self.or_condition_matches(&node.row) {
+                let pk = self.parent_key_str(&node.row);
+                self.parent_sizes.insert(pk, 1);
+                result.push(node);
+                continue;
+            }
             let count = self.fetch_child_count(&node.row);
             let pk = self.parent_key_str(&node.row);
             self.parent_sizes.insert(pk, count);
@@ -111,8 +132,10 @@ impl Operator for ExistsOperator {
     fn push(&mut self, change: Change) -> Vec<Change> {
         match &change {
             Change::Add(_) | Change::Remove(_) => {
-                // Parent add/remove: check existence condition
                 let row = change.node().row.clone();
+                if self.or_condition_matches(&row) {
+                    return vec![change];
+                }
                 let pk = self.parent_key_str(&row);
                 let count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
                     let c = self.fetch_child_count(&row);
@@ -127,6 +150,9 @@ impl Operator for ExistsOperator {
             }
             Change::Edit { .. } => {
                 let row = change.node().row.clone();
+                if self.or_condition_matches(&row) {
+                    return vec![change];
+                }
                 let pk = self.parent_key_str(&row);
                 let count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
                     let c = self.fetch_child_count(&row);
@@ -140,6 +166,9 @@ impl Operator for ExistsOperator {
                 }
             }
             Change::Child { node, child } => {
+                if self.or_condition_matches(&node.row) {
+                    return vec![change];
+                }
                 if child.relationship_name != self.relationship_name {
                     // Different relationship: pass through with filter
                     let pk = self.parent_key_str(&node.row);

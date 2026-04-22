@@ -156,21 +156,42 @@ fn values_eq(a: &Value, b: &Value) -> bool {
 
 pub fn evaluate(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
     match predicate {
-        Predicate::Eq(field, value) => row.get(field).map_or(false, |v| values_eq(v, value)),
-        Predicate::Neq(field, value) => row.get(field).map_or(true, |v| !values_eq(v, value)),
+        Predicate::Eq(field, value) => row.get(field).map_or(false, |v| {
+            if *v == Value::Null { return false; }
+            values_eq(v, value)
+        }),
+        Predicate::Neq(field, value) => row.get(field).map_or(false, |v| {
+            if *v == Value::Null { return false; }
+            !values_eq(v, value)
+        }),
         Predicate::Gt(field, value) => {
-            row.get(field).map_or(false, |v| compare_values(v, value) == std::cmp::Ordering::Greater)
+            row.get(field).map_or(false, |v| {
+                if *v == Value::Null { return false; }
+                compare_values(v, value) == std::cmp::Ordering::Greater
+            })
         }
         Predicate::Gte(field, value) => {
-            row.get(field).map_or(false, |v| compare_values(v, value) != std::cmp::Ordering::Less)
+            row.get(field).map_or(false, |v| {
+                if *v == Value::Null { return false; }
+                compare_values(v, value) != std::cmp::Ordering::Less
+            })
         }
         Predicate::Lt(field, value) => {
-            row.get(field).map_or(false, |v| compare_values(v, value) == std::cmp::Ordering::Less)
+            row.get(field).map_or(false, |v| {
+                if *v == Value::Null { return false; }
+                compare_values(v, value) == std::cmp::Ordering::Less
+            })
         }
         Predicate::Lte(field, value) => {
-            row.get(field).map_or(false, |v| compare_values(v, value) != std::cmp::Ordering::Greater)
+            row.get(field).map_or(false, |v| {
+                if *v == Value::Null { return false; }
+                compare_values(v, value) != std::cmp::Ordering::Greater
+            })
         }
-        Predicate::In(field, values) => row.get(field).map_or(false, |v| values.contains(v)),
+        Predicate::In(field, values) => row.get(field).map_or(false, |v| {
+            if *v == Value::Null { return false; }
+            values.contains(v)
+        }),
         Predicate::Like(field, pattern) => {
             row.get(field).map_or(false, |v| match v {
                 Value::String(s) => like_match(s, pattern),
@@ -185,8 +206,42 @@ pub fn evaluate(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
         }
         Predicate::And(conditions) => conditions.iter().all(|c| evaluate(c, row)),
         Predicate::Or(conditions) => conditions.iter().any(|c| evaluate(c, row)),
-        Predicate::Not(condition) => !evaluate(condition, row),
+        Predicate::Not(condition) => {
+            if is_null_for_row(condition, row) {
+                return false;
+            }
+            !evaluate(condition, row)
+        },
     }
+}
+
+/// Returns true if the predicate references a field whose row value is NULL/missing.
+/// Used by `Not` to propagate SQL NULL semantics (NOT NULL = NULL → false).
+fn is_null_for_row(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
+    match predicate {
+        Predicate::Eq(f, _)
+        | Predicate::Neq(f, _)
+        | Predicate::Gt(f, _)
+        | Predicate::Gte(f, _)
+        | Predicate::Lt(f, _)
+        | Predicate::Lte(f, _)
+        | Predicate::In(f, _)
+        | Predicate::Like(f, _) => {
+            matches!(row.get(f), None | Some(Value::Null))
+        }
+        Predicate::IsNull(_) | Predicate::IsNotNull(_) => false,
+        Predicate::And(conds) => conds.iter().any(|c| is_null_for_row(c, row)),
+        Predicate::Or(conds) => conds.iter().any(|c| is_null_for_row(c, row)),
+        Predicate::Not(inner) => is_null_for_row(inner, row),
+    }
+}
+
+/// Evaluate a predicate against a row of serde_json::Value (used by ExistsOperator).
+pub fn evaluate_json_row(predicate: &Predicate, row: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let converted: HashMap<String, Value> = row.iter()
+        .map(|(k, v)| (k.clone(), Value::from_json(v)))
+        .collect();
+    evaluate(predicate, &converted)
 }
 
 /// Compare two Values. null < everything else. Same-type comparisons.
@@ -245,6 +300,9 @@ fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize
         // Mismatch or pattern exhausted with text remaining: backtrack to last '%'
         if let Some(sp) = star_pi {
             star_ti += 1;
+            if star_ti > tlen {
+                return false; // text exhausted, no match possible
+            }
             ti = star_ti;
             pi = sp;
         } else {

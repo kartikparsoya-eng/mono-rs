@@ -132,7 +132,7 @@ export class Database implements Disposable {
         // Strip rusqlite's " in ... at offset N" suffix to match better-sqlite3 format
         const msg = e.message.replace(/ in .+ at offset \d+$/, '');
         const sqliteErr = new SqliteError(`${msg}: ${sql}`);
-        sqliteErr.stack = e.stack;
+        sqliteErr.stack = e.stack ?? '';
         throw sqliteErr;
       }
       throw e;
@@ -156,8 +156,10 @@ export class Database implements Disposable {
     columnTypes: Record<string, string>,
     tableName: string,
   ): T[] {
-    return this.#run('queryAll', sql, () =>
-      this.#db.queryAll(sql, params, columnTypes, tableName),
+    return this.#run(
+      'queryAll',
+      sql,
+      () => this.#db.queryAll(sql, params, columnTypes, tableName) as T[],
     );
   }
 

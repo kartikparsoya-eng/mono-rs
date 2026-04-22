@@ -650,7 +650,14 @@ export class PipelineDriver {
         },
       });
 
-      if (USE_RUST_HYDRATION) {
+      // CorrelatedSubquery conditions inside WHERE (e.g., OR branches with EXISTS)
+      // cannot be serialized by Rust's condition_to_predicate_json. Fall back to
+      // TS hydration for these queries while using Rust for everything else.
+      const hasCSQInWhere =
+        resolvedQuery.where !== undefined &&
+        this.#conditionHasCorrelatedSubquery(resolvedQuery.where);
+
+      if (USE_RUST_HYDRATION && !hasCSQInWhere) {
         let hydratedRowCount = 0;
         let lastHydratedRow: Row | undefined;
         if (isDualExecEnabled()) {
@@ -939,7 +946,10 @@ export class PipelineDriver {
         },
       });
 
-      const rustEligible = true;
+      const hasCSQInWhere =
+        resolvedQuery.where !== undefined &&
+        this.#conditionHasCorrelatedSubquery(resolvedQuery.where);
+      const rustEligible = !hasCSQInWhere;
       if (rustEligible) {
         const tableName = resolvedQuery.table ?? '';
         const pk = this.#primaryKeys?.get(tableName) ?? [];

@@ -646,6 +646,10 @@ fn parse_predicate_json(value: &serde_json::Value) -> Result<zero_ivm_rs::filter
             .collect();
         return Ok(Predicate::Or(preds?));
     }
+    if let Some(inner) = obj.get("not") {
+        let pred = parse_predicate_json(inner)?;
+        return Ok(Predicate::Not(Box::new(pred)));
+    }
     Err("unknown predicate format".to_string())
 }
 
@@ -718,6 +722,7 @@ fn build_next_operator(
             parent_key,
             child_key,
             child,
+            ..
         } => {
             Ok(Box::new(ParallelExistsOperator::new(
                 input,
@@ -885,6 +890,7 @@ fn build_push_next_operator(
             parent_key,
             child_key,
             child,
+            ..
         } => {
             let child_source = make_child_source(&source, child)
                 .ok_or("failed to create child source for exists")?;
@@ -1409,6 +1415,7 @@ mod tests {
                     primary_key: vec!["id".into()],
                     sort: vec![("id".into(), "asc".into())],
                 }],
+                or_condition: None,
             },
         ];
 
@@ -1450,6 +1457,7 @@ mod tests {
                     primary_key: vec!["id".into()],
                     sort: vec![("id".into(), "asc".into())],
                 }],
+                or_condition: None,
             },
         ];
 

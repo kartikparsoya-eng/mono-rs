@@ -47,6 +47,8 @@ pub enum OperatorConfig {
         parent_key: Vec<String>,
         child_key: Vec<String>,
         child: Vec<OperatorConfig>,
+        #[serde(default)]
+        or_condition: Option<serde_json::Value>,
     },
     #[serde(rename = "skip")]
     Skip {
@@ -228,9 +230,15 @@ pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn
                 parent_key,
                 child_key,
                 child,
+                or_condition,
             } => {
                 let input = current.ok_or("exists requires an input operator")?;
                 let child_op = build_operator(child)?;
+                let or_pred = if let Some(oc) = or_condition {
+                    Some(parse_predicate(oc)?)
+                } else {
+                    None
+                };
                 Box::new(ExistsOperator::new(
                     input,
                     child_op,
@@ -238,7 +246,7 @@ pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn
                     *not_exists,
                     parent_key.clone(),
                     child_key.clone(),
-                ))
+                ).with_or_predicate(or_pred))
             }
             OperatorConfig::Skip {
                 bound_row,
