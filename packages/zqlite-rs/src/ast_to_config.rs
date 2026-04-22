@@ -13,6 +13,17 @@ pub struct HydrateQuery {
     pub query_id: String,
     pub ast: Ast,
     pub primary_key: Vec<String>,
+    /// Map of table_name → { column_name → value_type }.
+    /// value_type is one of: "string", "number", "boolean", "json", "null".
+    /// When present, only these columns are included in output rows,
+    /// and type coercion (e.g. SQLite int → boolean) is applied.
+    #[serde(default)]
+    pub column_types: Option<HashMap<String, HashMap<String, String>>>,
+    /// Map of table_name → primary_key columns, provided by TS from
+    /// `#primaryKeys` (Zero schema PKs). Used instead of SQLite PRAGMA
+    /// table_info which returns SQLite PKs that may differ from Zero PKs.
+    #[serde(default)]
+    pub all_primary_keys: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +113,7 @@ pub enum ConditionValue {
 
 pub struct SchemaCache {
     columns: HashMap<String, Vec<String>>,
+    primary_keys: HashMap<String, Vec<String>>,
     db_path: String,
 }
 
@@ -109,29 +121,54 @@ impl SchemaCache {
     pub fn new(db_path: &str) -> Self {
         Self {
             columns: HashMap::new(),
+            primary_keys: HashMap::new(),
             db_path: db_path.to_string(),
         }
     }
 
-    pub fn get_columns(&mut self, table_name: &str) -> Result<Vec<String>, String> {
-        if let Some(cols) = self.columns.get(table_name) {
-            return Ok(cols.clone());
+    fn ensure_table_info(&mut self, table_name: &str) -> Result<(), String> {
+        if self.columns.contains_key(table_name) {
+            return Ok(());
         }
         let conn = rusqlite::Connection::open(&self.db_path)
             .map_err(|e| format!("Failed to open db: {e}"))?;
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info(\"{}\")", table_name))
             .map_err(|e| format!("PRAGMA table_info failed: {e}"))?;
-        let cols: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("query_map failed: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut cols = Vec::new();
+        let mut pk_cols: Vec<(i32, String)> = Vec::new();
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let pk: i32 = row.get(5)?;
+                Ok((name, pk))
+            })
+            .map_err(|e| format!("query_map failed: {e}"))?;
+        for r in rows {
+            let (name, pk) = r.map_err(|e| format!("row error: {e}"))?;
+            cols.push(name.clone());
+            if pk > 0 {
+                pk_cols.push((pk, name));
+            }
+        }
         if cols.is_empty() {
             return Err(format!("Table '{table_name}' not found or has no columns"));
         }
-        self.columns.insert(table_name.to_string(), cols.clone());
-        Ok(cols)
+        pk_cols.sort_by_key(|(idx, _)| *idx);
+        let pk: Vec<String> = pk_cols.into_iter().map(|(_, name)| name).collect();
+        self.columns.insert(table_name.to_string(), cols);
+        self.primary_keys.insert(table_name.to_string(), pk);
+        Ok(())
+    }
+
+    pub fn get_columns(&mut self, table_name: &str) -> Result<Vec<String>, String> {
+        self.ensure_table_info(table_name)?;
+        Ok(self.columns.get(table_name).unwrap().clone())
+    }
+
+    pub fn get_primary_key(&mut self, table_name: &str) -> Result<Vec<String>, String> {
+        self.ensure_table_info(table_name)?;
+        Ok(self.primary_keys.get(table_name).unwrap().clone())
     }
 }
 
@@ -207,6 +244,46 @@ pub fn ast_to_operator_configs(
     Ok(configs)
 }
 
+/// Collect all relationship names and their underlying table names
+/// from the AST recursively. Used to look up child table PKs.
+pub fn collect_child_tables(ast: &Ast) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    collect_child_tables_recursive(ast, &mut result);
+    result
+}
+
+fn collect_child_tables_recursive(ast: &Ast, out: &mut Vec<(String, String)>) {
+    if let Some(related) = &ast.related {
+        for rel in related {
+            let rel_name = relationship_name(rel);
+            let table_name = rel.subquery.table.clone();
+            out.push((rel_name, table_name));
+            collect_child_tables_recursive(&rel.subquery, out);
+        }
+    }
+    // Also check exists subqueries in where conditions
+    if let Some(cond) = &ast.where_cond {
+        collect_child_tables_from_condition(cond, out);
+    }
+}
+
+fn collect_child_tables_from_condition(cond: &Condition, out: &mut Vec<(String, String)>) {
+    match cond {
+        Condition::And { conditions: subs } | Condition::Or { conditions: subs } => {
+            for sub in subs {
+                collect_child_tables_from_condition(sub, out);
+            }
+        }
+        Condition::CorrelatedSubquery { related, .. } => {
+            let rel_name = relationship_name(related);
+            let table_name = related.subquery.table.clone();
+            out.push((rel_name, table_name));
+            collect_child_tables_recursive(&related.subquery, out);
+        }
+        _ => {}
+    }
+}
+
 fn relationship_name(rel: &CorrelatedSubquery) -> String {
     if let Some(alias) = &rel.subquery.alias {
         if !alias.is_empty() {
@@ -260,7 +337,20 @@ fn condition_to_predicate_json(cond: &Condition) -> Result<serde_json::Value, St
         Condition::Simple { op, left, right } => {
             let field = match left {
                 ConditionValue::Column { name } => name.clone(),
-                _ => return Err("Filter left side must be a column reference".to_string()),
+                ConditionValue::Literal { value: left_val } => {
+                    // Handle literal=literal conditions (e.g., 1=0 for ALWAYS_FALSE
+                    // produced by scalar subquery resolution when no rows match).
+                    let right_val = extract_literal_value(right)?;
+                    if (op == "=" || op == "IS") && left_val != &right_val {
+                        // Always false: OR of nothing
+                        return Ok(serde_json::json!({"or": []}));
+                    } else if (op == "=" || op == "IS") && left_val == &right_val {
+                        // Always true: AND of nothing
+                        return Ok(serde_json::json!({"and": []}));
+                    }
+                    return Err(format!("Unsupported literal-literal comparison with op: {op}"));
+                }
+                _ => return Err("Filter left side must be a column or literal reference".to_string()),
             };
             let value = extract_literal_value(right)?;
             let rust_op = match op.as_str() {

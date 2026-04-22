@@ -728,18 +728,11 @@ fn ivm_change_to_row_changes(
         row: &serde_json::Map<String, serde_json::Value>,
         primary_key: &[String],
     ) -> serde_json::Value {
-        if primary_key.len() == 1 {
-            row.get(&primary_key[0])
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Array(
-                primary_key
-                    .iter()
-                    .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
-                    .collect(),
-            )
-        }
+        let map: serde_json::Map<String, serde_json::Value> = primary_key
+            .iter()
+            .filter_map(|k| row.get(k).map(|v| (k.clone(), v.clone())))
+            .collect();
+        serde_json::Value::Object(map)
     }
 
     match change {
@@ -1184,7 +1177,7 @@ pub fn rust_advance_full_buf(
 
 #[napi]
 pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffer> {
-    use crate::ast_to_config::{HydrateQuery, SchemaCache, ast_to_operator_configs};
+    use crate::ast_to_config::{HydrateQuery, SchemaCache, ast_to_operator_configs, collect_child_tables};
     use crate::hydrate::{HydratePipelineConfig, hydrate_pipelines};
     use crate::query_builder::ColumnType;
     use crate::table_source::RustTableSource;
@@ -1225,6 +1218,44 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
         primary_keys.push(query.primary_key.clone());
     }
     let ast_translate_us = t0.elapsed().as_micros();
+
+    // Build a map of rel_name → primary_key for all child tables.
+    // This is used by flatten_nodes_to_row_changes to produce correct row keys.
+    // Prefer TS-provided all_primary_keys (Zero schema PKs) over SQLite PRAGMA PKs.
+    let mut all_pks: HashMap<String, Vec<String>> = HashMap::new();
+    for query in &queries {
+        // Root table PK
+        all_pks.insert(query.ast.table.clone(), query.primary_key.clone());
+
+        // If TS provided all_primary_keys, seed the map from it.
+        // This gives us Zero schema PKs which may differ from SQLite PKs.
+        if let Some(ref ts_pks) = query.all_primary_keys {
+            for (table_name, pk) in ts_pks {
+                if !all_pks.contains_key(table_name) {
+                    all_pks.insert(table_name.clone(), pk.clone());
+                }
+            }
+        }
+
+        // Child table PKs (by relationship name and table name)
+        for (rel_name, table_name) in collect_child_tables(&query.ast) {
+            // Use TS-provided PK if available, otherwise fall back to SQLite PRAGMA
+            let pk = if let Some(ref ts_pks) = query.all_primary_keys {
+                ts_pks.get(&table_name).cloned().unwrap_or_else(|| {
+                    schema_cache.get_primary_key(&table_name).unwrap_or_default()
+                })
+            } else {
+                schema_cache.get_primary_key(&table_name).unwrap_or_default()
+            };
+            if !all_pks.contains_key(&rel_name) {
+                all_pks.insert(rel_name.clone(), pk.clone());
+            }
+            // Also insert by actual table name (EXISTS children use table name as key)
+            if !all_pks.contains_key(&table_name) {
+                all_pks.insert(table_name, pk);
+            }
+        }
+    }
 
     if pipeline_configs.is_empty() {
         let result = AdvanceResult {
@@ -1298,7 +1329,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
             match hr.nodes {
                 Ok(nodes) => {
                     let t0 = Instant::now();
-                    flatten_nodes_to_row_changes(&mut all_changes, qid, tbl, pk, &nodes);
+                    flatten_nodes_to_row_changes(&mut all_changes, qid, tbl, pk, &nodes, &all_pks, &queries[orig_idx].column_types);
                     total_flatten_us += t0.elapsed().as_micros();
                 }
                 Err(e) => {
@@ -1345,21 +1376,11 @@ fn flatten_nodes_to_row_changes(
     table: &str,
     primary_key: &[String],
     nodes: &[zero_ivm_rs::types::Node],
+    all_pks: &HashMap<String, Vec<String>>,
+    column_types: &Option<HashMap<String, HashMap<String, String>>>,
 ) {
     for node in nodes {
-        let row_key = if primary_key.len() == 1 {
-            node.row
-                .get(&primary_key[0])
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        } else if primary_key.is_empty() {
-            // For relationship children, use entire row as key
-            let map: serde_json::Map<String, serde_json::Value> = node.row
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            serde_json::Value::Object(map)
-        } else {
+        let row_key = {
             let map: serde_json::Map<String, serde_json::Value> = primary_key
                 .iter()
                 .filter_map(|k| node.row.get(k).map(|v| (k.clone(), v.clone())))
@@ -1367,19 +1388,84 @@ fn flatten_nodes_to_row_changes(
             serde_json::Value::Object(map)
         };
 
-        let row: Row = node.row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let row: Option<Row> = coerce_row(&node.row, table, column_types);
 
-        out.push(RowChange {
-            query_id: query_id.to_string(),
-            table: table.to_string(),
-            row_key,
-            row: Some(row),
-            change_type: "add".to_string(),
-        });
+        // If coerce_row returns None, this table is unknown (e.g., system table) — skip it.
+        if let Some(row) = row {
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: table.to_string(),
+                row_key,
+                row: Some(row),
+                change_type: "add".to_string(),
+            });
+        }
 
         for (rel_name, children) in &node.relationships {
-            flatten_nodes_to_row_changes(out, query_id, rel_name, &[], children);
+            let child_pk = all_pks.get(rel_name)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            flatten_nodes_to_row_changes(out, query_id, rel_name, child_pk, children, all_pks, column_types);
         }
+    }
+}
+
+/// Filter row to only include columns in `column_types` for the given table,
+/// and apply type coercion (SQLite int → JSON bool, TEXT → parsed JSON).
+fn coerce_row(
+    row: &serde_json::Map<String, serde_json::Value>,
+    table: &str,
+    column_types: &Option<HashMap<String, HashMap<String, String>>>,
+) -> Option<Row> {
+    let table_cols = column_types.as_ref().and_then(|ct| ct.get(table));
+    match table_cols {
+        Some(cols) => {
+            Some(cols.iter()
+                .filter_map(|(col_name, value_type)| {
+                    let val = row.get(col_name).cloned().unwrap_or(serde_json::Value::Null);
+                    let coerced = coerce_value(val, value_type);
+                    Some((col_name.clone(), coerced))
+                })
+                .collect())
+        }
+        None if column_types.is_some() => {
+            // column_types was provided but this table isn't in it — skip this row
+            // (e.g., system tables like zeroz_1.mutations)
+            None
+        }
+        None => {
+            // No column type info at all — pass through all columns unfiltered
+            Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        }
+    }
+}
+
+/// Coerce a single value based on its ZQL value type.
+fn coerce_value(val: serde_json::Value, value_type: &str) -> serde_json::Value {
+    if val.is_null() {
+        return val;
+    }
+    match value_type {
+        "boolean" => {
+            // SQLite stores booleans as integers: 0 → false, non-zero → true
+            match &val {
+                serde_json::Value::Number(n) => {
+                    serde_json::Value::Bool(n.as_i64().map_or(false, |v| v != 0))
+                }
+                serde_json::Value::Bool(_) => val,
+                _ => val,
+            }
+        }
+        "json" => {
+            // SQLite stores JSON as TEXT — parse it
+            match &val {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(s).unwrap_or(val)
+                }
+                _ => val,
+            }
+        }
+        _ => val,
     }
 }
 

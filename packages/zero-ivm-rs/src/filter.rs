@@ -141,10 +141,23 @@ fn get_conditions(obj: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
 
 // ─── Evaluation ─────────────────────────────────────────────────────────────
 
+/// Compare two Values with boolean/number coercion.
+/// SQLite stores booleans as 0/1 (Number), but the AST uses Bool.
+/// This function handles cross-type comparisons.
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Bool(ab), Value::Number(n)) | (Value::Number(n), Value::Bool(ab)) => {
+            let bool_as_num = if *ab { 1.0 } else { 0.0 };
+            *n == bool_as_num
+        }
+        _ => a == b,
+    }
+}
+
 pub fn evaluate(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
     match predicate {
-        Predicate::Eq(field, value) => row.get(field).map_or(false, |v| v == value),
-        Predicate::Neq(field, value) => row.get(field).map_or(true, |v| v != value),
+        Predicate::Eq(field, value) => row.get(field).map_or(false, |v| values_eq(v, value)),
+        Predicate::Neq(field, value) => row.get(field).map_or(true, |v| !values_eq(v, value)),
         Predicate::Gt(field, value) => {
             row.get(field).map_or(false, |v| compare_values(v, value) == std::cmp::Ordering::Greater)
         }

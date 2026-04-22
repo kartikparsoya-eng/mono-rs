@@ -398,6 +398,8 @@ pub struct ParallelExistsOperator {
     not_exists: bool,
     parent_key: Vec<String>,
     child_key: Vec<String>,
+    relationship_name: String,
+    child_table_name: String,
 }
 
 impl ParallelExistsOperator {
@@ -408,7 +410,13 @@ impl ParallelExistsOperator {
         not_exists: bool,
         parent_key: Vec<String>,
         child_key: Vec<String>,
+        relationship_name: String,
     ) -> Self {
+        // Extract the actual child table name from the Source config
+        let child_table_name = child_config.first().and_then(|c| match c {
+            OperatorConfig::Source { table_name, .. } => Some(table_name.clone()),
+            _ => None,
+        }).unwrap_or_else(|| relationship_name.clone());
         Self {
             input,
             child_config,
@@ -416,6 +424,8 @@ impl ParallelExistsOperator {
             not_exists,
             parent_key,
             child_key,
+            relationship_name,
+            child_table_name,
         }
     }
 }
@@ -438,33 +448,46 @@ impl Operator for ParallelExistsOperator {
 
         let parent_key = &self.parent_key;
         let child_key = &self.child_key;
+        let rel_name = &self.child_table_name;
 
         parent_nodes
             .into_iter()
-            .filter(|node| {
-                let count = if !parent_key.is_empty() {
+            .filter_map(|mut node| {
+                let (count, children) = if !parent_key.is_empty() {
                     let pk0 = &parent_key[0];
                     let group_key = node.row.get(pk0)
                         .map(value_to_group_key)
                         .unwrap_or_else(|| "null".to_string());
-                    let children = grouped.get(&group_key);
+                    let fetched = grouped.get(&group_key);
                     if parent_key.len() > 1 {
                         use zero_ivm_rs::filter::{Value, compare_values};
-                        children.map(|cs| cs.iter().filter(|cn| {
+                        let filtered: Vec<Node> = fetched.map(|cs| cs.iter().filter(|cn| {
                             parent_key.iter().zip(child_key.iter()).all(|(pk, ck)| {
                                 let pv = node.row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
                                 let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
                                 !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
                                     && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
                             })
-                        }).count()).unwrap_or(0)
+                        }).cloned().collect()).unwrap_or_default();
+                        let c = filtered.len();
+                        (c, filtered)
                     } else {
-                        children.map(|cs| cs.len()).unwrap_or(0)
+                        let cs = fetched.cloned().unwrap_or_default();
+                        let c = cs.len();
+                        (c, cs)
                     }
                 } else {
-                    0
+                    (0, vec![])
                 };
-                if not_exists { count == 0 } else { count > 0 }
+                let passes = if not_exists { count == 0 } else { count > 0 };
+                if passes {
+                    // Attach exists children as a relationship so they get
+                    // flattened into RowChanges (matching TS behavior).
+                    node.relationships.insert(rel_name.clone(), children);
+                    Some(node)
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -703,6 +726,7 @@ fn build_next_operator(
                 *not_exists,
                 parent_key.clone(),
                 child_key.clone(),
+                relationship_name.clone(),
             )))
         }
         OperatorConfig::Skip {

@@ -657,7 +657,7 @@ export class PipelineDriver {
         },
       });
 
-      if (USE_RUST_HYDRATION && companionMeta.length === 0) {
+      if (USE_RUST_HYDRATION) {
         let hydratedRowCount = 0;
         let lastHydratedRow: Row | undefined;
         if (isDualExecEnabled()) {
@@ -932,7 +932,7 @@ export class PipelineDriver {
         },
       });
 
-      const rustEligible = companionMeta.length === 0;
+      const rustEligible = true;
       if (rustEligible) {
         const tableName = resolvedQuery.table ?? '';
         const pk = this.#primaryKeys?.get(tableName) ?? [];
@@ -940,6 +940,8 @@ export class PipelineDriver {
           query_id: q.queryID,
           ast: resolvedQuery,
           primary_key: [...pk],
+          column_types: this.#collectColumnTypes(resolvedQuery),
+          all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
         });
       }
 
@@ -989,13 +991,53 @@ export class PipelineDriver {
           const changes = changesByQuery.get(p.queryID) ?? [];
           let hydratedRowCount = 0;
           let lastHydratedRow: Row | undefined;
-          for (const item of this.#convertDecodedChanges(p.queryID, changes)) {
-            if (item !== 'yield' && item.type === ChangeType.ADD) {
-              hydratedRowCount++;
-              lastHydratedRow = item.row;
+
+          if (isDualExecEnabled()) {
+            // Dual-exec: run both Rust and TS, compare, yield TS (source of truth).
+            const permTables = collectPermissionTables(p.resolvedQuery);
+            const rustChanges = materializeChanges(
+              this.#convertDecodedChanges(
+                p.queryID,
+                changes,
+                permTables.size > 0 ? permTables : undefined,
+              ),
+            );
+            const tsChanges = materializeChanges(
+              hydrateInternal(
+                p.input,
+                p.queryID,
+                must(this.#primaryKeys),
+                this.#tableSpecs,
+              ),
+            );
+            const verified = dualExecCompare(
+              'hydrate-batch',
+              tsChanges,
+              rustChanges,
+              this.#lc,
+            );
+            for (const item of verified) {
+              if (item.type === ChangeType.ADD) {
+                hydratedRowCount++;
+                lastHydratedRow = item.row;
+              }
+              yield item;
             }
-            yield item;
+          } else {
+            const permTables = collectPermissionTables(p.resolvedQuery);
+            for (const item of this.#convertDecodedChanges(
+              p.queryID,
+              changes,
+              permTables.size > 0 ? permTables : undefined,
+            )) {
+              if (item !== 'yield' && item.type === ChangeType.ADD) {
+                hydratedRowCount++;
+                lastHydratedRow = item.row;
+              }
+              yield item;
+            }
           }
+
           if (p.takeStorage && p.resolvedQuery.limit !== undefined) {
             initializeTakeState(
               p.takeStorage,
@@ -1571,6 +1613,8 @@ export class PipelineDriver {
         query_id: queryID,
         ast: resolvedQuery,
         primary_key: [...pk],
+        column_types: this.#collectColumnTypes(resolvedQuery),
+        all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
       },
     ]);
     const resultBuf = rustHydrateFn(db.db.name, queriesJson);
@@ -1578,26 +1622,194 @@ export class PipelineDriver {
     if (decoded.error) {
       throw new Error(`Rust hydration failed: ${decoded.error}`);
     }
-    yield* this.#convertDecodedChanges(queryID, decoded.changes);
+    const permTables = collectPermissionTables(resolvedQuery);
+    yield* this.#convertDecodedChanges(
+      queryID,
+      decoded.changes,
+      permTables.size > 0 ? permTables : undefined,
+    );
+  }
+
+  /**
+   * Build a map of table_name → {column_name → value_type} for all tables
+   * referenced by the AST (root, related children, and exists subqueries).
+   * This tells Rust which columns to include and how to coerce types.
+   */
+  #collectColumnTypes(ast: AST): Record<string, Record<string, string>> {
+    const result: Record<string, Record<string, string>> = {};
+    const addTable = (tableName: string, alias?: string | undefined) => {
+      const key = alias || tableName;
+      // Skip mutation result tables — TS Streamer suppresses these rows
+      if (tableName.includes('.mutations')) {
+        return;
+      }
+      if (!result[key]) {
+        const spec = this.#tableSpecs.get(tableName);
+        if (spec) {
+          const cols: Record<string, string> = {};
+          for (const [colName, sv] of Object.entries(spec.zqlSpec)) {
+            cols[colName] = sv.type;
+          }
+          result[key] = cols;
+          // Also add by table name if different from key
+          if (key !== tableName && !result[tableName]) {
+            result[tableName] = cols;
+          }
+        }
+      }
+    };
+    const visit = (node: AST) => {
+      addTable(node.table, node.alias);
+      // Walk related subqueries
+      if (node.related) {
+        for (const rel of node.related) {
+          visit(rel.subquery);
+        }
+      }
+      // Walk where conditions for correlated subqueries (EXISTS)
+      if (node.where) {
+        this.#collectColumnTypesFromCondition(node.where, result);
+      }
+    };
+    visit(ast);
+    return result;
+  }
+
+  #collectColumnTypesFromCondition(
+    cond: Condition,
+    result: Record<string, Record<string, string>>,
+  ): void {
+    if (cond.type === 'and' || cond.type === 'or') {
+      for (const sub of cond.conditions) {
+        this.#collectColumnTypesFromCondition(sub, result);
+      }
+    } else if (cond.type === 'correlatedSubquery') {
+      const tableName = cond.related.subquery.table;
+      if (!result[tableName]) {
+        const spec = this.#tableSpecs.get(tableName);
+        if (spec) {
+          const cols: Record<string, string> = {};
+          for (const [colName, sv] of Object.entries(spec.zqlSpec)) {
+            cols[colName] = sv.type;
+          }
+          result[tableName] = cols;
+        }
+      }
+      // Recurse into the subquery
+      if (cond.related.subquery.related) {
+        for (const rel of cond.related.subquery.related) {
+          // Use the visit pattern — but we need to call the outer method
+          const subAst = rel.subquery;
+          const subResult = this.#collectColumnTypes(subAst);
+          Object.assign(result, subResult);
+        }
+      }
+      if (cond.related.subquery.where) {
+        this.#collectColumnTypesFromCondition(
+          cond.related.subquery.where,
+          result,
+        );
+      }
+    }
+  }
+
+  /**
+   * Build a map of table_name → primary_key columns for all tables
+   * referenced by the AST. Uses Zero schema PKs from #primaryKeys,
+   * which may differ from SQLite PKs (e.g. issueLabels has Zero PK
+   * "legacyID" but SQLite PK "(issueID, labelID)").
+   */
+  #collectAllPrimaryKeys(ast: AST): Record<string, string[]> {
+    const result: Record<string, string[]> = {};
+    const visit = (node: AST) => {
+      const tableName = node.table;
+      if (!result[tableName]) {
+        const pk = this.#primaryKeys?.get(tableName);
+        if (pk) {
+          result[tableName] = [...pk];
+        }
+      }
+      if (node.related) {
+        for (const rel of node.related) {
+          visit(rel.subquery);
+        }
+      }
+      if (node.where) {
+        this.#collectAllPrimaryKeysFromCondition(node.where, result);
+      }
+    };
+    visit(ast);
+    return result;
+  }
+
+  #collectAllPrimaryKeysFromCondition(
+    cond: Condition,
+    result: Record<string, string[]>,
+  ): void {
+    if (cond.type === 'and' || cond.type === 'or') {
+      for (const sub of cond.conditions) {
+        this.#collectAllPrimaryKeysFromCondition(sub, result);
+      }
+    } else if (cond.type === 'correlatedSubquery') {
+      const tableName = cond.related.subquery.table;
+      if (!result[tableName]) {
+        const pk = this.#primaryKeys?.get(tableName);
+        if (pk) {
+          result[tableName] = [...pk];
+        }
+      }
+      // Recurse into subquery's related and where
+      if (cond.related.subquery.related) {
+        for (const rel of cond.related.subquery.related) {
+          const subResult = this.#collectAllPrimaryKeys(rel.subquery);
+          Object.assign(result, subResult);
+        }
+      }
+      if (cond.related.subquery.where) {
+        this.#collectAllPrimaryKeysFromCondition(
+          cond.related.subquery.where,
+          result,
+        );
+      }
+    }
   }
 
   *#convertDecodedChanges(
     queryID: string,
     changes: DecodedRowChange[],
+    permissionTables?: Set<string> | undefined,
   ): Iterable<RowChange | 'yield'> {
     for (const change of changes) {
+      // Skip rows from permission-system tables (matching Streamer behavior).
+      if (permissionTables?.has(change.table)) {
+        continue;
+      }
       const type =
         change.type === 'add'
           ? ChangeType.ADD
           : change.type === 'edit'
             ? ChangeType.EDIT
             : ChangeType.REMOVE;
+      let row = change.row ?? (change.row_key as Row);
+      // Apply minRowVersion bump, matching Streamer.#streamNodes behavior.
+      if (type !== ChangeType.REMOVE && row) {
+        const spec = this.#tableSpecs.get(change.table)?.tableSpec;
+        if (spec) {
+          const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
+          if (
+            typeof rowVersion === 'string' &&
+            rowVersion < (spec.minRowVersion ?? '00')
+          ) {
+            row = {...row, [ZERO_VERSION_COLUMN_NAME]: spec.minRowVersion};
+          }
+        }
+      }
       yield {
         type,
         queryID,
         table: change.table,
         rowKey: change.row_key,
-        row: change.row ?? (change.row_key as Row),
+        row,
       } as RowChange;
     }
   }
@@ -2075,4 +2287,68 @@ function scalarValuesEqual(
   b: LiteralValue | null | undefined,
 ): boolean {
   return a === b;
+}
+
+/**
+ * Collect table names from EXISTS subqueries that have `system: 'permissions'`.
+ * Rust hydration doesn't know about the permissions system, so these child
+ * rows need to be filtered out in `#convertDecodedChanges`.
+ */
+function collectPermissionTables(ast: AST): Set<string> {
+  const result = new Set<string>();
+  const visitCondition = (cond: Condition) => {
+    if (cond.type === 'and' || cond.type === 'or') {
+      for (const sub of cond.conditions) {
+        visitCondition(sub);
+      }
+    } else if (cond.type === 'correlatedSubquery') {
+      if (cond.related.system === 'permissions') {
+        // Collect all tables reachable from this permission subquery
+        collectAllTables(cond.related.subquery, result);
+      } else {
+        // Still need to recurse into non-permission subqueries
+        visitAst(cond.related.subquery);
+      }
+    }
+  };
+  const visitAst = (node: AST) => {
+    if (node.where) {
+      visitCondition(node.where);
+    }
+    if (node.related) {
+      for (const rel of node.related) {
+        visitAst(rel.subquery);
+      }
+    }
+  };
+  visitAst(ast);
+  return result;
+}
+
+function collectAllTables(ast: AST, out: Set<string>): void {
+  out.add(ast.table);
+  if (ast.alias) {
+    out.add(ast.alias);
+  }
+  if (ast.related) {
+    for (const rel of ast.related) {
+      collectAllTables(rel.subquery, out);
+    }
+  }
+  if (ast.where) {
+    collectAllTablesFromCondition(ast.where, out);
+  }
+}
+
+function collectAllTablesFromCondition(
+  cond: Condition,
+  out: Set<string>,
+): void {
+  if (cond.type === 'and' || cond.type === 'or') {
+    for (const sub of cond.conditions) {
+      collectAllTablesFromCondition(sub, out);
+    }
+  } else if (cond.type === 'correlatedSubquery') {
+    collectAllTables(cond.related.subquery, out);
+  }
 }
