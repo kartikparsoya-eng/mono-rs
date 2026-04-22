@@ -1439,40 +1439,39 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         `${transformedQueries.length} hydrated`,
     );
 
-    for (const {
-      id: queryID,
-      transformationHash,
-      transformedAst,
-    } of transformedQueries) {
+    if (transformedQueries.length > 0) {
       const timer = new TimeSliceTimer(lc);
       let count = 0;
-      await startAsyncSpan(
-        tracer,
-        'vs.#hydrateUnchangedQueries.addQuery',
-        async span => {
-          span.setAttribute('queryHash', queryID);
-          span.setAttribute('transformationHash', transformationHash);
-          span.setAttribute('table', transformedAst.table);
-          for (const change of this.#pipelines.addQuery(
-            transformationHash,
-            queryID,
-            transformedAst,
-            await timer.start(),
-          )) {
-            if (change === 'yield') {
-              await timer.yieldProcess('yield in hydrateUnchangedQueries');
-            } else {
-              count++;
-            }
-          }
-        },
-      );
-
-      const elapsed = timer.totalElapsed();
+      const batchTimer = await timer.start();
+      for (const change of this.#pipelines.addQueries(
+        transformedQueries.map(q => ({
+          transformationHash: q.transformationHash,
+          queryID: q.id,
+          ast: q.transformedAst,
+        })),
+        batchTimer,
+      )) {
+        if (change === 'yield') {
+          await timer.yieldProcess('yield in hydrateUnchangedQueries');
+        } else {
+          count++;
+        }
+      }
+      const elapsed = timer.stop();
+      for (const q of transformedQueries) {
+        this.#addQueryMaterializationServerMetric(
+          q.transformationHash,
+          elapsed,
+        );
+      }
       this.#hydrations.add(1);
       this.#hydrationTime.record(elapsed / 1000);
-      this.#addQueryMaterializationServerMetric(transformationHash, elapsed);
-      lc.debug?.(`hydrated ${count} rows for ${queryID} (${elapsed} ms)`);
+      manualSpan(tracer, 'vs.hydrateUnchangedQueries.batch', elapsed, {
+        queryCount: transformedQueries.length,
+      });
+      lc.debug?.(
+        `batch hydrated ${count} rows for ${transformedQueries.length} queries (${elapsed} ms)`,
+      );
     }
   }
 

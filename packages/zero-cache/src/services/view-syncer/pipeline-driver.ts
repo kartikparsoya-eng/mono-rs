@@ -56,16 +56,6 @@ import {
 import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
 import {isRustJoinAvailable} from './rust-join.ts';
 
-type RustAdvanceFn = (
-  dbPath: string,
-  prevVersion: string,
-  currVersion: string,
-  syncableTablesJson: string,
-  allTableNamesJson: string,
-  permissionsTable: string,
-  pipelineConfigsJson: string,
-) => string;
-
 type RustFanOutFn = (
   changesJson: string,
   pipelineConfigsJson: string,
@@ -78,19 +68,16 @@ type RustDispatchPokeFn = (
   vsPipelinesJson: string,
 ) => Buffer;
 
-let rustAdvanceFn: RustAdvanceFn | undefined;
 let rustFanOutFn: RustFanOutFn | undefined;
 let rustHydrateFn: RustHydrateFn | undefined;
 let rustDispatchPokeFn: RustDispatchPokeFn | undefined;
 try {
   const esmRequire = createRequire(import.meta.url);
   const bindings = esmRequire('zqlite-rs');
-  rustAdvanceFn = bindings?.rustAdvance;
   rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
   rustDispatchPokeFn = bindings?.rustDispatchPoke;
 } catch {
-  rustAdvanceFn = undefined;
   rustFanOutFn = undefined;
   rustHydrateFn = undefined;
   rustDispatchPokeFn = undefined;
@@ -1270,7 +1257,6 @@ export class PipelineDriver {
         }
         const start = timer.totalElapsed();
 
-        let type;
         try {
           const tableSource = this.#tables.get(table);
           if (!tableSource) {
@@ -1318,7 +1304,6 @@ export class PipelineDriver {
         const elapsed = timer.totalElapsed() - start;
         this.#advanceTime.record(elapsed / 1000, {
           table,
-          type,
         });
       }
 
