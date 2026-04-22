@@ -5,7 +5,11 @@ import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
 import {must} from '../../../../shared/src/must.ts';
 import {RustStorage} from '../../../../zero-ivm-rs/index.js';
 import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
-import type {AST, LiteralValue} from '../../../../zero-protocol/src/ast.ts';
+import type {
+  AST,
+  CompoundKey,
+  LiteralValue,
+} from '../../../../zero-protocol/src/ast.ts';
 import type {Condition} from '../../../../zero-protocol/src/ast.ts';
 import type {ClientSchema} from '../../../../zero-protocol/src/client-schema.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
@@ -92,14 +96,16 @@ interface RustPipelineConfig {
   source_tables: string[];
   operators: RustOperator[];
   primary_key: string[];
-  related?: Array<{
-    relationship: string;
-    parent_field: string[];
-    child_field: string[];
-    child_ast: unknown;
-  }>;
-  limit?: number | null;
-  order_by?: [string, string][];
+  related?:
+    | Array<{
+        relationship: string;
+        parent_field: string[];
+        child_field: string[];
+        child_ast: unknown;
+      }>
+    | undefined;
+  limit?: number | null | undefined;
+  order_by?: [string, string][] | undefined;
 }
 type RustOperator =
   | {type: 'filter'; predicate: unknown}
@@ -622,7 +628,7 @@ export class PipelineDriver {
                   return createRustExistsWrapper(
                     input as FilterOperator,
                     relationshipName,
-                    parentField,
+                    parentField as CompoundKey,
                     existsTypes.get(relationshipName) ?? 'EXISTS',
                   );
                 }
@@ -854,6 +860,8 @@ export class PipelineDriver {
       query_id: string;
       ast: AST;
       primary_key: string[];
+      column_types?: Record<string, Record<string, string>>;
+      all_primary_keys?: Record<string, string[]>;
     }> = [];
 
     const costModel = this.#ensureCostModelExistsIfEnabled(
@@ -909,7 +917,7 @@ export class PipelineDriver {
                   return createRustExistsWrapper(
                     input as FilterOperator,
                     relationshipName,
-                    parentField,
+                    parentField as CompoundKey,
                     existsTypes.get(relationshipName) ?? 'EXISTS',
                   );
                 }
@@ -1349,11 +1357,11 @@ export class PipelineDriver {
 
     if (ast.related) {
       for (const rel of ast.related) {
-        if (rel.system === 'exists') {
+        if ((rel.system as string) === 'exists') {
           operators.push({
             type: 'exists',
             relationship: rel.subquery.table ?? '',
-            parent_field: rel.correlation.parentField,
+            parent_field: [...rel.correlation.parentField],
             not_exists:
               existsTypes.get(
                 rel.subquery.alias ?? rel.subquery.table ?? '',
@@ -1363,9 +1371,9 @@ export class PipelineDriver {
           operators.push({
             type: 'join',
             relationship: rel.subquery.table ?? '',
-            parent_field: rel.correlation.parentField,
-            child_field: rel.correlation.childField,
-            child_ast: rel.subquery,
+            parent_field: [...rel.correlation.parentField],
+            child_field: [...rel.correlation.childField],
+            child_ast: rel.subquery as unknown,
           });
         }
       }
@@ -1387,14 +1395,17 @@ export class PipelineDriver {
       source_tables: sourceTables,
       operators,
       primary_key: [...pk],
-      related: ast.related?.map(r => ({
-        relationship: r.subquery.table ?? '',
-        parent_field: r.correlation.parentField,
-        child_field: r.correlation.childField,
-        child_ast: r.subquery,
-      })),
-      limit: ast.limit,
-      order_by: ast.orderBy?.map(([col, dir]) => [col, dir]),
+      related:
+        ast.related?.map(r => ({
+          relationship: r.subquery.table ?? '',
+          parent_field: [...r.correlation.parentField],
+          child_field: [...r.correlation.childField],
+          child_ast: r.subquery as unknown,
+        })) ?? [],
+      limit: ast.limit ?? null,
+      order_by: ast.orderBy?.map(
+        ([col, dir]) => [col, dir] as [string, string],
+      ),
     };
   }
 

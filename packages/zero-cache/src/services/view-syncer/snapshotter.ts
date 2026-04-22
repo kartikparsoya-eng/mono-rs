@@ -260,7 +260,8 @@ export type ResetPipelinesReason =
   | 'scalar-subquery'
   | 'schema-change'
   | 'truncation'
-  | 'permissions-change';
+  | 'permissions-change'
+  | 'rust-dispatch-error';
 
 export class ResetPipelinesSignal extends Error {
   readonly name = 'ResetPipelinesSignal';
@@ -354,7 +355,10 @@ class Snapshot {
     };
   }
 
-  getRow(table: LiteTableSpecWithKeysAndVersion, rowKey: JSONValue) {
+  getRow(
+    table: LiteTableSpecWithKeysAndVersion,
+    rowKey: JSONValue,
+  ): Record<string, JSONValue> | undefined {
     const key = normalizedKeyOrder(rowKey as RowKey);
     const conds = Object.keys(key).map(c => `${id(c)}=?`);
     const cols = Object.keys(table.columns);
@@ -362,14 +366,19 @@ class Snapshot {
       table.name,
     )} WHERE ${conds.join(' AND ')}`;
     // Pass empty columnTypes — fromSQLiteTypes handles conversion in the Diff iterator
-    return this.db.db.getRow(sql, Object.values(key), {}, table.name);
+    return this.db.db.getRow<Record<string, JSONValue>>(
+      sql,
+      Object.values(key),
+      {},
+      table.name,
+    );
   }
 
   getRows(
     table: LiteTableSpecWithKeysAndVersion,
     keys: PrimaryKey[],
     row: RowValue,
-  ) {
+  ): Record<string, JSONValue>[] {
     // Filter out keys where any column is NULL. This is both correct and
     // critical for performance:
     // 1. Correctness: NULL values can't violate uniqueness (NULL != NULL in SQL)
@@ -392,7 +401,7 @@ class Snapshot {
     const cached = this.db.statementCache.get(sql);
     this.db.statementCache.return(cached);
     const buf = this.db.db.getRowsBuf(sql, params);
-    return decodeBuf(buf, cols);
+    return decodeBuf<Record<string, JSONValue>>(buf, cols);
   }
 
   resetToHead(): Snapshot {
@@ -504,7 +513,12 @@ class Diff implements SnapshotDiff {
               );
             }
             // Sanity check detects if the diff is being accessed after the Snapshots have advanced.
-            this.checkThatDiffIsValid(stateVersion, op, prevValues, nextValue);
+            this.checkThatDiffIsValid(
+              stateVersion,
+              op,
+              prevValues as RowValue[],
+              nextValue as RowValue,
+            );
 
             if (prevValues.length === 0 && nextValue === null) {
               // Filter out no-op changes (e.g. a delete of a row that does not exist in prev).
@@ -515,16 +529,16 @@ class Diff implements SnapshotDiff {
             if (
               table === this.#permissionsTable &&
               prevValues.some(
-                prevValue => prevValue.permissions !== nextValue.permissions,
+                prevValue => prevValue.permissions !== nextValue!.permissions,
               )
             ) {
               throw new ResetPipelinesSignal(
                 `Permissions have changed ${
                   prevValues.find(
                     prevValue =>
-                      prevValue.permissions !== nextValue.permissions,
-                  ).hash
-                } => ${nextValue.hash}`,
+                      prevValue.permissions !== nextValue!.permissions,
+                  )!.hash
+                } => ${nextValue!.hash}`,
                 'permissions-change',
               );
             }
@@ -536,10 +550,10 @@ class Diff implements SnapshotDiff {
               value: {
                 table,
                 prevValues: prevValues.map(prevValue =>
-                  fromSQLiteTypes(zqlSpec, prevValue, table),
+                  fromSQLiteTypes(zqlSpec, prevValue as unknown as Row, table),
                 ),
                 nextValue: nextValue
-                  ? fromSQLiteTypes(zqlSpec, nextValue, table)
+                  ? fromSQLiteTypes(zqlSpec, nextValue as unknown as Row, table)
                   : null,
                 rowKey,
               } satisfies Change,
