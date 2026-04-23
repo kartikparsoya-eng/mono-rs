@@ -460,6 +460,49 @@ describe('view-syncer/pipeline-driver', () => {
     expect(pipelines.replicaVersion).toBe('123');
   });
 
+  test('totalHydrationTimeMs sums per-query times correctly', () => {
+    pipelines.init(clientSchema);
+
+    // Mock timer that returns a fixed value for totalElapsed.
+    // addQuery calls timer.totalElapsed() once at the end to get hydrationTimeMs.
+    const mockTimer = (ms: number): Timer => ({
+      totalElapsed: () => ms,
+      elapsedLap: () => 0,
+    });
+
+    // Hydrate two queries with known times.
+    [
+      ...pipelines.addQuery(
+        'hash1',
+        'queryID1',
+        ISSUES_AND_COMMENTS,
+        mockTimer(50),
+      ),
+    ];
+    [
+      ...pipelines.addQuery(
+        'hash2',
+        'queryID2',
+        {
+          table: 'issues',
+          orderBy: [['id', 'asc']],
+        } as AST,
+        mockTimer(30),
+      ),
+    ];
+
+    // totalHydrationTimeMs should be the sum: 50 + 30 = 80, NOT cumulative.
+    expect(pipelines.totalHydrationTimeMs()).toBe(80);
+
+    // After removing one query, only the remaining query's time should count.
+    pipelines.removeQuery('queryID1');
+    expect(pipelines.totalHydrationTimeMs()).toBe(30);
+
+    // After removing all queries, total should be 0.
+    pipelines.removeQuery('queryID2');
+    expect(pipelines.totalHydrationTimeMs()).toBe(0);
+  });
+
   test('add query', () => {
     pipelines.init(clientSchema);
 
