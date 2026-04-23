@@ -81,7 +81,10 @@ try {
   rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
   rustDispatchPokeFn = bindings?.rustDispatchPoke;
-} catch {
+} catch (e) {
+  // Log so operators know Rust acceleration is unavailable.
+  // eslint-disable-next-line no-console
+  console.warn(`Failed to load zqlite-rs native bindings: ${e}`);
   rustFanOutFn = undefined;
   rustHydrateFn = undefined;
   rustDispatchPokeFn = undefined;
@@ -303,8 +306,15 @@ export class PipelineDriver {
     'Number of rows deleted because they conflicted with added row',
   );
 
+  readonly #rustAdvanceFailures = getOrCreateCounter(
+    'sync',
+    'ivm.rust-advance-failures',
+    'Number of times Rust advance failed and fell back to TS',
+  );
+
   readonly #inspectorDelegate: InspectorDelegate;
   readonly #pipelineConfigs = new Map<string, RustPipelineConfig>();
+  readonly #permissionTablesByQuery = new Map<string, Set<string>>();
   #useRustAdvance = false;
 
   constructor(
@@ -373,6 +383,7 @@ export class PipelineDriver {
     this.#tables.clear();
     this.#allTableNames.clear();
     this.#pipelineConfigs.clear();
+    this.#permissionTablesByQuery.clear();
     this.#useRustAdvance = false;
     this.#initAndResetCommon(clientSchema);
   }
@@ -794,8 +805,15 @@ export class PipelineDriver {
         );
         if (config) {
           this.#pipelineConfigs.set(queryID, config);
+          const permTables = collectPermissionTables(resolvedQuery);
+          if (permTables.size > 0) {
+            this.#permissionTablesByQuery.set(queryID, permTables);
+          } else {
+            this.#permissionTablesByQuery.delete(queryID);
+          }
         } else {
           this.#pipelineConfigs.delete(queryID);
+          this.#permissionTablesByQuery.delete(queryID);
         }
         this.#reevaluateRustAdvance();
       }
@@ -938,18 +956,15 @@ export class PipelineDriver {
         },
       });
 
-      const rustEligible = true;
-      if (rustEligible) {
-        const tableName = resolvedQuery.table ?? '';
-        const pk = this.#primaryKeys?.get(tableName) ?? [];
-        rustPayloads.push({
-          query_id: q.queryID,
-          ast: resolvedQuery,
-          primary_key: [...pk],
-          column_types: this.#collectColumnTypes(resolvedQuery),
-          all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
-        });
-      }
+      const tableName = resolvedQuery.table ?? '';
+      const pk = this.#primaryKeys?.get(tableName) ?? [];
+      rustPayloads.push({
+        query_id: q.queryID,
+        ast: resolvedQuery,
+        primary_key: [...pk],
+        column_types: this.#collectColumnTypes(resolvedQuery),
+        all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
+      });
 
       prepared.push({
         queryID: q.queryID,
@@ -1152,8 +1167,15 @@ export class PipelineDriver {
           );
           if (config) {
             this.#pipelineConfigs.set(p.queryID, config);
+            const permTables = collectPermissionTables(p.resolvedQuery);
+            if (permTables.size > 0) {
+              this.#permissionTablesByQuery.set(p.queryID, permTables);
+            } else {
+              this.#permissionTablesByQuery.delete(p.queryID);
+            }
           } else {
             this.#pipelineConfigs.delete(p.queryID);
+            this.#permissionTablesByQuery.delete(p.queryID);
           }
           this.#reevaluateRustAdvance();
         }
@@ -1177,6 +1199,7 @@ export class PipelineDriver {
       }
     }
     if (this.#pipelineConfigs.delete(queryID)) {
+      this.#permissionTablesByQuery.delete(queryID);
       this.#reevaluateRustAdvance();
     }
   }
@@ -1228,6 +1251,7 @@ export class PipelineDriver {
       } catch (e) {
         if (e instanceof ResetPipelinesSignal) throw e;
         this.#lc.warn?.(`Rust dispatch advance failed, falling back: ${e}`);
+        this.#rustAdvanceFailures.add(1);
       }
     }
     if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
@@ -1240,6 +1264,7 @@ export class PipelineDriver {
       } catch (e) {
         if (e instanceof ResetPipelinesSignal) throw e;
         this.#lc.warn?.(`Rust advance failed, falling back to TS: ${e}`);
+        this.#rustAdvanceFailures.add(1);
         this.#useRustAdvance = false;
       }
     }
@@ -1514,26 +1539,48 @@ export class PipelineDriver {
     return {
       version: curr.version,
       numChanges,
-      changes: this.#convertDispatchChanges(vsResult.changes),
+      changes: this.#convertDispatchChanges(
+        vsResult.changes,
+        this.#combinedPermissionTables(),
+      ),
     };
   }
 
   *#convertDispatchChanges(
     changes: DecodedRowChange[],
+    permissionTables?: Set<string> | undefined,
   ): Iterable<RowChange | 'yield'> {
     for (const change of changes) {
+      // Skip rows from permission-system tables (matching Streamer behavior).
+      if (permissionTables?.has(change.table)) {
+        continue;
+      }
       const type =
         change.type === 'add'
           ? ChangeType.ADD
           : change.type === 'edit'
             ? ChangeType.EDIT
             : ChangeType.REMOVE;
+      let row = change.row ?? (change.row_key as Row);
+      // Apply minRowVersion bump, matching Streamer.#streamNodes behavior.
+      if (type !== ChangeType.REMOVE && row) {
+        const spec = this.#tableSpecs.get(change.table)?.tableSpec;
+        if (spec) {
+          const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
+          if (
+            typeof rowVersion === 'string' &&
+            rowVersion < (spec.minRowVersion ?? '00')
+          ) {
+            row = {...row, [ZERO_VERSION_COLUMN_NAME]: spec.minRowVersion};
+          }
+        }
+      }
       yield {
         type,
         queryID: change.queryID,
         table: change.table,
         rowKey: change.row_key,
-        row: change.row ?? (change.row_key as Row),
+        row: type === ChangeType.REMOVE ? undefined : row,
       } as RowChange;
     }
   }
@@ -1597,7 +1644,10 @@ export class PipelineDriver {
     return {
       version: curr.version,
       numChanges,
-      changes: this.#convertRustChanges(result.changes),
+      changes: this.#convertRustChanges(
+        result.changes,
+        this.#combinedPermissionTables(),
+      ),
     };
   }
 
@@ -1836,6 +1886,19 @@ export class PipelineDriver {
     }
   }
 
+  #combinedPermissionTables(): Set<string> | undefined {
+    if (this.#permissionTablesByQuery.size === 0) {
+      return undefined;
+    }
+    const combined = new Set<string>();
+    for (const tables of this.#permissionTablesByQuery.values()) {
+      for (const t of tables) {
+        combined.add(t);
+      }
+    }
+    return combined.size > 0 ? combined : undefined;
+  }
+
   *#convertRustChanges(
     changes: Array<{
       queryID: string;
@@ -1844,23 +1907,39 @@ export class PipelineDriver {
       row: Row | null;
       type: string;
     }>,
+    permissionTables?: Set<string> | undefined,
   ): Iterable<RowChange | 'yield'> {
     for (const change of changes) {
+      // Skip rows from permission-system tables (matching Streamer behavior).
+      if (permissionTables?.has(change.table)) {
+        continue;
+      }
       const type =
         change.type === 'add'
           ? ChangeType.ADD
           : change.type === 'edit'
             ? ChangeType.EDIT
             : ChangeType.REMOVE;
+      let row = change.row ?? (change.row_key as Row);
+      // Apply minRowVersion bump, matching Streamer.#streamNodes behavior.
+      if (type !== ChangeType.REMOVE && row) {
+        const spec = this.#tableSpecs.get(change.table)?.tableSpec;
+        if (spec) {
+          const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
+          if (
+            typeof rowVersion === 'string' &&
+            rowVersion < (spec.minRowVersion ?? '00')
+          ) {
+            row = {...row, [ZERO_VERSION_COLUMN_NAME]: spec.minRowVersion};
+          }
+        }
+      }
       yield {
         type,
         queryID: change.queryID,
         table: change.table,
         rowKey: change.row_key,
-        row:
-          type === ChangeType.REMOVE
-            ? undefined
-            : (change.row ?? change.row_key),
+        row: type === ChangeType.REMOVE ? undefined : row,
       } as RowChange;
     }
   }
@@ -1919,7 +1998,10 @@ export class PipelineDriver {
       };
       if (!result.error) {
         rustChanges = materializeChanges(
-          this.#convertRustChanges(result.changes),
+          this.#convertRustChanges(
+            result.changes,
+            this.#combinedPermissionTables(),
+          ),
         );
       } else {
         this.#lc.warn?.(`[dual-exec] Rust fan-out error: ${result.error}`);

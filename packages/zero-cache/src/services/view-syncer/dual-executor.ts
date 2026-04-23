@@ -13,6 +13,7 @@ import type {LogContext} from '@rocicorp/logger';
 import {type JSONValue} from '../../../../shared/src/json.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
+import {getOrCreateCounter} from '../../observability/metrics.ts';
 import type {RowChange} from './pipeline-driver.ts';
 
 // --- Configuration ---
@@ -45,6 +46,18 @@ interface NormalizedChange {
 }
 
 // --- Stats ---
+
+const dualExecComparisons = getOrCreateCounter(
+  'sync',
+  'ivm.dual-exec-comparisons',
+  'Number of dual-exec Rust vs TS comparisons',
+);
+
+const dualExecMismatches = getOrCreateCounter(
+  'sync',
+  'ivm.dual-exec-mismatches',
+  'Number of dual-exec Rust vs TS mismatches',
+);
 
 export interface DualExecStats {
   comparisons: number;
@@ -274,6 +287,7 @@ export function dualExecCompare(
   lc: LogContext,
 ): RowChange[] {
   stats.comparisons++;
+  dualExecComparisons.add(1);
 
   const result = compareChanges(tsChanges, rustChanges);
 
@@ -285,6 +299,7 @@ export function dualExecCompare(
   }
 
   stats.mismatches++;
+  dualExecMismatches.add(1);
 
   const detail = formatMismatches(label, result);
   stats.lastMismatchDetail = detail;

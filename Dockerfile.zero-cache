@@ -1,0 +1,120 @@
+# Build zero-cache with Rust IVM from local mono-rs source.
+#
+# This is a multi-stage build:
+#   Stage 1 (rust-builder): Cross-compiles zqlite-rs + zero-ivm-rs NAPI addons
+#                           with patched SQLite (BEGIN CONCURRENT support)
+#   Stage 2 (runtime):      Slim Node.js image with pre-built JS + NAPI binaries
+#
+# Build (use scripts/build-zero-cache.sh instead for convenience):
+#   npm run build  # first build JS
+#   docker build -f Dockerfile.zero-cache -t rocicorp/zero:local .
+#
+# Run:
+#   docker run --rm -p 4848:4848 \
+#     -e ZERO_UPSTREAM_DB=postgresql://user:pass@host:5432/db \
+#     -e ZERO_CHANGE_DB=postgresql://user:pass@host:5432/db \
+#     rocicorp/zero:local zero-cache-start
+
+# syntax=docker/dockerfile:1
+
+# ── Stage 1: Build Rust NAPI addons for Linux ────────────────────────
+FROM rust:1.90.0 AS rust-builder
+
+# Install Node.js 22 + build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential python3 pkg-config ca-certificates gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @napi-rs/cli
+
+# Copy both crate sources (zqlite-rs depends on ../zero-ivm-rs)
+COPY packages/zero-ivm-rs/ /build/zero-ivm-rs/
+COPY packages/zqlite-rs/ /build/zqlite-rs/
+
+# Copy patched SQLite sources (Rocicorp fork with BEGIN CONCURRENT)
+# These are staged by the build script into .docker-ctx/sqlite3-patch/
+COPY .docker-ctx/sqlite3-patch/ /build/sqlite3-patch/
+
+# Build zero-ivm-rs first (dependency of zqlite-rs)
+WORKDIR /build/zero-ivm-rs
+RUN npm install
+RUN cargo build --release
+RUN npx napi build --release
+RUN mv zero-ivm-rs.node zero-ivm-rs.linux-arm64-gnu.node
+RUN ls -la *.node
+
+# Build zqlite-rs with patched SQLite
+WORKDIR /build/zqlite-rs
+RUN npm install
+# Initial build to force cargo to extract libsqlite3-sys sources
+RUN LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS cargo build --release 2>&1 | tail -5 || true
+# Patch the extracted libsqlite3-sys with BEGIN CONCURRENT support
+RUN set -e && \
+    SQLITE_DIR=$(find ${CARGO_HOME:-/usr/local/cargo}/registry/src -type d -name 'libsqlite3-sys-0.31*' 2>/dev/null | head -1) && \
+    echo "SQLITE_DIR=$SQLITE_DIR" && \
+    if [ -z "$SQLITE_DIR" ]; then \
+      echo "FATAL: Cannot find libsqlite3-sys in cargo registry" && exit 1; \
+    fi && \
+    cp /build/sqlite3-patch/sqlite3.c "$SQLITE_DIR/sqlite3/sqlite3.c" && \
+    cp /build/sqlite3-patch/sqlite3.h "$SQLITE_DIR/sqlite3/sqlite3.h" && \
+    echo "Patched $(grep -c 'CONCURRENT' "$SQLITE_DIR/sqlite3/sqlite3.c") CONCURRENT refs" && \
+    cargo clean && \
+    echo "SQLite patching complete"
+# Rebuild with patched SQLite
+RUN LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS cargo build --release
+RUN LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS npx napi build --release
+RUN mv zqlite-rs.node zqlite-rs.linux-arm64-gnu.node
+RUN ls -la *.node
+
+# ── Stage 2: Slim runtime image ──────────────────────────────────────
+FROM node:22-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget ca-certificates python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/app
+
+# Install runtime JS deps
+COPY .docker-ctx/package.json .
+RUN npm install --omit=dev --ignore-scripts 2>/dev/null; \
+    npm rebuild @rocicorp/zero-sqlite3 2>/dev/null || true; \
+    npm rebuild better-sqlite3 2>/dev/null || true
+
+# Copy pre-built JS output
+COPY .docker-ctx/out/ /opt/app/out/
+
+# Copy native Rust modules into node_modules so require() finds them
+COPY .docker-ctx/node_modules_extra/zqlite-rs/ /opt/app/node_modules/zqlite-rs/
+COPY .docker-ctx/node_modules_extra/zero-ivm-rs/ /opt/app/node_modules/zero-ivm-rs/
+
+# Also copy zero-ivm-rs into out/ since pipeline-driver.js uses a relative import
+COPY .docker-ctx/node_modules_extra/zero-ivm-rs/ /opt/app/out/zero-ivm-rs/
+
+# Create the @rocicorp/zero symlink structure
+RUN mkdir -p node_modules/@rocicorp/zero && \
+    ln -sf /opt/app/out node_modules/@rocicorp/zero/out && \
+    ln -sf /opt/app/package.json node_modules/@rocicorp/zero/package.json
+
+# Copy linux NAPI binaries from rust-builder stage
+COPY --from=rust-builder /build/zqlite-rs/*.linux-*.node /opt/app/node_modules/zqlite-rs/
+COPY --from=rust-builder /build/zero-ivm-rs/*.linux-*.node /opt/app/node_modules/zero-ivm-rs/
+COPY --from=rust-builder /build/zero-ivm-rs/*.linux-*.node /opt/app/out/zero-ivm-rs/
+
+# Enable Rust IVM
+ENV ZERO_DISABLE_RUST_IVM=0
+ENV ZERO_LOG_FORMAT=json
+ENV ZERO_IN_CONTAINER=1
+ENV NODE_OPTIONS="--experimental-strip-types --no-warnings"
+ENV NODE_ENV=development
+
+EXPOSE 4848 4849
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
+  CMD wget --spider -q http://localhost:4848/ || exit 1
+
+ENTRYPOINT ["node", "/opt/app/out/zero/src/cli.js"]

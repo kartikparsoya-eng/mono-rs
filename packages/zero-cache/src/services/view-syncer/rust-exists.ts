@@ -193,6 +193,10 @@ export function createRustExistsWrapper(
         }
 
         default:
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[rust-exists] Unknown action '${action.action}', falling back to TS`,
+          );
           yield* original.push(change, wrapper);
           return;
       }
