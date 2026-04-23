@@ -777,8 +777,7 @@ export class PipelineDriver {
       }
 
       // Note: This hydrationTime is a wall-clock overestimate, as it does
-      // not take time slicing into account. The view-syncer resets this
-      // to a more precise processing-time measurement with setHydrationTime().
+      // not take time slicing into account.
       this.#pipelines.set(queryID, {
         input,
         hydrationTimeMs,
@@ -991,6 +990,7 @@ export class PipelineDriver {
     }
 
     // Phase 3: Yield results per-query and finalize pipelines.
+    let lastTotalElapsed = 0;
     for (const p of prepared) {
       this.#hydrateContext = {timer};
       try {
@@ -1084,7 +1084,9 @@ export class PipelineDriver {
           } as RowChange;
         }
 
-        const hydrationTimeMs = timer.totalElapsed();
+        const currentTotal = timer.totalElapsed();
+        const hydrationTimeMs = currentTotal - lastTotalElapsed;
+        lastTotalElapsed = currentTotal;
         p.debugDelegate?.reset();
 
         // Set up live companion pipelines for reactive scalar subquery monitoring.
