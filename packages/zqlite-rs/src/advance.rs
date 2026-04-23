@@ -255,25 +255,44 @@ impl Predicate {
 fn evaluate_predicate(predicate: &Predicate, row: &Row) -> bool {
     match predicate {
         Predicate::Eq(field, value) => {
-            row.get(field).map_or(false, |v| &Value::from_json(v) == value)
+            // NULL = x is NULL (falsy) in SQL three-valued logic
+            row.get(field).map_or(false, |v| {
+                let v = Value::from_json(v);
+                if v == Value::Null { false } else { &v == value }
+            })
         }
         Predicate::Neq(field, value) => {
-            row.get(field).map_or(true, |v| &Value::from_json(v) != value)
+            // NULL != x is NULL (falsy) in SQL three-valued logic
+            row.get(field).map_or(false, |v| {
+                let v = Value::from_json(v);
+                if v == Value::Null { false } else { &v != value }
+            })
         }
         Predicate::Gt(field, value) => row.get(field).map_or(false, |v| {
-            compare_values(&Value::from_json(v), value) == std::cmp::Ordering::Greater
+            let v = Value::from_json(v);
+            if v == Value::Null { return false; }
+            compare_values(&v, value) == std::cmp::Ordering::Greater
         }),
         Predicate::Gte(field, value) => row.get(field).map_or(false, |v| {
-            compare_values(&Value::from_json(v), value) != std::cmp::Ordering::Less
+            let v = Value::from_json(v);
+            if v == Value::Null { return false; }
+            compare_values(&v, value) != std::cmp::Ordering::Less
         }),
         Predicate::Lt(field, value) => row.get(field).map_or(false, |v| {
-            compare_values(&Value::from_json(v), value) == std::cmp::Ordering::Less
+            let v = Value::from_json(v);
+            if v == Value::Null { return false; }
+            compare_values(&v, value) == std::cmp::Ordering::Less
         }),
         Predicate::Lte(field, value) => row.get(field).map_or(false, |v| {
-            compare_values(&Value::from_json(v), value) != std::cmp::Ordering::Greater
+            let v = Value::from_json(v);
+            if v == Value::Null { return false; }
+            compare_values(&v, value) != std::cmp::Ordering::Greater
         }),
         Predicate::In(field, values) => {
-            row.get(field).map_or(false, |v| values.contains(&Value::from_json(v)))
+            row.get(field).map_or(false, |v| {
+                let v = Value::from_json(v);
+                if v == Value::Null { false } else { values.contains(&v) }
+            })
         }
         Predicate::Like(field, pattern, ci) => row.get(field).map_or(false, |v| match v {
             serde_json::Value::String(s) => like_match(s, pattern, *ci),
