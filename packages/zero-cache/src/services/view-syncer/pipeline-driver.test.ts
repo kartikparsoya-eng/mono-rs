@@ -128,6 +128,9 @@ describe('view-syncer/pipeline-driver', () => {
 
       INSERT INTO "issueLabels" (issueID, labelID, legacyID, _0_version) VALUES ('1', '1', '1-1', '123');
       INSERT INTO "labels" (id, name, _0_version) VALUES ('1', 'bug', '123');
+      INSERT INTO "labels" (id, name, _0_version) VALUES ('2', 'Bug', '123');
+      INSERT INTO "labels" (id, name, _0_version) VALUES ('3', 'FEATURE', '123');
+      INSERT INTO "labels" (id, name, _0_version) VALUES ('4', 'feature', '123');
 
       CREATE TABLE uniques (
         id "TEXT|NOT_NULL",
@@ -2466,6 +2469,113 @@ describe('view-syncer/pipeline-driver', () => {
         ]),
       );
     });
+  });
+
+  test('LIKE is case-sensitive, ILIKE is case-insensitive', () => {
+    pipelines.init(clientSchema);
+
+    const LABELS_LIKE: AST = {
+      table: 'labels',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'simple',
+        left: {type: 'column', name: 'name'},
+        op: 'LIKE',
+        right: {type: 'literal', value: '%bug%'},
+      },
+    };
+
+    const likeResult = [
+      ...pipelines.addQuery(
+        'hash-like',
+        'queryLike',
+        LABELS_LIKE,
+        startTimer(),
+      ),
+    ];
+
+    // SQLite LIKE is case-insensitive for ASCII by default,
+    // so both 'bug' (id 1) and 'Bug' (id 2) match.
+    expect(likeResult.filter(r => r.table === 'labels')).toHaveLength(2);
+    expect(likeResult).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: 'labels',
+          type: 0,
+          rowKey: {id: '1'},
+        }),
+        expect.objectContaining({
+          table: 'labels',
+          type: 0,
+          rowKey: {id: '2'},
+        }),
+      ]),
+    );
+
+    const LABELS_ILIKE: AST = {
+      table: 'labels',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'simple',
+        left: {type: 'column', name: 'name'},
+        op: 'ILIKE',
+        right: {type: 'literal', value: '%bug%'},
+      },
+    };
+
+    const ilikeResult = [
+      ...pipelines.addQuery(
+        'hash-ilike',
+        'queryIlike',
+        LABELS_ILIKE,
+        startTimer(),
+      ),
+    ];
+
+    // Both 'bug' and 'Bug' match case-insensitive ILIKE
+    expect(ilikeResult.filter(r => r.table === 'labels')).toHaveLength(2);
+    expect(ilikeResult).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: 'labels',
+          type: 0,
+          rowKey: {id: '1'},
+        }),
+        expect.objectContaining({
+          table: 'labels',
+          type: 0,
+          rowKey: {id: '2'},
+        }),
+      ]),
+    );
+  });
+
+  test('literal-literal comparison with != (always true)', () => {
+    pipelines.init(clientSchema);
+
+    // WHERE 1 != 0 — always true, should return all issues
+    const AST_LITERAL: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'simple',
+        left: {type: 'literal', value: 1},
+        op: '!=',
+        right: {type: 'literal', value: 0},
+      },
+    };
+
+    const result = [
+      ...pipelines.addQuery(
+        'hash-literal',
+        'queryLiteral',
+        AST_LITERAL,
+        startTimer(),
+      ),
+    ];
+
+    // All 3 issues should be returned (1!=0 is always true)
+    expect(result.filter(r => r.table === 'issues')).toHaveLength(3);
   });
 
   describe('NOT EXISTS advance', () => {

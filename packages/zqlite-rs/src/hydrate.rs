@@ -400,6 +400,7 @@ pub struct ParallelExistsOperator {
     child_key: Vec<String>,
     relationship_name: String,
     child_table_name: String,
+    or_predicate: Option<zero_ivm_rs::filter::Predicate>,
 }
 
 impl ParallelExistsOperator {
@@ -411,6 +412,7 @@ impl ParallelExistsOperator {
         parent_key: Vec<String>,
         child_key: Vec<String>,
         relationship_name: String,
+        or_predicate: Option<zero_ivm_rs::filter::Predicate>,
     ) -> Self {
         // Extract the actual child table name from the Source config
         let child_table_name = child_config.first().and_then(|c| match c {
@@ -426,6 +428,15 @@ impl ParallelExistsOperator {
             child_key,
             relationship_name,
             child_table_name,
+            or_predicate,
+        }
+    }
+
+    fn or_condition_matches(&self, row: &serde_json::Map<String, serde_json::Value>) -> bool {
+        if let Some(ref pred) = self.or_predicate {
+            zero_ivm_rs::filter::evaluate_json_row(pred, row)
+        } else {
+            false
         }
     }
 }
@@ -453,6 +464,7 @@ impl Operator for ParallelExistsOperator {
         parent_nodes
             .into_iter()
             .filter_map(|mut node| {
+                let or_matches = self.or_condition_matches(&node.row);
                 let (count, children) = if !parent_key.is_empty() {
                     let pk0 = &parent_key[0];
                     let group_key = node.row.get(pk0)
@@ -480,7 +492,7 @@ impl Operator for ParallelExistsOperator {
                     (0, vec![])
                 };
                 let passes = if not_exists { count == 0 } else { count > 0 };
-                if passes {
+                if passes || or_matches {
                     // Attach exists children as a relationship so they get
                     // flattened into RowChanges (matching TS behavior).
                     node.relationships.insert(rel_name.clone(), children);
@@ -498,6 +510,147 @@ impl Operator for ParallelExistsOperator {
 
     fn op_type(&self) -> &'static str {
         "parallel_exists"
+    }
+}
+
+/// A parallel Or-Exists operator: passes a parent row if ANY branch's exists check passes,
+/// or if the or_condition (simple predicates) matches. This implements OR semantics across
+/// multiple correlated subqueries: OR(CSQ1, CSQ2, ..., simple_conditions).
+pub struct ParallelOrExistsOperator {
+    input: Box<dyn Operator>,
+    branches: Vec<OrExistsBranch>,
+    source: Arc<RustTableSource>,
+    or_predicate: Option<zero_ivm_rs::filter::Predicate>,
+}
+
+struct OrExistsBranch {
+    child_config: Vec<OperatorConfig>,
+    not_exists: bool,
+    parent_key: Vec<String>,
+    child_key: Vec<String>,
+    relationship_name: String,
+    child_table_name: String,
+}
+
+impl ParallelOrExistsOperator {
+    pub fn new(
+        input: Box<dyn Operator>,
+        branches: Vec<zero_ivm_rs::pipeline::ExistsBranch>,
+        source: Arc<RustTableSource>,
+        or_predicate: Option<zero_ivm_rs::filter::Predicate>,
+    ) -> Self {
+        let branches = branches
+            .into_iter()
+            .map(|b| {
+                let child_table_name = b.child.first().and_then(|c| match c {
+                    OperatorConfig::Source { table_name, .. } => Some(table_name.clone()),
+                    _ => None,
+                }).unwrap_or_else(|| b.relationship_name.clone());
+                OrExistsBranch {
+                    child_config: b.child,
+                    not_exists: b.not_exists,
+                    parent_key: b.parent_key,
+                    child_key: b.child_key,
+                    relationship_name: b.relationship_name,
+                    child_table_name,
+                }
+            })
+            .collect();
+        Self { input, branches, source, or_predicate }
+    }
+
+    fn or_condition_matches(&self, row: &serde_json::Map<String, serde_json::Value>) -> bool {
+        if let Some(ref pred) = self.or_predicate {
+            zero_ivm_rs::filter::evaluate_json_row(pred, row)
+        } else {
+            false
+        }
+    }
+}
+
+unsafe impl Send for ParallelOrExistsOperator {}
+
+impl Operator for ParallelOrExistsOperator {
+    fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        let parent_nodes = self.input.fetch(req);
+
+        // Batch fetch children for ALL parent nodes, once per branch
+        let branch_groups: Vec<HashMap<String, Vec<Node>>> = self.branches.iter()
+            .map(|branch| {
+                batch_fetch_children(
+                    &self.source,
+                    &branch.child_config,
+                    &branch.parent_key,
+                    &branch.child_key,
+                    &parent_nodes,
+                )
+            })
+            .collect();
+
+        parent_nodes
+            .into_iter()
+            .filter_map(|mut node| {
+                // Short-circuit: if simple or_condition matches, pass through
+                // but still need to check all branches for relationship attachment
+                let or_match = self.or_condition_matches(&node.row);
+
+                // Check ALL branches — attach relationships from every matching branch.
+                // Pass the parent row if ANY branch's exists check passes (OR semantics)
+                // or if the or_condition matched.
+                let mut any_branch_passed = false;
+                for (bi, branch) in self.branches.iter().enumerate() {
+                    let grouped = &branch_groups[bi];
+
+                    let (count, children) = if !branch.parent_key.is_empty() {
+                        let pk0 = &branch.parent_key[0];
+                        let group_key = node.row.get(pk0)
+                            .map(value_to_group_key)
+                            .unwrap_or_else(|| "null".to_string());
+                        let fetched = grouped.get(&group_key);
+                        if branch.parent_key.len() > 1 {
+                            use zero_ivm_rs::filter::{Value, compare_values};
+                            let filtered: Vec<Node> = fetched.map(|cs| cs.iter().filter(|cn| {
+                                branch.parent_key.iter().zip(branch.child_key.iter()).all(|(pk, ck)| {
+                                    let pv = node.row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
+                                    let cv = cn.row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+                                    !matches!(pv, Value::Null) && !matches!(cv, Value::Null)
+                                        && compare_values(&pv, &cv) == std::cmp::Ordering::Equal
+                                })
+                            }).cloned().collect()).unwrap_or_default();
+                            let c = filtered.len();
+                            (c, filtered)
+                        } else {
+                            let cs = fetched.cloned().unwrap_or_default();
+                            let c = cs.len();
+                            (c, cs)
+                        }
+                    } else {
+                        (0, vec![])
+                    };
+
+                    let passes = if branch.not_exists { count == 0 } else { count > 0 };
+                    if passes {
+                        any_branch_passed = true;
+                    }
+                    // Always attach children as relationship (matching TS behavior)
+                    node.relationships.insert(branch.child_table_name.clone(), children);
+                }
+
+                if any_branch_passed || or_match {
+                    Some(node)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn push(&mut self, _change: Change) -> Vec<Change> {
+        vec![]
+    }
+
+    fn op_type(&self) -> &'static str {
+        "parallel_or_exists"
     }
 }
 
@@ -614,7 +767,11 @@ fn parse_predicate_json(value: &serde_json::Value) -> Result<zero_ivm_rs::filter
         }
         if let Some(val) = obj.get("like") {
             let pattern = val.as_str().ok_or("'like' value must be a string")?.to_string();
-            return Ok(Predicate::Like(field, pattern));
+            return Ok(Predicate::Like(field, pattern, true));
+        }
+        if let Some(val) = obj.get("ilike") {
+            let pattern = val.as_str().ok_or("'ilike' value must be a string")?.to_string();
+            return Ok(Predicate::Like(field, pattern, true));
         }
         if let Some(val) = obj.get("isNull") {
             if val.as_bool().unwrap_or(false) {
@@ -722,8 +879,13 @@ fn build_next_operator(
             parent_key,
             child_key,
             child,
-            ..
+            or_condition,
         } => {
+            let or_pred = if let Some(oc) = or_condition {
+                Some(parse_predicate_json(oc)?)
+            } else {
+                None
+            };
             Ok(Box::new(ParallelExistsOperator::new(
                 input,
                 child.clone(),
@@ -732,6 +894,23 @@ fn build_next_operator(
                 parent_key.clone(),
                 child_key.clone(),
                 relationship_name.clone(),
+                or_pred,
+            )))
+        }
+        OperatorConfig::OrExists {
+            branches,
+            or_condition,
+        } => {
+            let or_pred = if let Some(oc) = or_condition {
+                Some(parse_predicate_json(oc)?)
+            } else {
+                None
+            };
+            Ok(Box::new(ParallelOrExistsOperator::new(
+                input,
+                branches.clone(),
+                source,
+                or_pred,
             )))
         }
         OperatorConfig::Skip {
@@ -903,6 +1082,9 @@ fn build_push_next_operator(
                 parent_key.clone(),
                 child_key.clone(),
             )))
+        }
+        OperatorConfig::OrExists { .. } => {
+            Err("OrExists not supported in push path".to_string())
         }
         OperatorConfig::Skip {
             bound_row,

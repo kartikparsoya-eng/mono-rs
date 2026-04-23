@@ -100,7 +100,7 @@ enum Predicate {
     Lt(String, Value),
     Lte(String, Value),
     In(String, Vec<Value>),
-    Like(String, String),
+    Like(String, String, bool),
     IsNull(String),
     IsNotNull(String),
     And(Vec<Predicate>),
@@ -146,7 +146,12 @@ impl Predicate {
             "like" => {
                 let field = obj.get("field")?.as_str()?.to_string();
                 let pattern = obj.get("value")?.as_str()?.to_string();
-                Some(Predicate::Like(field, pattern))
+                Some(Predicate::Like(field, pattern, false))
+            }
+            "ilike" => {
+                let field = obj.get("field")?.as_str()?.to_string();
+                let pattern = obj.get("value")?.as_str()?.to_string();
+                Some(Predicate::Like(field, pattern, true))
             }
             "isNull" => Some(Predicate::IsNull(obj.get("field")?.as_str()?.to_string())),
             "isNotNull" => Some(Predicate::IsNotNull(obj.get("field")?.as_str()?.to_string())),
@@ -204,7 +209,11 @@ impl Predicate {
                 }
                 if ast_op == "LIKE" {
                     let pattern = right.get("value")?.as_str()?.to_string();
-                    return Some(Predicate::Like(field, pattern));
+                    return Some(Predicate::Like(field, pattern, false));
+                }
+                if ast_op == "ILIKE" {
+                    let pattern = right.get("value")?.as_str()?.to_string();
+                    return Some(Predicate::Like(field, pattern, true));
                 }
 
                 let value = Value::from_json(right.get("value")?);
@@ -266,8 +275,8 @@ fn evaluate_predicate(predicate: &Predicate, row: &Row) -> bool {
         Predicate::In(field, values) => {
             row.get(field).map_or(false, |v| values.contains(&Value::from_json(v)))
         }
-        Predicate::Like(field, pattern) => row.get(field).map_or(false, |v| match v {
-            serde_json::Value::String(s) => like_match(s, pattern),
+        Predicate::Like(field, pattern, ci) => row.get(field).map_or(false, |v| match v {
+            serde_json::Value::String(s) => like_match(s, pattern, *ci),
             _ => false,
         }),
         Predicate::IsNull(field) => {
@@ -295,15 +304,15 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-fn like_match(text: &str, pattern: &str) -> bool {
+fn like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
     let text_chars: Vec<char> = text.chars().collect();
     let pattern_chars: Vec<char> = pattern.chars().collect();
-    like_match_impl(&text_chars, &pattern_chars, 0, 0)
+    like_match_impl(&text_chars, &pattern_chars, 0, 0, case_insensitive)
 }
 
 /// Iterative two-pointer LIKE matching — O(N*M) worst case.
 /// Tracks the last '%' position to backtrack greedily instead of recursing.
-fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize) -> bool {
+fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize, case_insensitive: bool) -> bool {
     let (tlen, plen) = (text.len(), pattern.len());
     let mut star_pi: Option<usize> = None; // pattern index after last '%'
     let mut star_ti: usize = 0; // text index when we matched last '%'
@@ -322,8 +331,11 @@ fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize
                     pi += 1;
                     continue;
                 }
-                c if ti < tlen
-                    && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() =>
+                c if ti < tlen && if case_insensitive {
+                    text[ti].to_ascii_lowercase() == c.to_ascii_lowercase()
+                } else {
+                    text[ti] == c
+                } =>
                 {
                     ti += 1;
                     pi += 1;

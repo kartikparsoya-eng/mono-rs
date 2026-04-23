@@ -39,7 +39,7 @@ pub enum Predicate {
     Lt(String, Value),
     Lte(String, Value),
     In(String, Vec<Value>),
-    Like(String, String),
+    Like(String, String, bool),
     IsNull(String),
     IsNotNull(String),
     And(Vec<Predicate>),
@@ -87,14 +87,15 @@ impl Predicate {
                     .collect();
                 Ok(Predicate::In(field, values))
             }
-            "like" => {
+            "like" | "ilike" => {
+                let case_insensitive = op == "ilike";
                 let field = get_field(obj)?;
                 let pattern = obj
                     .get("value")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| Error::from_reason("'like' predicate must have string 'value'"))?
                     .to_string();
-                Ok(Predicate::Like(field, pattern))
+                Ok(Predicate::Like(field, pattern, case_insensitive))
             }
             "isNull" => Ok(Predicate::IsNull(get_field(obj)?)),
             "isNotNull" => Ok(Predicate::IsNotNull(get_field(obj)?)),
@@ -192,9 +193,9 @@ pub fn evaluate(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
             if *v == Value::Null { return false; }
             values.contains(v)
         }),
-        Predicate::Like(field, pattern) => {
+        Predicate::Like(field, pattern, ci) => {
             row.get(field).map_or(false, |v| match v {
-                Value::String(s) => like_match(s, pattern),
+                Value::String(s) => like_match(s, pattern, *ci),
                 _ => false,
             })
         }
@@ -226,7 +227,7 @@ fn is_null_for_row(predicate: &Predicate, row: &HashMap<String, Value>) -> bool 
         | Predicate::Lt(f, _)
         | Predicate::Lte(f, _)
         | Predicate::In(f, _)
-        | Predicate::Like(f, _) => {
+        | Predicate::Like(f, _, _) => {
             matches!(row.get(f), None | Some(Value::Null))
         }
         Predicate::IsNull(_) | Predicate::IsNotNull(_) => false,
@@ -260,15 +261,15 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 /// SQL LIKE pattern matching. % matches any sequence, _ matches any single char.
-pub fn like_match(text: &str, pattern: &str) -> bool {
+pub fn like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
     let text_chars: Vec<char> = text.chars().collect();
     let pattern_chars: Vec<char> = pattern.chars().collect();
-    like_match_impl(&text_chars, &pattern_chars, 0, 0)
+    like_match_impl(&text_chars, &pattern_chars, 0, 0, case_insensitive)
 }
 
 /// Iterative two-pointer LIKE matching — O(N*M) worst case.
 /// Tracks the last '%' position to backtrack greedily instead of recursing.
-fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize) -> bool {
+fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize, case_insensitive: bool) -> bool {
     let (tlen, plen) = (text.len(), pattern.len());
     let mut star_pi: Option<usize> = None; // pattern index after last '%'
     let mut star_ti: usize = 0; // text index when we matched last '%'
@@ -287,8 +288,11 @@ fn like_match_impl(text: &[char], pattern: &[char], mut ti: usize, mut pi: usize
                     pi += 1;
                     continue;
                 }
-                c if ti < tlen
-                    && text[ti].to_ascii_lowercase() == c.to_ascii_lowercase() =>
+                c if ti < tlen && if case_insensitive {
+                    text[ti].to_ascii_lowercase() == c.to_ascii_lowercase()
+                } else {
+                    text[ti] == c
+                } =>
                 {
                     ti += 1;
                     pi += 1;
@@ -370,7 +374,7 @@ impl RustFilterPredicate {
             | Predicate::Lt(f, _)
             | Predicate::Lte(f, _)
             | Predicate::In(f, _)
-            | Predicate::Like(f, _)
+            | Predicate::Like(f, _, _)
             | Predicate::IsNull(f)
             | Predicate::IsNotNull(f) => {
                 fields.push(f.clone());
@@ -697,15 +701,26 @@ mod tests {
 
     #[test]
     fn test_like_pattern() {
-        assert!(like_match("hello world", "%world"));
-        assert!(like_match("hello world", "hello%"));
-        assert!(like_match("hello world", "%lo wo%"));
-        assert!(like_match("hello world", "hello_world"));
-        assert!(!like_match("hello world", "hello_worlds"));
-        assert!(like_match("abc", "a_c"));
-        assert!(!like_match("abbc", "a_c"));
-        assert!(like_match("", "%"));
-        assert!(!like_match("", "_"));
+        // Case-sensitive (LIKE)
+        assert!(like_match("hello world", "%world", false));
+        assert!(like_match("hello world", "hello%", false));
+        assert!(like_match("hello world", "%lo wo%", false));
+        assert!(like_match("hello world", "hello_world", false));
+        assert!(!like_match("hello world", "hello_worlds", false));
+        assert!(like_match("abc", "a_c", false));
+        assert!(!like_match("abbc", "a_c", false));
+        assert!(like_match("", "%", false));
+        assert!(!like_match("", "_", false));
+
+        // Case-sensitive: must respect case
+        assert!(!like_match("Hello", "hello", false));
+        assert!(!like_match("ABC", "abc", false));
+        assert!(like_match("ABC", "ABC", false));
+
+        // Case-insensitive (ILIKE)
+        assert!(like_match("Hello", "hello", true));
+        assert!(like_match("ABC", "abc", true));
+        assert!(like_match("Hello World", "%world", true));
     }
 
     #[test]

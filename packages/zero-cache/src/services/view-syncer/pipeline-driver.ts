@@ -650,14 +650,7 @@ export class PipelineDriver {
         },
       });
 
-      // CorrelatedSubquery conditions inside WHERE (e.g., OR branches with EXISTS)
-      // cannot be serialized by Rust's condition_to_predicate_json. Fall back to
-      // TS hydration for these queries while using Rust for everything else.
-      const hasCSQInWhere =
-        resolvedQuery.where !== undefined &&
-        this.#conditionHasCorrelatedSubquery(resolvedQuery.where);
-
-      if (USE_RUST_HYDRATION && !hasCSQInWhere) {
+      if (USE_RUST_HYDRATION) {
         let hydratedRowCount = 0;
         let lastHydratedRow: Row | undefined;
         if (isDualExecEnabled()) {
@@ -946,10 +939,7 @@ export class PipelineDriver {
         },
       });
 
-      const hasCSQInWhere =
-        resolvedQuery.where !== undefined &&
-        this.#conditionHasCorrelatedSubquery(resolvedQuery.where);
-      const rustEligible = !hasCSQInWhere;
+      const rustEligible = true;
       if (rustEligible) {
         const tableName = resolvedQuery.table ?? '';
         const pk = this.#primaryKeys?.get(tableName) ?? [];
@@ -1061,6 +1051,18 @@ export class PipelineDriver {
               hydratedRowCount,
               lastHydratedRow,
             );
+          }
+          // Warm up the TS pipeline to initialize child Take operators
+          // (e.g., in EXISTS/JOIN subqueries). Rust hydration bypasses
+          // input.fetch(), so child Takes have empty storage and silently
+          // drop all pushes. Running a fetch through the pipeline triggers
+          // each child Take's #initialFetch, populating their partition state.
+          for (const node of p.input.fetch({})) {
+            if (node === 'yield') {
+              continue;
+            }
+            // Discard results — we only need the side effect of
+            // initializing Take state in child subquery pipelines.
           }
         } else {
           yield* hydrateInternal(

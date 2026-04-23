@@ -91,6 +91,13 @@ describe('pipeline-driver NOT EXISTS', () => {
       INSERT INTO parents (id, name, _0_version) VALUES ('p3', 'Carol', '123');
       INSERT INTO children (id, "parentID", active, _0_version) VALUES ('c1', 'p1', 1, '123');
       INSERT INTO children (id, "parentID", active, _0_version) VALUES ('c2', 'p2', 0, '123');
+
+      CREATE TABLE pets (
+        id TEXT PRIMARY KEY,
+        "ownerID" TEXT,
+        _0_version TEXT NOT NULL
+      );
+      INSERT INTO pets (id, "ownerID", _0_version) VALUES ('pet1', 'p1', '123');
     `);
 
     populateFromExistingTables(db, listTables(db, false));
@@ -107,8 +114,11 @@ describe('pipeline-driver NOT EXISTS', () => {
   const children = table('children')
     .columns({id: string(), parentID: string(), active: boolean()})
     .primaryKey('id');
+  const pets = table('pets')
+    .columns({id: string(), ownerID: string()})
+    .primaryKey('id');
 
-  const clientSchema = createSchema({tables: [parents, children]});
+  const clientSchema = createSchema({tables: [parents, children, pets]});
 
   const PARENTS_WITHOUT_CHILDREN: AST = {
     table: 'parents',
@@ -273,5 +283,276 @@ describe('pipeline-driver NOT EXISTS', () => {
     // No overlap
     const overlap = existsParents.filter(id => notExistsParents.includes(id));
     expect(overlap).toHaveLength(0);
+  });
+
+  // Test for OR(simple, AND(simple, EXISTS(csq))) — the browsableChannels pattern.
+  // OR(name="Carol", AND(name="Alice", EXISTS(children)))
+  // Should match: p1 (Alice, has children), p3 (Carol, no children but name matches OR)
+  // Should NOT match: p2 (Bob, has children but name doesn't match either branch)
+  const OR_SIMPLE_AND_EXISTS: AST = {
+    table: 'parents',
+    orderBy: [['id', 'asc']],
+    where: {
+      type: 'or',
+      conditions: [
+        {
+          type: 'simple',
+          op: '=',
+          left: {type: 'column', name: 'name'},
+          right: {type: 'literal', value: 'Carol'},
+        },
+        {
+          type: 'and',
+          conditions: [
+            {
+              type: 'simple',
+              op: '=',
+              left: {type: 'column', name: 'name'},
+              right: {type: 'literal', value: 'Alice'},
+            },
+            {
+              type: 'correlatedSubquery',
+              op: 'EXISTS',
+              related: {
+                system: 'client',
+                correlation: {
+                  parentField: ['id'],
+                  childField: ['parentID'],
+                },
+                subquery: {
+                  table: 'children',
+                  alias: 'children',
+                  orderBy: [['id', 'asc']],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  test('OR(simple, AND(simple, EXISTS)) — browsableChannels pattern', () => {
+    pipelines.init(clientSchema);
+    const hydration = [
+      ...pipelines.addQuery(
+        'hash-or-and',
+        'qOrAnd',
+        OR_SIMPLE_AND_EXISTS,
+        startTimer(),
+      ),
+    ];
+
+    const parentRows = hydration
+      .filter(r => r.table === 'parents')
+      .map(r => r.row.id)
+      .sort();
+    // p1 (Alice + has children), p3 (Carol via simple branch)
+    expect(parentRows).toEqual(['p1', 'p3']);
+  });
+
+  // Test for OR(simple, AND(EXISTS(csq1), EXISTS(csq2))) — multiple CSQs in AND inside OR.
+  // OR(name="Carol", AND(EXISTS(children), EXISTS(pets)))
+  // p1 (Alice): has children + has pets → AND branch passes
+  // p2 (Bob):   has children + no pets  → AND branch fails, name≠Carol → fail
+  // p3 (Carol): no children + no pets   → AND branch fails, name=Carol → pass
+  const OR_SIMPLE_AND_MULTI_CSQ: AST = {
+    table: 'parents',
+    orderBy: [['id', 'asc']],
+    where: {
+      type: 'or',
+      conditions: [
+        {
+          type: 'simple',
+          op: '=',
+          left: {type: 'column', name: 'name'},
+          right: {type: 'literal', value: 'Carol'},
+        },
+        {
+          type: 'and',
+          conditions: [
+            {
+              type: 'correlatedSubquery',
+              op: 'EXISTS',
+              related: {
+                system: 'client',
+                correlation: {
+                  parentField: ['id'],
+                  childField: ['parentID'],
+                },
+                subquery: {
+                  table: 'children',
+                  alias: 'children',
+                  orderBy: [['id', 'asc']],
+                },
+              },
+            },
+            {
+              type: 'correlatedSubquery',
+              op: 'EXISTS',
+              related: {
+                system: 'client',
+                correlation: {
+                  parentField: ['id'],
+                  childField: ['ownerID'],
+                },
+                subquery: {
+                  table: 'pets',
+                  alias: 'pets',
+                  orderBy: [['id', 'asc']],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  // Test for OR(EXISTS(children), EXISTS(pets)) — pure OR of two CSQs, no simple conditions.
+  // p1 (Alice): has children + has pets → passes (either branch)
+  // p2 (Bob):   has children + no pets  → passes (first branch)
+  // p3 (Carol): no children + no pets   → fails both branches
+  const OR_CSQ1_CSQ2: AST = {
+    table: 'parents',
+    orderBy: [['id', 'asc']],
+    where: {
+      type: 'or',
+      conditions: [
+        {
+          type: 'correlatedSubquery',
+          op: 'EXISTS',
+          related: {
+            system: 'client',
+            correlation: {
+              parentField: ['id'],
+              childField: ['parentID'],
+            },
+            subquery: {
+              table: 'children',
+              alias: 'children',
+              orderBy: [['id', 'asc']],
+            },
+          },
+        },
+        {
+          type: 'correlatedSubquery',
+          op: 'EXISTS',
+          related: {
+            system: 'client',
+            correlation: {
+              parentField: ['id'],
+              childField: ['ownerID'],
+            },
+            subquery: {
+              table: 'pets',
+              alias: 'pets',
+              orderBy: [['id', 'asc']],
+            },
+          },
+        },
+      ],
+    },
+  };
+
+  test('OR(EXISTS(children), EXISTS(pets)) — pure OR of two CSQs', () => {
+    pipelines.init(clientSchema);
+    const hydration = [
+      ...pipelines.addQuery(
+        'hash-or-csqs',
+        'qOrCsqs',
+        OR_CSQ1_CSQ2,
+        startTimer(),
+      ),
+    ];
+
+    const parentRows = hydration
+      .filter(r => r.table === 'parents')
+      .map(r => r.row.id)
+      .sort();
+    // p1 (has children + has pets), p2 (has children)
+    expect(parentRows).toEqual(['p1', 'p2']);
+  });
+
+  test('OR(simple, AND(EXISTS, EXISTS)) — multiple CSQs in AND', () => {
+    pipelines.init(clientSchema);
+    const hydration = [
+      ...pipelines.addQuery(
+        'hash-multi-csq',
+        'qMultiCsq',
+        OR_SIMPLE_AND_MULTI_CSQ,
+        startTimer(),
+      ),
+    ];
+
+    const parentRows = hydration
+      .filter(r => r.table === 'parents')
+      .map(r => r.row.id)
+      .sort();
+    // p1 (has children + has pets), p3 (Carol via simple branch)
+    expect(parentRows).toEqual(['p1', 'p3']);
+  });
+
+  // AST: OR(name='Carol', OR(name='Alice', NOT EXISTS(children)))
+  const OR_NESTED_OR_CSQ: AST = {
+    table: 'parents',
+    orderBy: [['id', 'asc']],
+    where: {
+      type: 'or',
+      conditions: [
+        {
+          type: 'simple',
+          left: {type: 'column', name: 'name'},
+          op: '=',
+          right: {type: 'literal', value: 'Carol'},
+        },
+        {
+          type: 'or',
+          conditions: [
+            {
+              type: 'simple',
+              left: {type: 'column', name: 'name'},
+              op: '=',
+              right: {type: 'literal', value: 'Alice'},
+            },
+            {
+              type: 'correlatedSubquery',
+              op: 'NOT EXISTS',
+              related: {
+                system: 'client',
+                correlation: {
+                  parentField: ['id'],
+                  childField: ['parentID'],
+                },
+                subquery: {
+                  table: 'children',
+                  alias: 'children',
+                  orderBy: [['id', 'asc']],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  test('OR(simple, OR(simple2, CSQ)) — nested OR with CSQ', () => {
+    pipelines.init(clientSchema);
+    const hydration = [
+      ...pipelines.addQuery(
+        'hash-nested-or',
+        'qNestedOr',
+        OR_NESTED_OR_CSQ,
+        startTimer(),
+      ),
+    ];
+
+    const parentRows = hydration
+      .filter(r => r.table === 'parents')
+      .map(r => r.row.id)
+      .sort();
+    // p1 (Alice via inner simple), p3 (Carol via outer simple + NOT EXISTS)
+    expect(parentRows).toEqual(['p1', 'p3']);
   });
 });

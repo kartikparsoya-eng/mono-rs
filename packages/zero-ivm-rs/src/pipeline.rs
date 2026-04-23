@@ -16,6 +16,15 @@ use crate::types::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ExistsBranch {
+    pub relationship_name: String,
+    pub not_exists: bool,
+    pub parent_key: Vec<String>,
+    pub child_key: Vec<String>,
+    pub child: Vec<OperatorConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum OperatorConfig {
     #[serde(rename = "source")]
@@ -47,6 +56,12 @@ pub enum OperatorConfig {
         parent_key: Vec<String>,
         child_key: Vec<String>,
         child: Vec<OperatorConfig>,
+        #[serde(default)]
+        or_condition: Option<serde_json::Value>,
+    },
+    #[serde(rename = "or_exists")]
+    OrExists {
+        branches: Vec<ExistsBranch>,
         #[serde(default)]
         or_condition: Option<serde_json::Value>,
     },
@@ -262,6 +277,11 @@ pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn
                     exclusive: *exclusive,
                 };
                 Box::new(SkipOperator::new(input, bound, sort_specs))
+            }
+            OperatorConfig::OrExists { .. } => {
+                // OrExists is handled by the hydration path's ParallelOrExistsOperator.
+                // In the push path, this should not appear (TS handles advance).
+                return Err("OrExists not supported in push path".to_string());
             }
             OperatorConfig::Cap {
                 limit,
