@@ -71,3 +71,12 @@ next-env.d.ts
 reflect.config.json
 .reflect/
 bundle-sizes.json
+
+# Rust build artifacts
+**/target
+
+# Allow Docker build context through (overrides 'out' exclusion above)
+!.docker-ctx
+!.docker-ctx/**
+!packages/zqlite-rs
+!packages/zero-ivm-rs
