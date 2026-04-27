@@ -80,40 +80,9 @@ impl JoinOperator {
         }
     }
 
-    /// Fetch children, checking overlay first, then delegating to child.fetch().
-    fn fetch_children_with_overlay(
-        &mut self,
-        parent_row: &Row,
-        overlay: &HashMap<String, Vec<Node>>,
-    ) -> Vec<Node> {
-        let key = self.serialize_join_key(parent_row);
-        if let Some(nodes) = overlay.get(&key) {
-            return nodes.clone();
-        }
-        self.fetch_children(parent_row)
-    }
-
-    /// Serialize the join key values from a parent row for overlay lookup.
-    fn serialize_join_key(&self, row: &Row) -> String {
-        let vals: Vec<String> = self
-            .parent_key
-            .iter()
-            .map(|k| {
-                row.get(k)
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "null".to_string())
-            })
-            .collect();
-        vals.join("|")
-    }
-
-    /// Attach children to a node using overlay.
-    fn attach_children_with_overlay(
-        &mut self,
-        mut node: Node,
-        overlay: &HashMap<String, Vec<Node>>,
-    ) -> Node {
-        let children = self.fetch_children_with_overlay(&node.row, overlay);
+    /// Attach children to a node by fetching from child source.
+    fn attach_children(&mut self, mut node: Node) -> Node {
+        let children = self.fetch_children(&node.row);
         node.relationships
             .insert(self.relationship_name.clone(), children);
         node
@@ -147,29 +116,25 @@ impl Operator for JoinOperator {
     }
 
     fn push(&mut self, change: Change) -> Vec<Change> {
-        let overlay: HashMap<String, Vec<Node>> = HashMap::new();
-
         match change {
             Change::Add(node) => {
-                let node = self.attach_children_with_overlay(node, &overlay);
+                let node = self.attach_children(node);
                 vec![Change::Add(node)]
             }
             Change::Remove(node) => {
-                let node = self.attach_children_with_overlay(node, &overlay);
+                let node = self.attach_children(node);
                 vec![Change::Remove(node)]
             }
             Change::Edit { node, old_node } => {
                 if self.join_key_changed(&old_node.row, &node.row) {
-                    let old_with_children =
-                        self.attach_children_with_overlay(old_node, &overlay);
-                    let new_with_children =
-                        self.attach_children_with_overlay(node, &overlay);
+                    let old_with_children = self.attach_children(old_node);
+                    let new_with_children = self.attach_children(node);
                     vec![
                         Change::Remove(old_with_children),
                         Change::Add(new_with_children),
                     ]
                 } else {
-                    let children = self.fetch_children_with_overlay(&node.row, &overlay);
+                    let children = self.fetch_children(&node.row);
                     let rel_name = self.relationship_name.clone();
                     let mut new_node = node;
                     new_node
@@ -184,14 +149,11 @@ impl Operator for JoinOperator {
                 }
             }
             Change::Child { node, child } => {
-                let parent_with_rels =
-                    self.attach_children_with_overlay(node, &overlay);
+                // Preserve original child data (matches TS #pushParent CHILD case)
+                let parent_with_rels = self.attach_children(node);
                 vec![Change::Child {
                     node: parent_with_rels,
-                    child: ChildData {
-                        relationship_name: self.relationship_name.clone(),
-                        change: child.change,
-                    },
+                    child,
                 }]
             }
         }
@@ -337,7 +299,8 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type(), ChangeType::Child);
         if let Change::Child { ref child, .. } = result[0] {
-            assert_eq!(child.relationship_name, "items");
+            // Preserves original child data (not overwritten to join's rel name)
+            assert_eq!(child.relationship_name, "orig");
         } else {
             panic!("expected Child change");
         }
@@ -398,5 +361,140 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].change_type(), ChangeType::Remove);
         assert_eq!(result[1].change_type(), ChangeType::Add);
+    }
+
+    #[test]
+    fn test_join_push_child_preserves_relationship_name() {
+        // When a Child change comes from a nested relationship (not this join's),
+        // the original relationship_name must be preserved.
+        let children = vec![make_node(&[
+            ("parentId", serde_json::json!(1)),
+            ("val", serde_json::json!("c1")),
+        ])];
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: vec![] }),
+            Box::new(MockSource { nodes: children }),
+            vec!["id".into()],
+            vec!["parentId".into()],
+            "items".into(),
+        );
+
+        let parent = make_node(&[("id", serde_json::json!(1))]);
+        let inner_child = make_node(&[("nested_id", serde_json::json!(42))]);
+        let child_change = Change::Child {
+            node: parent,
+            child: ChildData {
+                relationship_name: "nested_rel".into(),
+                change: Box::new(Change::Add(inner_child)),
+            },
+        };
+
+        let result = op.push(child_change);
+        assert_eq!(result.len(), 1);
+        if let Change::Child { ref node, ref child } = result[0] {
+            // Join attaches its own children to the parent node
+            assert_eq!(node.relationships["items"].len(), 1);
+            // But preserves the original child data
+            assert_eq!(child.relationship_name, "nested_rel");
+        } else {
+            panic!("expected Child change");
+        }
+    }
+
+    #[test]
+    fn test_join_push_remove_attaches_children() {
+        let children = vec![make_node(&[
+            ("parentId", serde_json::json!(1)),
+            ("val", serde_json::json!("c1")),
+        ])];
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: vec![] }),
+            Box::new(MockSource { nodes: children }),
+            vec!["id".into()],
+            vec!["parentId".into()],
+            "children".into(),
+        );
+
+        let parent = make_node(&[
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Alice")),
+        ]);
+        let result = op.push(Change::Remove(parent));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].change_type(), ChangeType::Remove);
+        assert_eq!(result[0].node().relationships["children"].len(), 1);
+    }
+
+    #[test]
+    fn test_join_push_edit_same_key_shares_children() {
+        let children = vec![make_node(&[
+            ("parentId", serde_json::json!(1)),
+            ("val", serde_json::json!("c1")),
+        ])];
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: vec![] }),
+            Box::new(MockSource { nodes: children }),
+            vec!["id".into()],
+            vec!["parentId".into()],
+            "children".into(),
+        );
+
+        let old_node = make_node(&[
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("old")),
+        ]);
+        let new_node = make_node(&[
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("new")),
+        ]);
+        let result = op.push(Change::Edit {
+            node: new_node,
+            old_node,
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].change_type(), ChangeType::Edit);
+        if let Change::Edit { ref node, ref old_node } = result[0] {
+            // Both nodes share the same children (key didn't change)
+            assert_eq!(node.relationships["children"].len(), 1);
+            assert_eq!(old_node.relationships["children"].len(), 1);
+        } else {
+            panic!("expected Edit");
+        }
+    }
+
+    #[test]
+    fn test_join_compound_key_filters_correctly() {
+        let children = vec![
+            make_node(&[
+                ("a", serde_json::json!(1)),
+                ("b", serde_json::json!(2)),
+                ("val", serde_json::json!("match")),
+            ]),
+            make_node(&[
+                ("a", serde_json::json!(1)),
+                ("b", serde_json::json!(99)),
+                ("val", serde_json::json!("no_match")),
+            ]),
+        ];
+        let parents = vec![make_node(&[
+            ("x", serde_json::json!(1)),
+            ("y", serde_json::json!(2)),
+        ])];
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: parents }),
+            Box::new(MockSource { nodes: children }),
+            vec!["x".into(), "y".into()],
+            vec!["a".into(), "b".into()],
+            "items".into(),
+        );
+
+        let result = op.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 1);
+        // Only the child with a=1,b=2 should match
+        assert_eq!(result[0].relationships["items"].len(), 1);
+        assert_eq!(
+            result[0].relationships["items"][0].row.get("val").unwrap(),
+            &serde_json::json!("match")
+        );
     }
 }

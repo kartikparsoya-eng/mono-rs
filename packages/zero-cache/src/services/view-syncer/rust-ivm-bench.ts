@@ -61,25 +61,12 @@ const comments = table('comments')
 const clientSchema = createSchema({tables: [issues, comments]});
 
 // ─── Queries ─────────────────────────────────────────────────────────────────
+// Filter-only queries (no orderBy, limit, or related) so Rust advance
+// actually engages rust_fan_out / rust_dispatch_poke instead of falling
+// back to the TS IVM tree.
 const QUERY_TEMPLATES: AST[] = [
   {
     table: 'issues',
-    orderBy: [['id', 'desc']],
-    related: [
-      {
-        system: 'client',
-        correlation: {parentField: ['id'], childField: ['issueID']},
-        subquery: {
-          table: 'comments',
-          alias: 'comments',
-          orderBy: [['id', 'desc']],
-        },
-      },
-    ],
-  },
-  {
-    table: 'issues',
-    orderBy: [['id', 'asc']],
     where: {
       type: 'simple',
       left: {type: 'column', name: 'closed'},
@@ -89,12 +76,24 @@ const QUERY_TEMPLATES: AST[] = [
   },
   {
     table: 'issues',
-    orderBy: [['id', 'asc']],
-    limit: 10,
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'closed'},
+      op: '=',
+      right: {type: 'literal', value: true},
+    },
   },
   {
     table: 'comments',
-    orderBy: [['id', 'asc']],
+  },
+  {
+    table: 'comments',
+    where: {
+      type: 'simple',
+      left: {type: 'column', name: 'upvotes'},
+      op: '>',
+      right: {type: 'literal', value: 500},
+    },
   },
 ];
 

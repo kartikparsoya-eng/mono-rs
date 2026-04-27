@@ -125,6 +125,30 @@ impl ConnectionPool {
         let conns = self.connections.lock().map_err(|_| PoolError::Poisoned)?;
         Ok(conns.len())
     }
+
+    /// Re-opens all connections at a new database path. Each connection gets
+    /// a fresh `BEGIN DEFERRED` snapshot. All `PooledConnection` guards must
+    /// be dropped before calling this — checked via available count.
+    pub fn swap_path(&mut self, new_path: &str) -> Result<()> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI;
+
+        let mut conns = self.connections.lock().map_err(|_| PoolError::Poisoned)?;
+        if conns.len() != self.pool_size {
+            return Err(PoolError::Exhausted);
+        }
+        conns.clear();
+        for _ in 0..self.pool_size {
+            let conn = Connection::open_with_flags(new_path, flags)?;
+            conn.busy_timeout(Duration::from_millis(5000))?;
+            conn.execute_batch("BEGIN DEFERRED")?;
+            conns.push(conn);
+        }
+        drop(conns);
+        self.path = new_path.to_owned();
+        Ok(())
+    }
 }
 
 /// RAII guard that returns a connection to the pool on drop.

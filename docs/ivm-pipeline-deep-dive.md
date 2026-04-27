@@ -172,13 +172,13 @@ Vec<OperatorConfig> (Rust)         <-- used by rustHydrate + rustAdvance
 
 ### The delegate (`pipeline-driver.ts:596-642`)
 
-| Delegate method       | What it does                                                              |
-|-----------------------|---------------------------------------------------------------------------|
-| `getSource(table)`    | Lazily creates a `TableSource` backed by SQLite snapshot (line 601)       |
-| `createStorage()`     | Returns `RustTakeStorage` (if Rust IVM on) or TS `Storage` (line 602)    |
-| `decorateSourceInput` | Wraps source with `MeasurePushOperator` for metrics (line 612)           |
-| `decorateFilterInput` | Wraps EXISTS filters with `RustExistsWrapper` if enabled (line 621)      |
-| `costModel`           | `ConnectionCostModel` from SQLite stats, if planner enabled (line 641)   |
+| Delegate method       | What it does                                                           |
+| --------------------- | ---------------------------------------------------------------------- |
+| `getSource(table)`    | Lazily creates a `TableSource` backed by SQLite snapshot (line 601)    |
+| `createStorage()`     | Returns `RustTakeStorage` (if Rust IVM on) or TS `Storage` (line 602)  |
+| `decorateSourceInput` | Wraps source with `MeasurePushOperator` for metrics (line 612)         |
+| `decorateFilterInput` | Wraps EXISTS filters with `RustExistsWrapper` if enabled (line 621)    |
+| `costModel`           | `ConnectionCostModel` from SQLite stats, if planner enabled (line 641) |
 
 ### Rust eligibility check
 
@@ -246,6 +246,7 @@ Vec<Node> result
 ```
 
 **Key differences:**
+
 - Rust uses `ParallelJoinOperator` / `ParallelExistsOperator` — batch `WHERE IN`
   queries instead of per-row child fetches
 - Rust uses `LiveTableSource` which reads SQLite directly via a shared
@@ -410,6 +411,7 @@ Vec<DecodedRowChange> -> yield to ViewSyncer
 ```
 
 **Why Rust is 12x faster:**
+
 1. Rayon parallelism — multiple pipelines hydrate simultaneously on thread pool
 2. Direct SQLite access — no JS overhead, no generator/yield machinery
 3. Batch child fetches — `WHERE IN` instead of per-row correlated subqueries
@@ -599,6 +601,7 @@ Binary Buffer -> TS decode -> RowChanges
 ### When is Rust advance used? (`#reevaluateRustAdvance`, pipeline-driver.ts:1430)
 
 ALL of these must be true:
+
 1. `USE_RUST_ADVANCE` env flag is on
 2. At least one pipeline exists
 3. Every pipeline has a Rust config (no CSQ-in-WHERE queries)
@@ -769,14 +772,14 @@ Value encoding tags:
 
 ### Data serialization by path
 
-| Path | Input format | Output format | Notes |
-|------|-------------|---------------|-------|
-| `rustHydrate` | JSON string (queries) | Binary Buffer | Fastest; avoids JSON output overhead |
-| `rustFanOut` | JSON strings | JSON or Binary | Binary for dispatch_poke |
-| `rustAdvanceFull` | JSON strings | Binary Buffer | Full operator push |
-| `Pipeline.fetch/push` | JSON strings | JSON strings | Slower; used for testing/compat |
-| `RustFilterPredicate` | Direct JsObject | Direct JsObject | Fastest NAPI; raw field extraction |
-| `RustTakeState` | Direct JsObject | Direct JsObject | State management, row comparison |
+| Path                  | Input format          | Output format   | Notes                                |
+| --------------------- | --------------------- | --------------- | ------------------------------------ |
+| `rustHydrate`         | JSON string (queries) | Binary Buffer   | Fastest; avoids JSON output overhead |
+| `rustFanOut`          | JSON strings          | JSON or Binary  | Binary for dispatch_poke             |
+| `rustAdvanceFull`     | JSON strings          | Binary Buffer   | Full operator push                   |
+| `Pipeline.fetch/push` | JSON strings          | JSON strings    | Slower; used for testing/compat      |
+| `RustFilterPredicate` | Direct JsObject       | Direct JsObject | Fastest NAPI; raw field extraction   |
+| `RustTakeState`       | Direct JsObject       | Direct JsObject | State management, row comparison     |
 
 ---
 
@@ -1034,58 +1037,62 @@ Production use:   Yes — all queries               Limited — filter-only quer
 
 ### Operator implementation comparison
 
-| Operator | TS | Rust (pipeline) | Rust (NAPI helper) |
-|----------|----|-----------------|--------------------|
-| Source | `MemorySource` (BTree, overlay) | `SourceOperator` (in-memory Vec) | `LiveTableSource` (direct SQLite) |
-| Filter | `filter.ts` (stateless) | `filter_op.rs` (stateless) | `RustFilterPredicate` (raw JsObject batch) |
-| Join | `join.ts` (lazy child, overlay) | `join_op.rs` (sequential) | `ParallelJoinOperator` (batch WHERE IN) |
-| Exists | `exists.ts` (0<->1 detection) | `exists_op.rs` (parent_sizes HashMap) | `ParallelExistsOperator` (batch) |
-| Take | `take.ts` (Storage-backed) | `take_op.rs` (HashMap state) | `RustTakeState` (napi state manager) |
-| Skip | (in builder) | `skip_op.rs` (bound filter) | — |
-| Cap | (in builder) | `cap_op.rs` (PK tracking) | — |
+| Operator | TS                              | Rust (pipeline)                       | Rust (NAPI helper)                         |
+| -------- | ------------------------------- | ------------------------------------- | ------------------------------------------ |
+| Source   | `MemorySource` (BTree, overlay) | `SourceOperator` (in-memory Vec)      | `LiveTableSource` (direct SQLite)          |
+| Filter   | `filter.ts` (stateless)         | `filter_op.rs` (stateless)            | `RustFilterPredicate` (raw JsObject batch) |
+| Join     | `join.ts` (lazy child, overlay) | `join_op.rs` (sequential)             | `ParallelJoinOperator` (batch WHERE IN)    |
+| Exists   | `exists.ts` (0<->1 detection)   | `exists_op.rs` (parent_sizes HashMap) | `ParallelExistsOperator` (batch)           |
+| Take     | `take.ts` (Storage-backed)      | `take_op.rs` (HashMap state)          | `RustTakeState` (napi state manager)       |
+| Skip     | (in builder)                    | `skip_op.rs` (bound filter)           | —                                          |
+| Cap      | (in builder)                    | `cap_op.rs` (PK tracking)             | —                                          |
 
 ---
 
 ## 12. File Reference
 
 ### Pipeline orchestration
-| File | Key contents |
-|------|-------------|
-| `zero-cache/src/services/view-syncer/pipeline-driver.ts` | `PipelineDriver` class, `addQueries()`, `#advance()`, `#rustHydrate()`, `initializeTakeState()` |
-| `zero-cache/src/services/view-syncer/view-syncer.ts` | `ViewSyncer` — per-client lifecycle, `#syncQueryPipelineSet()`, advance loop |
-| `zero-cache/src/services/view-syncer/snapshotter.ts` | `Snapshotter` — SQLite snapshot pairs, diff computation |
-| `zero-cache/src/services/view-syncer/decode-advance-buf.ts` | `decodeAdvanceResultBuf()` — binary buffer decoding |
+
+| File                                                        | Key contents                                                                                    |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `zero-cache/src/services/view-syncer/pipeline-driver.ts`    | `PipelineDriver` class, `addQueries()`, `#advance()`, `#rustHydrate()`, `initializeTakeState()` |
+| `zero-cache/src/services/view-syncer/view-syncer.ts`        | `ViewSyncer` — per-client lifecycle, `#syncQueryPipelineSet()`, advance loop                    |
+| `zero-cache/src/services/view-syncer/snapshotter.ts`        | `Snapshotter` — SQLite snapshot pairs, diff computation                                         |
+| `zero-cache/src/services/view-syncer/decode-advance-buf.ts` | `decodeAdvanceResultBuf()` — binary buffer decoding                                             |
 
 ### TS IVM operators
-| File | Operator |
-|------|----------|
-| `zql/src/ivm/operator.ts` | `Input`, `Output`, `Operator`, `Storage` interfaces |
-| `zql/src/ivm/memory-source.ts` | `MemorySource` — BTree-backed table source with overlay |
-| `zql/src/ivm/take.ts` | `Take` — windowed LIMIT with bound management |
-| `zql/src/ivm/filter.ts` | `Filter` — stateless predicate |
-| `zql/src/ivm/join.ts` | `Join` — hierarchical parent-child with lazy streams |
-| `zql/src/ivm/exists.ts` | `Exists` — EXISTS/NOT EXISTS with 0<->1 transition |
-| `zql/src/ivm/filter-operators.ts` | `FilterStart`, `FilterEnd` — filter chain adapters |
+
+| File                              | Operator                                                |
+| --------------------------------- | ------------------------------------------------------- |
+| `zql/src/ivm/operator.ts`         | `Input`, `Output`, `Operator`, `Storage` interfaces     |
+| `zql/src/ivm/memory-source.ts`    | `MemorySource` — BTree-backed table source with overlay |
+| `zql/src/ivm/take.ts`             | `Take` — windowed LIMIT with bound management           |
+| `zql/src/ivm/filter.ts`           | `Filter` — stateless predicate                          |
+| `zql/src/ivm/join.ts`             | `Join` — hierarchical parent-child with lazy streams    |
+| `zql/src/ivm/exists.ts`           | `Exists` — EXISTS/NOT EXISTS with 0<->1 transition      |
+| `zql/src/ivm/filter-operators.ts` | `FilterStart`, `FilterEnd` — filter chain adapters      |
 
 ### Rust hydration & advance (zqlite-rs)
-| File | Key contents |
-|------|-------------|
-| `zqlite-rs/src/hydrate.rs` | `hydrate_pipelines()`, `build_operator_with_live_source()`, `LiveTableSource`, `ParallelJoinOperator`, `ParallelExistsOperator` |
-| `zqlite-rs/src/advance.rs` | `rust_hydrate()`, `rust_fan_out()`, `rust_dispatch_poke()`, `rust_advance_full()`, binary encoding, NAPI entry points |
-| `zqlite-rs/src/ast_to_config.rs` | `ast_to_operator_configs()` — AST to Rust operator config translation |
-| `zqlite-rs/src/query_builder.rs` | `build_select_query()` — SQL generation for SQLite |
+
+| File                             | Key contents                                                                                                                    |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `zqlite-rs/src/hydrate.rs`       | `hydrate_pipelines()`, `build_operator_with_live_source()`, `LiveTableSource`, `ParallelJoinOperator`, `ParallelExistsOperator` |
+| `zqlite-rs/src/advance.rs`       | `rust_hydrate()`, `rust_fan_out()`, `rust_dispatch_poke()`, `rust_advance_full()`, binary encoding, NAPI entry points           |
+| `zqlite-rs/src/ast_to_config.rs` | `ast_to_operator_configs()` — AST to Rust operator config translation                                                           |
+| `zqlite-rs/src/query_builder.rs` | `build_select_query()` — SQL generation for SQLite                                                                              |
 
 ### Rust IVM operators (zero-ivm-rs)
-| File | Operator |
-|------|----------|
-| `zero-ivm-rs/src/operator.rs` | `Operator` trait (`fetch`, `push`, `op_type`) |
-| `zero-ivm-rs/src/pipeline.rs` | `SourceOperator`, `build_operator()`, `Pipeline` napi class |
-| `zero-ivm-rs/src/filter.rs` | `RustFilterPredicate` napi class, `evaluate()`, `like_match()` |
-| `zero-ivm-rs/src/filter_op.rs` | `FilterOperator` (pipeline operator) |
-| `zero-ivm-rs/src/join_op.rs` | `JoinOperator` (sequential, for push path) |
-| `zero-ivm-rs/src/exists_op.rs` | `ExistsOperator` (with parent_sizes state) |
-| `zero-ivm-rs/src/take_op.rs` | `TakeOperator` (with HashMap state) |
-| `zero-ivm-rs/src/take_state.rs` | `RustTakeState` napi class (TS Take's state manager) |
-| `zero-ivm-rs/src/skip_op.rs` | `SkipOperator` (cursor-based pagination) |
-| `zero-ivm-rs/src/cap_op.rs` | `CapOperator` (PK-tracked limit) |
-| `zero-ivm-rs/src/storage.rs` | `RustStorage` napi class (HashMap key-value store) |
+
+| File                            | Operator                                                       |
+| ------------------------------- | -------------------------------------------------------------- |
+| `zero-ivm-rs/src/operator.rs`   | `Operator` trait (`fetch`, `push`, `op_type`)                  |
+| `zero-ivm-rs/src/pipeline.rs`   | `SourceOperator`, `build_operator()`, `Pipeline` napi class    |
+| `zero-ivm-rs/src/filter.rs`     | `RustFilterPredicate` napi class, `evaluate()`, `like_match()` |
+| `zero-ivm-rs/src/filter_op.rs`  | `FilterOperator` (pipeline operator)                           |
+| `zero-ivm-rs/src/join_op.rs`    | `JoinOperator` (sequential, for push path)                     |
+| `zero-ivm-rs/src/exists_op.rs`  | `ExistsOperator` (with parent_sizes state)                     |
+| `zero-ivm-rs/src/take_op.rs`    | `TakeOperator` (with HashMap state)                            |
+| `zero-ivm-rs/src/take_state.rs` | `RustTakeState` napi class (TS Take's state manager)           |
+| `zero-ivm-rs/src/skip_op.rs`    | `SkipOperator` (cursor-based pagination)                       |
+| `zero-ivm-rs/src/cap_op.rs`     | `CapOperator` (PK-tracked limit)                               |
+| `zero-ivm-rs/src/storage.rs`    | `RustStorage` napi class (HashMap key-value store)             |

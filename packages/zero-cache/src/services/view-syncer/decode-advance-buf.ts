@@ -39,10 +39,27 @@ export type DecodedRowChange = {
   type: string;
 };
 
+export type PipelineTimings = {
+  queryID: string;
+  buildUs: number;
+  warmupUs: number;
+  rewindUs: number;
+  pushUs: number;
+  dedupFilterUs: number;
+  totalUs: number;
+};
+
+export type AdvanceTimings = {
+  totalUs: number;
+  pipelineCount: number;
+  perPipeline: PipelineTimings[];
+};
+
 export type DecodedAdvanceResult = {
   changes: DecodedRowChange[];
   error?: string | undefined;
   error_type?: string | undefined;
+  timings?: AdvanceTimings | undefined;
 };
 
 export function decodeAdvanceResultBuf(buf: Buffer): DecodedAdvanceResult {
@@ -96,7 +113,44 @@ export function decodeAdvanceResultBuf(buf: Buffer): DecodedAdvanceResult {
     };
   }
 
-  return {changes, error, error_type: errorType};
+  // Check for timings trailer (flag bit 1)
+  const hasTimings = (flags & 2) !== 0;
+  let timings: AdvanceTimings | undefined;
+  if (hasTimings && offset < buf.byteLength) {
+    const totalUs = readU64(view, offset);
+    offset += 8;
+    const pipelineCount = view.getUint32(offset, true);
+    offset += 4;
+    const perPipeline: PipelineTimings[] = [];
+    for (let p = 0; p < pipelineCount; p++) {
+      let queryID: string;
+      [queryID, offset] = readStr(buf, view, offset);
+      const buildUs = readU64(view, offset);
+      offset += 8;
+      const warmupUs = readU64(view, offset);
+      offset += 8;
+      const rewindUs = readU64(view, offset);
+      offset += 8;
+      const pushUs = readU64(view, offset);
+      offset += 8;
+      const dedupFilterUs = readU64(view, offset);
+      offset += 8;
+      const pipelineTotalUs = readU64(view, offset);
+      offset += 8;
+      perPipeline.push({
+        queryID,
+        buildUs,
+        warmupUs,
+        rewindUs,
+        pushUs,
+        dedupFilterUs,
+        totalUs: pipelineTotalUs,
+      });
+    }
+    timings = {totalUs, pipelineCount, perPipeline};
+  }
+
+  return {changes, error, error_type: errorType, timings};
 }
 
 function readStr(
@@ -108,6 +162,12 @@ function readStr(
   offset += 2;
   const s = textDecoder.decode(buf.subarray(offset, offset + len));
   return [s, offset + len];
+}
+
+function readU64(view: DataView, offset: number): number {
+  const lo = view.getUint32(offset, true);
+  const hi = view.getUint32(offset + 4, true);
+  return hi * 0x100000000 + lo;
 }
 
 function readJsonValue(

@@ -8,9 +8,9 @@ When User A opens the app, their Zero client establishes a WebSocket to `zero-ca
 
 ```ts
 // User A's queries
-z.query.channels.where('visibility', '=', 'public')
-z.query.messages.where('channelId', '=', 'general').limit(50)
-z.query.participants.where('userId', '=', 'userA')
+z.query.channels.where('visibility', '=', 'public');
+z.query.messages.where('channelId', '=', 'general').limit(50);
+z.query.participants.where('userId', '=', 'userA');
 ```
 
 Each user gets their own **ViewSyncer** instance (`view-syncer.ts`) which owns a **PipelineDriver** (`pipeline-driver.ts`). The PipelineDriver calls `addQueries()` which triggers **hydration** — fetching the full initial result set from SQLite.
@@ -72,24 +72,26 @@ User B's PipelineDriver (watching `#random`): "No match" → no poke sent.
 ## Are hydration and advance independent?
 
 **Independent per-user:**
+
 - Each user has their own ViewSyncer, PipelineDriver, and IVM operator trees
 - Hydration is fully independent — User A's queries don't affect User B's
 - Advance evaluation is independent — each PipelineDriver checks its own pipelines
 
 **Shared across all users:**
+
 - The SQLite replica (single copy of the data)
 - The Snapshotter diff (computed once, consumed by all ViewSyncers)
 - `rust_dispatch_poke` — the optimization where Rust evaluates the diff against ALL ViewSyncers' filter pipelines in one batched Rayon call, instead of N separate calls
 
 ## Hydration vs Advance comparison
 
-| | Hydration | Advance |
-|---|---|---|
-| **When** | User connects or adds a query | PG transaction committed |
-| **What** | Full result set from scratch | Incremental delta (what changed?) |
-| **Rust coverage** | All operators (filter, join, take, exists) | Filter-only (joins/takes/exists fall back to TS) |
-| **Frequency** | Once per query subscription | Every PG write that touches subscribed tables |
-| **Hot path?** | Only at connection time | Yes — every mutation fans out to all connected users |
+|                   | Hydration                                  | Advance                                              |
+| ----------------- | ------------------------------------------ | ---------------------------------------------------- |
+| **When**          | User connects or adds a query              | PG transaction committed                             |
+| **What**          | Full result set from scratch               | Incremental delta (what changed?)                    |
+| **Rust coverage** | All operators (filter, join, take, exists) | Filter-only (joins/takes/exists fall back to TS)     |
+| **Frequency**     | Once per query subscription                | Every PG write that touches subscribed tables        |
+| **Hot path?**     | Only at connection time                    | Yes — every mutation fans out to all connected users |
 
 ## Why this matters at scale
 

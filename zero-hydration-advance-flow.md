@@ -4,12 +4,12 @@
 
 Zero's query pipeline has two phases:
 
-| | **Hydration** | **Advance** |
-|---|---|---|
-| **Purpose** | Build initial query result + operator state | Propagate row diffs incrementally |
-| **Model** | Pull-based (`fetch()`) | Push-based (`push()`) |
-| **TS path** | TS operator tree `fetch()` | TS operator tree `push()` |
-| **Rust path** | Separate Rust operator tree (parallel via Rayon) | Stateless filter-only fan-out |
+|               | **Hydration**                                    | **Advance**                       |
+| ------------- | ------------------------------------------------ | --------------------------------- |
+| **Purpose**   | Build initial query result + operator state      | Propagate row diffs incrementally |
+| **Model**     | Pull-based (`fetch()`)                           | Push-based (`push()`)             |
+| **TS path**   | TS operator tree `fetch()`                       | TS operator tree `push()`         |
+| **Rust path** | Separate Rust operator tree (parallel via Rayon) | Stateless filter-only fan-out     |
 
 Both hydration paths use real IVM operators — hydration is NOT a raw SQL bypass.
 
@@ -89,15 +89,15 @@ addQuery()
 
 ### Key Code Locations
 
-| Component | File | Lines |
-|---|---|---|
-| `hydrateInternal()` | `pipeline-driver.ts` | 2237-2250 |
-| `TableSource.fetch()` | `packages/zqlite/src/table-source.ts` | 81-120 |
-| `Filter.filter()` | `packages/zql/src/ivm/filter.ts` | 18-57 |
-| `Join.fetch()` | `packages/zql/src/ivm/join.ts` | 119-127 |
-| `Exists.filter()` | `packages/zql/src/ivm/exists.ts` | 80-99 |
-| `Take.fetch()` | `packages/zql/src/ivm/take.ts` | 93-156 |
-| `Take.#initialFetch()` | `packages/zql/src/ivm/take.ts` | 158-199 |
+| Component              | File                                  | Lines     |
+| ---------------------- | ------------------------------------- | --------- |
+| `hydrateInternal()`    | `pipeline-driver.ts`                  | 2237-2250 |
+| `TableSource.fetch()`  | `packages/zqlite/src/table-source.ts` | 81-120    |
+| `Filter.filter()`      | `packages/zql/src/ivm/filter.ts`      | 18-57     |
+| `Join.fetch()`         | `packages/zql/src/ivm/join.ts`        | 119-127   |
+| `Exists.filter()`      | `packages/zql/src/ivm/exists.ts`      | 80-99     |
+| `Take.fetch()`         | `packages/zql/src/ivm/take.ts`        | 93-156    |
+| `Take.#initialFetch()` | `packages/zql/src/ivm/take.ts`        | 158-199   |
 
 ### What Each Operator Does During fetch()
 
@@ -169,17 +169,17 @@ addQuery()
 
 ### Key Code Locations
 
-| Component | File |
-|---|---|
-| `rust_hydrate()` NAPI entry | `packages/zqlite-rs/src/advance.rs:1197-1309` |
-| `hydrate_pipelines()` | `packages/zqlite-rs/src/hydrate.rs:517-547` |
-| `LiveTableSource` | `packages/zqlite-rs/src/hydrate.rs:18-80` |
-| `FilterOperator` | `packages/zero-ivm-rs/src/filter_op.rs:29-36` |
-| `ParallelJoinOperator` | `packages/zqlite-rs/src/hydrate.rs:292-391` |
-| `ParallelExistsOperator` | `packages/zqlite-rs/src/hydrate.rs:394-502` |
-| `TakeOperator` | `packages/zero-ivm-rs/src/take_op.rs:53-87` |
-| `RustTableSource` (SQLite) | `packages/zqlite-rs/src/table_source.rs:55-97` |
-| `Operator` trait | `packages/zero-ivm-rs/src/operator.rs:1-13` |
+| Component                   | File                                           |
+| --------------------------- | ---------------------------------------------- |
+| `rust_hydrate()` NAPI entry | `packages/zqlite-rs/src/advance.rs:1197-1309`  |
+| `hydrate_pipelines()`       | `packages/zqlite-rs/src/hydrate.rs:517-547`    |
+| `LiveTableSource`           | `packages/zqlite-rs/src/hydrate.rs:18-80`      |
+| `FilterOperator`            | `packages/zero-ivm-rs/src/filter_op.rs:29-36`  |
+| `ParallelJoinOperator`      | `packages/zqlite-rs/src/hydrate.rs:292-391`    |
+| `ParallelExistsOperator`    | `packages/zqlite-rs/src/hydrate.rs:394-502`    |
+| `TakeOperator`              | `packages/zero-ivm-rs/src/take_op.rs:53-87`    |
+| `RustTableSource` (SQLite)  | `packages/zqlite-rs/src/table_source.rs:55-97` |
+| `Operator` trait            | `packages/zero-ivm-rs/src/operator.rs:1-13`    |
 
 ---
 
@@ -283,12 +283,12 @@ advance() called with new snapshot
 
 ### Push Operator Behaviors
 
-| Operator | Push Behavior |
-|---|---|
-| **Filter** | Evaluates predicate on old/new row. Edit where filter status changes → converted to add or remove |
-| **Exists** | Child add/remove: recounts relationship. If count crosses 0↔1, emits add/remove on parent |
-| **Join** | Parent change: attaches fetched children. Child change: wraps as CHILD change on matching parents |
-| **Take** | Checks if change is within window (row <= bound). May fetch next/prev rows to maintain `size <= limit`. Emits compensating changes |
+| Operator   | Push Behavior                                                                                                                      |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **Filter** | Evaluates predicate on old/new row. Edit where filter status changes → converted to add or remove                                  |
+| **Exists** | Child add/remove: recounts relationship. If count crosses 0↔1, emits add/remove on parent                                          |
+| **Join**   | Parent change: attaches fetched children. Child change: wraps as CHILD change on matching parents                                  |
+| **Take**   | Checks if change is within window (row <= bound). May fetch next/prev rows to maintain `size <= limit`. Emits compensating changes |
 
 ### Rust Advance Accelerators
 
@@ -359,13 +359,13 @@ TS Push Path with Rust Wrappers
 
 Rust hydration handles **all query types** except one edge case:
 
-| Query Feature | Rust Hydration? |
-|---|---|
-| Filters (WHERE clauses) | Yes |
-| Joins (`.related()`) | Yes — `ParallelJoinOperator` |
+| Query Feature                                | Rust Hydration?                |
+| -------------------------------------------- | ------------------------------ |
+| Filters (WHERE clauses)                      | Yes                            |
+| Joins (`.related()`)                         | Yes — `ParallelJoinOperator`   |
 | EXISTS/NOT EXISTS (as relationship includes) | Yes — `ParallelExistsOperator` |
-| LIMIT/TAKE | Yes — `TakeOperator` |
-| Correlated subqueries in WHERE | **No** — falls back to TS |
+| LIMIT/TAKE                                   | Yes — `TakeOperator`           |
+| Correlated subqueries in WHERE               | **No** — falls back to TS      |
 
 The sole exclusion: queries with `type === 'correlatedSubquery'` anywhere in the WHERE condition tree (`pipeline-driver.ts:1422-1428`). This is when EXISTS/NOT EXISTS appears directly as a WHERE filter (not as a `.related()` include). These can't be serialized to the Rust AST format.
 
@@ -374,6 +374,7 @@ In practice this is rare — most EXISTS usage is via `.related()` which becomes
 ### Advance: Filter-Only (in production)
 
 Rust advance is much more restricted (`pipeline-driver.ts:1430-1449`):
+
 - ALL pipeline operators must be filter-only (no join/exists/take)
 - No companion pipelines (scalar subquery monitoring)
 - No tables with multiple unique keys

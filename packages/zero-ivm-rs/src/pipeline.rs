@@ -100,6 +100,9 @@ fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, 
         if let Some(val) = obj.get("eq") {
             return Ok(Predicate::Eq(field, Value::from_json(val)));
         }
+        if let Some(val) = obj.get("neq") {
+            return Ok(Predicate::Neq(field, Value::from_json(val)));
+        }
         if let Some(val) = obj.get("gt") {
             return Ok(Predicate::Gt(field, Value::from_json(val)));
         }
@@ -111,6 +114,29 @@ fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, 
         }
         if let Some(val) = obj.get("lte") {
             return Ok(Predicate::Lte(field, Value::from_json(val)));
+        }
+        if let Some(val) = obj.get("in") {
+            let values = val
+                .as_array()
+                .ok_or("'in' value must be an array")?
+                .iter()
+                .map(Value::from_json)
+                .collect();
+            return Ok(Predicate::In(field, values));
+        }
+        if let Some(val) = obj.get("like") {
+            let pattern = val.as_str().ok_or("'like' value must be a string")?.to_string();
+            return Ok(Predicate::Like(field, pattern, false));
+        }
+        if let Some(val) = obj.get("ilike") {
+            let pattern = val.as_str().ok_or("'ilike' value must be a string")?.to_string();
+            return Ok(Predicate::Like(field, pattern, true));
+        }
+        if obj.get("isNull").is_some() {
+            return Ok(Predicate::IsNull(field));
+        }
+        if obj.get("isNotNull").is_some() {
+            return Ok(Predicate::IsNotNull(field));
         }
         return Err(format!("unknown predicate operator for field {}", field));
     }
@@ -133,6 +159,10 @@ fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, 
             .map(parse_predicate)
             .collect();
         return Ok(Predicate::Or(preds?));
+    }
+
+    if let Some(inner) = obj.get("not") {
+        return Ok(Predicate::Not(Box::new(parse_predicate(inner)?)));
     }
 
     Err("unknown predicate format".to_string())

@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::operator::Operator;
-use crate::types::{Change, FetchRequest, Node, Row};
+use crate::types::{Change, Constraint, FetchRequest, Node, Row};
 
 struct CapState {
     size: usize,
-    pks: HashSet<String>,
+    pks: Vec<String>,
 }
 
 pub struct CapOperator {
@@ -14,6 +14,39 @@ pub struct CapOperator {
     primary_key: Vec<String>,
     partition_key: Option<Vec<String>>,
     states: HashMap<String, CapState>,
+}
+
+/// Matches TS getCapStateKey: JSON.stringify(['cap', ...partitionValues])
+fn cap_state_key(partition_key: Option<&[String]>, row: &Row) -> String {
+    let mut parts: Vec<serde_json::Value> = vec![serde_json::Value::String("cap".to_string())];
+    if let Some(pk) = partition_key {
+        for k in pk {
+            parts.push(row.get(k).cloned().unwrap_or(serde_json::Value::Null));
+        }
+    }
+    serde_json::to_string(&parts).unwrap_or_default()
+}
+
+/// Matches TS serializePK: JSON.stringify(primaryKey.map(k => row[k]))
+fn serialize_pk(primary_key: &[String], row: &Row) -> String {
+    let vals: Vec<serde_json::Value> = primary_key
+        .iter()
+        .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
+        .collect();
+    serde_json::to_string(&vals).unwrap_or_default()
+}
+
+/// Build a single-key constraint for partition-scoped fetches.
+fn partition_constraint(partition_key: Option<&[String]>, row: &Row) -> Option<Constraint> {
+    let pk = partition_key?;
+    if pk.len() == 1 {
+        Some(Constraint {
+            key: pk[0].clone(),
+            value: row.get(&pk[0]).cloned().unwrap_or(serde_json::Value::Null),
+        })
+    } else {
+        None
+    }
 }
 
 impl CapOperator {
@@ -31,28 +64,6 @@ impl CapOperator {
             states: HashMap::new(),
         }
     }
-
-    fn partition_key_str(&self, row: &Row) -> String {
-        match &self.partition_key {
-            Some(pk) => {
-                let vals: Vec<serde_json::Value> = pk
-                    .iter()
-                    .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
-                    .collect();
-                serde_json::to_string(&vals).unwrap_or_default()
-            }
-            None => String::new(),
-        }
-    }
-
-    fn serialize_pk(&self, row: &Row) -> String {
-        let vals: Vec<serde_json::Value> = self
-            .primary_key
-            .iter()
-            .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
-            .collect();
-        serde_json::to_string(&vals).unwrap_or_default()
-    }
 }
 
 impl Operator for CapOperator {
@@ -61,17 +72,17 @@ impl Operator for CapOperator {
         let mut result = Vec::new();
 
         for node in all_nodes {
-            let part_key = self.partition_key_str(&node.row);
-            let pk = self.serialize_pk(&node.row);
+            let part_key = cap_state_key(self.partition_key.as_deref(), &node.row);
+            let pk = serialize_pk(&self.primary_key, &node.row);
 
             let state = self.states.entry(part_key).or_insert_with(|| CapState {
                 size: 0,
-                pks: HashSet::new(),
+                pks: Vec::new(),
             });
 
             if state.size < self.limit {
                 state.size += 1;
-                state.pks.insert(pk);
+                state.pks.push(pk);
                 result.push(node);
             }
         }
@@ -80,45 +91,88 @@ impl Operator for CapOperator {
     }
 
     fn push(&mut self, change: Change) -> Vec<Change> {
-        let part_key = self.partition_key_str(&change.node().row);
-        let pk = self.serialize_pk(&change.node().row);
-
         match &change {
-            Change::Add(_) => {
+            Change::Add(node) => {
+                let part_key = cap_state_key(self.partition_key.as_deref(), &node.row);
+                let pk = serialize_pk(&self.primary_key, &node.row);
                 let state = match self.states.get_mut(&part_key) {
                     Some(s) => s,
                     None => return vec![],
                 };
                 if state.size < self.limit {
                     state.size += 1;
-                    state.pks.insert(pk);
+                    state.pks.push(pk);
                     vec![change]
                 } else {
                     vec![]
                 }
             }
-            Change::Remove(_) => {
-                let state = match self.states.get_mut(&part_key) {
-                    Some(s) => s,
-                    None => return vec![],
+            Change::Remove(node) => {
+                let part_key = cap_state_key(self.partition_key.as_deref(), &node.row);
+                let pk = serialize_pk(&self.primary_key, &node.row);
+
+                // First: find and remove from state, collect what we need
+                let (pk_index, pks_snapshot, new_size) = {
+                    let state = match self.states.get_mut(&part_key) {
+                        Some(s) => s,
+                        None => return vec![],
+                    };
+                    let pk_index = match state.pks.iter().position(|p| p == &pk) {
+                        Some(i) => i,
+                        None => return vec![],
+                    };
+                    state.pks.remove(pk_index);
+                    let new_size = state.size - 1;
+                    state.size = new_size;
+                    (pk_index, state.pks.clone(), new_size)
                 };
-                if state.pks.remove(&pk) {
-                    state.size -= 1;
-                    vec![change]
-                } else {
-                    vec![]
+                let _ = pk_index; // used above
+
+                // Try to fetch a replacement row from input.
+                // Exclude both remaining tracked PKs and the just-removed PK
+                // (in production the removed row is gone from post-tx DB, but
+                // during stateless replay the source may still return it).
+                let mut pk_set: std::collections::HashSet<String> =
+                    pks_snapshot.iter().cloned().collect();
+                pk_set.insert(pk.clone());
+
+                let fetch_constraint = partition_constraint(self.partition_key.as_deref(), &node.row);
+                let replacement_nodes = self.input.fetch(&FetchRequest {
+                    constraint: fetch_constraint,
+                    start: None,
+                    reverse: false,
+                });
+
+                let mut replacement: Option<Node> = None;
+                for rn in replacement_nodes {
+                    let rn_pk = serialize_pk(&self.primary_key, &rn.row);
+                    if !pk_set.contains(&rn_pk) {
+                        replacement = Some(rn);
+                        break;
+                    }
                 }
+
+                let mut result = vec![change];
+                if let Some(rep) = replacement {
+                    let rep_pk = serialize_pk(&self.primary_key, &rep.row);
+                    let state = self.states.get_mut(&part_key).unwrap();
+                    state.pks.push(rep_pk);
+                    state.size = new_size + 1;
+                    result.push(Change::Add(rep));
+                }
+                result
             }
             Change::Edit { old_node, .. } => {
-                let old_pk = self.serialize_pk(&old_node.row);
+                let part_key = cap_state_key(self.partition_key.as_deref(), &old_node.row);
+                let old_pk = serialize_pk(&self.primary_key, &old_node.row);
+                let new_pk = serialize_pk(&self.primary_key, &change.node().row);
                 let state = match self.states.get_mut(&part_key) {
                     Some(s) => s,
                     None => return vec![],
                 };
-                if state.pks.contains(&old_pk) {
-                    if old_pk != pk {
-                        state.pks.remove(&old_pk);
-                        state.pks.insert(pk);
+                if let Some(idx) = state.pks.iter().position(|p| p == &old_pk) {
+                    if old_pk != new_pk {
+                        state.pks[idx] = new_pk;
                     }
                     vec![change]
                 } else {
@@ -126,6 +180,8 @@ impl Operator for CapOperator {
                 }
             }
             Change::Child { .. } => {
+                let part_key = cap_state_key(self.partition_key.as_deref(), &change.node().row);
+                let pk = serialize_pk(&self.primary_key, &change.node().row);
                 let state = match self.states.get(&part_key) {
                     Some(s) => s,
                     None => return vec![],
@@ -186,51 +242,181 @@ mod tests {
     }
 
     #[test]
-    fn test_cap_tracks_push_changes() {
+    fn test_cap_add_within_and_at_limit() {
         let nodes = vec![make_node(1)];
         let input = Box::new(MockInput { nodes });
         let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
-
-        // Initialize state via fetch
         let _ = op.fetch(&FetchRequest::default());
 
-        // Add within limit
         let result = op.push(Change::Add(make_node(2)));
         assert_eq!(result.len(), 1);
 
-        // Add at limit -> drop
         let result = op.push(Change::Add(make_node(3)));
-        assert_eq!(result.len(), 0);
+        assert_eq!(result.len(), 0, "at limit, should drop");
+    }
 
-        // Remove tracked PK
-        let result = op.push(Change::Remove(make_node(1)));
-        assert_eq!(result.len(), 1);
+    #[test]
+    fn test_cap_remove_untracked_drops() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
 
-        // Remove untracked PK -> drop
         let result = op.push(Change::Remove(make_node(99)));
         assert_eq!(result.len(), 0);
     }
 
     #[test]
-    fn test_cap_edit_tracked_pk() {
-        let nodes = vec![make_node(1)];
+    fn test_cap_remove_fetches_replacement() {
+        let nodes = vec![make_node(1), make_node(2), make_node(3)];
         let input = Box::new(MockInput { nodes });
         let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
 
+        let fetched = op.fetch(&FetchRequest::default());
+        assert_eq!(fetched.len(), 2);
+
+        let result = op.push(Change::Remove(make_node(1)));
+        assert_eq!(result.len(), 2, "should emit remove + replacement add");
+        assert!(matches!(&result[0], Change::Remove(n) if n.row.get("id").unwrap() == &serde_json::json!(1)));
+        assert!(matches!(&result[1], Change::Add(n) if n.row.get("id").unwrap() == &serde_json::json!(3)));
+
+        let state = op.states.values().next().unwrap();
+        assert_eq!(state.size, 2);
+        assert_eq!(state.pks.len(), 2);
+    }
+
+    #[test]
+    fn test_cap_remove_no_replacement_available() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 1, vec!["id".to_string()], None);
         let _ = op.fetch(&FetchRequest::default());
 
-        // Edit of tracked PK -> propagate
+        let result = op.push(Change::Remove(make_node(1)));
+        assert_eq!(result.len(), 1, "just the remove, no replacement");
+        assert!(matches!(&result[0], Change::Remove(_)));
+
+        let state = op.states.values().next().unwrap();
+        assert_eq!(state.size, 0);
+    }
+
+    #[test]
+    fn test_cap_edit_tracked_propagates() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
         let result = op.push(Change::Edit {
             node: make_node(1),
             old_node: make_node(1),
         });
         assert_eq!(result.len(), 1);
+    }
 
-        // Edit of untracked PK -> drop
+    #[test]
+    fn test_cap_edit_untracked_drops() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
         let result = op.push(Change::Edit {
             node: make_node(99),
             old_node: make_node(99),
         });
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_cap_edit_updates_pk_in_place() {
+        let nodes = vec![make_node(1), make_node(2)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Edit {
+            node: make_node(10),
+            old_node: make_node(1),
+        });
+        assert_eq!(result.len(), 1);
+
+        let state = op.states.values().next().unwrap();
+        let pk_10 = serde_json::to_string(&vec![serde_json::json!(10)]).unwrap();
+        let pk_2 = serde_json::to_string(&vec![serde_json::json!(2)]).unwrap();
+        assert!(state.pks.contains(&pk_10));
+        assert!(state.pks.contains(&pk_2));
+    }
+
+    #[test]
+    fn test_cap_child_tracked_propagates() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_change = Change::Child {
+            node: make_node(1),
+            child: crate::types::ChildData {
+                relationship_name: "items".to_string(),
+                change: Box::new(Change::Add(make_node(100))),
+            },
+        };
+        assert_eq!(op.push(child_change).len(), 1);
+    }
+
+    #[test]
+    fn test_cap_child_untracked_drops() {
+        let nodes = vec![make_node(1)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_change = Change::Child {
+            node: make_node(99),
+            child: crate::types::ChildData {
+                relationship_name: "items".to_string(),
+                change: Box::new(Change::Add(make_node(101))),
+            },
+        };
+        assert_eq!(op.push(child_change).len(), 0);
+    }
+
+    #[test]
+    fn test_cap_partition_key_str_matches_ts() {
+        let mut row = Row::new();
+        row.insert("group".to_string(), serde_json::json!("a"));
+        let key = cap_state_key(Some(&["group".to_string()]), &row);
+        assert_eq!(key, r#"["cap","a"]"#);
+    }
+
+    #[test]
+    fn test_cap_partition_key_str_no_partition() {
+        let row = Row::new();
+        let key = cap_state_key(None, &row);
+        assert_eq!(key, r#"["cap"]"#);
+    }
+
+    #[test]
+    fn test_cap_pks_ordered() {
+        let nodes = vec![make_node(3), make_node(1), make_node(2)];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(input, 3, vec!["id".to_string()], None);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let state = op.states.values().next().unwrap();
+        let pk_3 = serde_json::to_string(&vec![serde_json::json!(3)]).unwrap();
+        let pk_1 = serde_json::to_string(&vec![serde_json::json!(1)]).unwrap();
+        let pk_2 = serde_json::to_string(&vec![serde_json::json!(2)]).unwrap();
+        assert_eq!(state.pks, vec![pk_3, pk_1, pk_2]);
+    }
+
+    #[test]
+    fn test_cap_no_state_returns_empty() {
+        let input = Box::new(MockInput { nodes: vec![] });
+        let mut op = CapOperator::new(input, 2, vec!["id".to_string()], None);
+        // No fetch → no state initialized
+        assert_eq!(op.push(Change::Add(make_node(1))).len(), 0);
+        assert_eq!(op.push(Change::Remove(make_node(1))).len(), 0);
     }
 }

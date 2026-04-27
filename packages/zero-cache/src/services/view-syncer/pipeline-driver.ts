@@ -51,7 +51,6 @@ import {
   decodeAdvanceResultBuf,
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
-import {decodeDispatchPokeBuf} from './decode-dispatch-buf.ts';
 import {
   isDualExecEnabled,
   dualExecCompare,
@@ -60,17 +59,7 @@ import {
 import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
 import {isRustJoinAvailable} from './rust-join.ts';
 
-type RustFanOutFn = (
-  changesJson: string,
-  pipelineConfigsJson: string,
-) => string;
-
 type RustHydrateFn = (dbPath: string, queriesJson: string) => Buffer;
-
-type RustDispatchPokeFn = (
-  changesJson: string,
-  vsPipelinesJson: string,
-) => Buffer;
 
 type RustAdvanceFromAstBufFn = (
   dbPath: string,
@@ -78,30 +67,35 @@ type RustAdvanceFromAstBufFn = (
   queriesJson: string,
 ) => Buffer;
 
-let rustFanOutFn: RustFanOutFn | undefined;
 let rustHydrateFn: RustHydrateFn | undefined;
-let rustDispatchPokeFn: RustDispatchPokeFn | undefined;
 let rustAdvanceFromAstBufFn: RustAdvanceFromAstBufFn | undefined;
+let RustPipelineClass:
+  | (new (
+      dbPath: string,
+      queriesJson: string,
+    ) => {
+      hydrate(): Buffer;
+      advance(changesJson: string): Buffer;
+      swapSnapshot(newDbPath: string): void;
+      addQuery(queryJson: string): void;
+      removeQuery(queryId: string): void;
+      pipelineCount(): number;
+    })
+  | undefined;
 try {
   const esmRequire = createRequire(import.meta.url);
   const bindings = esmRequire('zqlite-rs');
-  rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
-  rustDispatchPokeFn = bindings?.rustDispatchPoke;
   rustAdvanceFromAstBufFn = bindings?.rustAdvanceFromAstBuf;
+  RustPipelineClass = bindings?.RustPipeline;
 } catch (e) {
   // Log so operators know Rust acceleration is unavailable.
   // eslint-disable-next-line no-console
   console.warn(`Failed to load zqlite-rs native bindings: ${e}`);
-  rustFanOutFn = undefined;
   rustHydrateFn = undefined;
-  rustDispatchPokeFn = undefined;
   rustAdvanceFromAstBufFn = undefined;
+  RustPipelineClass = undefined;
 }
-
-const DISABLE_RUST_DISPATCH =
-  process.env.ZERO_DISABLE_RUST_DISPATCH === '1' ||
-  process.env.ZERO_DISABLE_RUST_DISPATCH === 'true';
 
 interface RustPipelineConfig {
   query_id: string;
@@ -139,7 +133,9 @@ type RustOperator =
 const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
 const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
 const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
-const USE_RUST_ADVANCE = USE_RUST_IVM && rustFanOutFn !== undefined;
+const USE_RUST_ADVANCE =
+  USE_RUST_IVM &&
+  (RustPipelineClass !== undefined || rustAdvanceFromAstBufFn !== undefined);
 const USE_RUST_HYDRATION =
   USE_RUST_IVM &&
   process.env.ZERO_DISABLE_RUST_HYDRATION !== '1' &&
@@ -325,6 +321,9 @@ export class PipelineDriver {
   readonly #pipelineConfigs = new Map<string, RustPipelineConfig>();
   readonly #permissionTablesByQuery = new Map<string, Set<string>>();
   #useRustAdvance = false;
+  #rustPipeline: InstanceType<NonNullable<typeof RustPipelineClass>> | null =
+    null;
+  #rustPipelineDirty = true;
 
   constructor(
     lc: LogContext,
@@ -394,6 +393,8 @@ export class PipelineDriver {
     this.#pipelineConfigs.clear();
     this.#permissionTablesByQuery.clear();
     this.#useRustAdvance = false;
+    this.#rustPipeline = null;
+    this.#rustPipelineDirty = true;
     this.#initAndResetCommon(clientSchema);
   }
 
@@ -978,6 +979,8 @@ export class PipelineDriver {
 
       const tableName = resolvedQuery.table ?? '';
       const pk = this.#primaryKeys?.get(tableName) ?? [];
+      const rustEligible =
+        rustHydrateFn !== undefined && companionMeta.length === 0;
       rustPayloads.push({
         query_id: q.queryID,
         ast: resolvedQuery,
@@ -1252,7 +1255,7 @@ export class PipelineDriver {
    */
   advance(
     timer: Timer,
-    vsId?: string | undefined,
+    _vsId?: string | undefined,
   ): {
     version: string;
     numChanges: number;
@@ -1262,30 +1265,18 @@ export class PipelineDriver {
       this.initialized(),
       'Pipeline driver must be initialized before advancing',
     );
-    // Try dispatch poke path first (Phase 27: cross-VS batching)
-    if (
-      vsId &&
-      !DISABLE_RUST_DISPATCH &&
-      rustDispatchPokeFn &&
-      this.#useRustAdvance &&
-      this.#pipelineConfigs.size > 0
-    ) {
-      try {
-        return this.#rustDispatchAdvance(vsId);
-      } catch (e) {
-        if (e instanceof ResetPipelinesSignal) throw e;
-        this.#lc.warn?.(`Rust dispatch advance failed, falling back: ${e}`);
-        this.#rustAdvanceFailures.add(1);
-      }
-    }
     if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
+      console.error(
+        `[DBG_ADVANCE] useRustAdvance=true, configs=${this.#pipelineConfigs.size}, RustPipelineClass=${!!RustPipelineClass}, rustAdvanceFromAstBufFn=${!!rustAdvanceFromAstBufFn}`,
+      );
       if (isDualExecEnabled()) {
         // Dual-exec: run both Rust and TS, compare results
         return this.#dualExecAdvance(timer);
       }
       try {
-        return this.#rustAdvance();
+        return this.#rustAdvance(timer);
       } catch (e) {
+        console.error(`[DBG_ADVANCE] Rust advance failed:`, e);
         if (e instanceof ResetPipelinesSignal) throw e;
         this.#lc.warn?.(`Rust advance failed, falling back to TS: ${e}`);
         this.#rustAdvanceFailures.add(1);
@@ -1481,6 +1472,7 @@ export class PipelineDriver {
   }
 
   #reevaluateRustAdvance() {
+    this.#rustPipelineDirty = true;
     this.#useRustAdvance =
       USE_RUST_ADVANCE &&
       this.#pipelines.size > 0 &&
@@ -1500,75 +1492,6 @@ export class PipelineDriver {
       [...this.#tableSpecs.values()].every(
         s => s.tableSpec.uniqueKeys.length <= 1,
       );
-  }
-
-  #serializePipelineConfigs(): string {
-    return JSON.stringify([...this.#pipelineConfigs.values()]);
-  }
-
-  #rustDispatchAdvance(vsId: string): {
-    version: string;
-    numChanges: number;
-    changes: Iterable<RowChange | 'yield'>;
-  } {
-    assert(rustDispatchPokeFn, 'Rust dispatch poke not available');
-
-    const diff = this.#snapshotter.advance(
-      this.#tableSpecs,
-      this.#allTableNames,
-    );
-    const {prev, curr, changes: numChanges} = diff;
-
-    this.#lc.debug?.(
-      `rust_dispatch_poke ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines, vs=${vsId}`,
-    );
-
-    // Collect changes from TS diff iterator
-    const collectedChanges: Array<{
-      table: string;
-      prevValues: ReadonlyArray<Readonly<Row>>;
-      nextValue: Readonly<Row> | null;
-      rowKey: unknown;
-    }> = [];
-    for (const change of diff) {
-      collectedChanges.push(change);
-    }
-
-    const changesJson = JSON.stringify(collectedChanges);
-    const vsPipelinesJson = JSON.stringify([
-      {vs_id: vsId, pipelines: [...this.#pipelineConfigs.values()]},
-    ]);
-
-    const resultBuf = rustDispatchPokeFn(changesJson, vsPipelinesJson);
-    const vsResults = decodeDispatchPokeBuf(resultBuf);
-
-    // Find result for this VS
-    const vsResult = vsResults.find(r => r.vsId === vsId);
-    if (!vsResult) {
-      throw new Error(`No dispatch result for VS ${vsId}`);
-    }
-    if (vsResult.error) {
-      throw new ResetPipelinesSignal(
-        `Rust dispatch poke error for VS ${vsId}: ${vsResult.error}`,
-        'rust-dispatch-error',
-      );
-    }
-
-    // Update table DBs
-    for (const table of this.#tables.values()) {
-      table.setDB(curr.db.db);
-    }
-    this.#ensureCostModelExistsIfEnabled(curr.db.db);
-    this.#lc.debug?.(`Rust dispatch poke advanced to ${curr.version}`);
-
-    return {
-      version: curr.version,
-      numChanges,
-      changes: this.#convertDispatchChanges(
-        vsResult.changes,
-        this.#combinedPermissionTables(),
-      ),
-    };
   }
 
   *#convertDispatchChanges(
@@ -1610,7 +1533,7 @@ export class PipelineDriver {
     }
   }
 
-  #rustAdvance(): {
+  #rustAdvance(timer: Timer): {
     version: string;
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
@@ -1639,37 +1562,40 @@ export class PipelineDriver {
 
     let changes: Iterable<RowChange | 'yield'>;
 
-    if (rustAdvanceFromAstBufFn) {
+    if (RustPipelineClass) {
+      // Persistent pipeline path: build once, reuse across advances
+      if (this.#rustPipelineDirty || !this.#rustPipeline) {
+        // Build with the OLD snapshot so warmup fetch populates Take state
+        // from pre-change data. Then swap to the NEW snapshot so re-fetches
+        // during push see the updated rows.
+        this.#rustPipeline = this.#buildRustPipeline(prev.db.db.name);
+        this.#rustPipeline.swapSnapshot(curr.db.db.name);
+        this.#rustPipelineDirty = false;
+      } else {
+        // Swap to new snapshot DB without rebuilding operator trees
+        this.#rustPipeline.swapSnapshot(curr.db.db.name);
+      }
+      const changesJson = JSON.stringify(collectedChanges);
+      const resultBuf = this.#rustPipeline.advance(changesJson);
+      const decoded = decodeAdvanceResultBuf(resultBuf);
+      if (decoded.error) {
+        throw new Error(
+          `Rust persistent pipeline advance failed: ${decoded.error}`,
+        );
+      }
+      changes = materializeChanges(
+        this.#convertDispatchChanges(
+          decoded.changes,
+          this.#combinedPermissionTables(),
+        ),
+      );
+    } else if (rustAdvanceFromAstBufFn) {
       // Full AST-based advance: supports all operator types
       const rustChanges = this.#runRustAdvanceFromAst(
         curr.db.db.name,
         collectedChanges,
       );
       changes = rustChanges;
-    } else {
-      // Legacy filter-only fan-out
-      assert(rustFanOutFn, 'Rust fan-out not available');
-      const changesJson = JSON.stringify(collectedChanges);
-      const pipelineConfigsJson = this.#serializePipelineConfigs();
-      const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
-      const result = JSON.parse(resultJson) as {
-        changes: Array<{
-          queryID: string;
-          table: string;
-          row_key: Row;
-          row: Row | null;
-          type: string;
-        }>;
-        error?: string;
-        error_type?: string;
-      };
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      changes = this.#convertRustChanges(
-        result.changes,
-        this.#combinedPermissionTables(),
-      );
     }
 
     for (const table of this.#tables.values()) {
@@ -1681,7 +1607,7 @@ export class PipelineDriver {
     return {
       version: curr.version,
       numChanges,
-      changes,
+      changes: this.#wrapWithTimeout(changes, timer, numChanges),
     };
   }
 
@@ -1933,57 +1859,12 @@ export class PipelineDriver {
     return combined.size > 0 ? combined : undefined;
   }
 
-  *#convertRustChanges(
-    changes: Array<{
-      queryID: string;
-      table: string;
-      row_key: Row;
-      row: Row | null;
-      type: string;
-    }>,
-    permissionTables?: Set<string> | undefined,
-  ): Iterable<RowChange | 'yield'> {
-    for (const change of changes) {
-      // Skip rows from permission-system tables (matching Streamer behavior).
-      if (permissionTables?.has(change.table)) {
-        continue;
-      }
-      const type =
-        change.type === 'add'
-          ? ChangeType.ADD
-          : change.type === 'edit'
-            ? ChangeType.EDIT
-            : ChangeType.REMOVE;
-      let row = change.row ?? (change.row_key as Row);
-      // Apply minRowVersion bump, matching Streamer.#streamNodes behavior.
-      if (type !== ChangeType.REMOVE && row) {
-        const spec = this.#tableSpecs.get(change.table)?.tableSpec;
-        if (spec) {
-          const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
-          if (
-            typeof rowVersion === 'string' &&
-            rowVersion < (spec.minRowVersion ?? '00')
-          ) {
-            row = {...row, [ZERO_VERSION_COLUMN_NAME]: spec.minRowVersion};
-          }
-        }
-      }
-      yield {
-        type,
-        queryID: change.queryID,
-        table: change.table,
-        rowKey: change.row_key,
-        row: type === ChangeType.REMOVE ? undefined : row,
-      } as RowChange;
-    }
-  }
-
   /**
    * Dual-execution advance: runs both TS and Rust fan-out on the SAME diff,
    * then compares results. TS is the source of truth.
    *
    * Uses one snapshotter.advance() call. The diff is materialized once and
-   * fed to both Rust (via rust_fan_out JSON) and TS (via #advance with a
+   * fed to both Rust and TS (via #advance with a
    * synthetic iterable). The TS #advance path handles db state updates.
    */
   #dualExecAdvance(timer: Timer): {
@@ -1991,8 +1872,6 @@ export class PipelineDriver {
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
   } {
-    assert(rustFanOutFn, 'Rust fan-out not available');
-
     // 1. Get diff once, materialize changes
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
@@ -2015,8 +1894,6 @@ export class PipelineDriver {
     );
 
     // 2. Run Rust advance on collected changes
-    // Prefer full AST-based advance (supports all operator types) over
-    // filter-only fan-out when the binding is available.
     let rustChanges: RowChange[] = [];
     try {
       if (rustAdvanceFromAstBufFn) {
@@ -2024,30 +1901,6 @@ export class PipelineDriver {
           curr.db.db.name,
           collectedChanges,
         );
-      } else {
-        const changesJson = JSON.stringify(collectedChanges);
-        const pipelineConfigsJson = this.#serializePipelineConfigs();
-        const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
-        const result = JSON.parse(resultJson) as {
-          changes: Array<{
-            queryID: string;
-            table: string;
-            row_key: Row;
-            row: Row | null;
-            type: string;
-          }>;
-          error?: string;
-        };
-        if (!result.error) {
-          rustChanges = materializeChanges(
-            this.#convertRustChanges(
-              result.changes,
-              this.#combinedPermissionTables(),
-            ),
-          );
-        } else {
-          this.#lc.warn?.(`[dual-exec] Rust fan-out error: ${result.error}`);
-        }
       }
     } catch (e) {
       this.#lc.warn?.(`[dual-exec] Rust advance exception: ${e}`);
@@ -2132,6 +1985,18 @@ export class PipelineDriver {
     const resultBuf = rustAdvanceFromAstBufFn(dbPath, changesJson, queriesJson);
     const decoded = decodeAdvanceResultBuf(resultBuf);
 
+    if (decoded.timings) {
+      const t = decoded.timings;
+      console.error(
+        `[rust-advance-profile] total=${t.totalUs}us pipelines=${t.pipelineCount}`,
+      );
+      for (const p of t.perPipeline) {
+        console.error(
+          `  [pipeline ${p.queryID}] total=${p.totalUs}us build=${p.buildUs}us warmup=${p.warmupUs}us rewind=${p.rewindUs}us push=${p.pushUs}us dedup=${p.dedupFilterUs}us`,
+        );
+      }
+    }
+
     if (decoded.error) {
       this.#lc.warn?.(
         `[dual-exec] Rust advance-from-ast error: ${decoded.error}`,
@@ -2145,6 +2010,36 @@ export class PipelineDriver {
         this.#combinedPermissionTables(),
       ),
     );
+  }
+
+  #buildRustPipeline(
+    dbPath: string,
+  ): InstanceType<NonNullable<typeof RustPipelineClass>> {
+    assert(RustPipelineClass, 'RustPipeline class not available');
+
+    const queries: Array<{
+      query_id: string;
+      ast: AST;
+      primary_key: string[];
+      column_types: Record<string, Record<string, string>>;
+      all_primary_keys: Record<string, string[]>;
+    }> = [];
+
+    for (const [queryID, pipeline] of this.#pipelines) {
+      const ast = pipeline.transformedAst;
+      const tableName = ast.table ?? '';
+      const pk = this.#primaryKeys?.get(tableName) ?? [];
+      queries.push({
+        query_id: queryID,
+        ast,
+        primary_key: [...pk],
+        column_types: this.#collectColumnTypes(ast),
+        all_primary_keys: this.#collectAllPrimaryKeys(ast),
+      });
+    }
+
+    const queriesJson = JSON.stringify(queries);
+    return new RustPipelineClass(dbPath, queriesJson);
   }
 
   /** Implements `BuilderDelegate.getSource()` */
@@ -2216,6 +2111,37 @@ export class PipelineDriver {
       );
     }
     return advanceTimer.elapsedLap() > this.#yieldThresholdMs();
+  }
+
+  /**
+   * Wraps an iterable of changes with timeout and yield checks,
+   * matching the behavior of the TS #advance() generator.
+   */
+  *#wrapWithTimeout(
+    changes: Iterable<RowChange | 'yield'>,
+    timer: Timer,
+    numChanges: number,
+  ): Iterable<RowChange | 'yield'> {
+    const totalHydrationTimeMs = this.totalHydrationTimeMs();
+    this.#advanceContext = {
+      timer,
+      totalHydrationTimeMs,
+      numChanges,
+      pos: 0,
+    };
+    try {
+      for (const change of changes) {
+        if (this.#shouldAdvanceYieldMaybeAbortAdvance()) {
+          yield 'yield';
+        }
+        yield change;
+        if (change !== 'yield') {
+          this.#advanceContext.pos++;
+        }
+      }
+    } finally {
+      this.#advanceContext = null;
+    }
   }
 
   /** Implements `BuilderDelegate.createStorage()` */

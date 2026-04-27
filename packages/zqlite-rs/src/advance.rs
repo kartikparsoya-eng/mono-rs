@@ -67,6 +67,28 @@ pub struct AdvanceResult {
     pub changes: Vec<RowChange>,
     pub error: Option<String>,
     pub error_type: Option<String>,
+    pub timings: Option<AdvanceTimings>,
+}
+
+/// Per-pipeline timing breakdown (microseconds) for benchmarking.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AdvanceTimings {
+    pub pipeline_count: u32,
+    /// Per-pipeline timings: (query_id, build_us, warmup_us, rewind_us, push_us, dedup_filter_us, total_us)
+    pub per_pipeline: Vec<PipelineTimings>,
+    /// Total wall-clock time for advance_pipelines_full (includes Rayon overhead)
+    pub total_us: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PipelineTimings {
+    pub query_id: String,
+    pub build_us: u64,
+    pub warmup_us: u64,
+    pub rewind_us: u64,
+    pub push_us: u64,
+    pub dedup_filter_us: u64,
+    pub total_us: u64,
 }
 
 // ─── Predicate AST (reimplemented from zero-ivm-rs, cdylib can't cross-link) ─
@@ -591,6 +613,7 @@ pub fn rust_advance(
                     curr_version, actual
                 )),
                 error_type: Some("version_mismatch".to_string()),
+                timings: None,
             };
             return Ok(serde_json::to_string(&result).unwrap());
         }
@@ -616,6 +639,7 @@ pub fn rust_advance(
                 changes: Vec::new(),
                 error: Some(msg),
                 error_type: Some("reset".to_string()),
+                timings: None,
             };
             return Ok(serde_json::to_string(&result).unwrap());
         }
@@ -626,6 +650,7 @@ pub fn rust_advance(
                 changes: Vec::new(),
                 error: Some(msg),
                 error_type: Some("truncate".to_string()),
+                timings: None,
             };
             return Ok(serde_json::to_string(&result).unwrap());
         }
@@ -636,6 +661,7 @@ pub fn rust_advance(
                 changes: Vec::new(),
                 error: Some(msg),
                 error_type: Some("unknown".to_string()),
+                timings: None,
             };
             return Ok(serde_json::to_string(&result).unwrap());
         }
@@ -656,6 +682,7 @@ pub fn rust_advance(
         changes: row_changes,
         error: None,
         error_type: None,
+        timings: None,
     };
 
     serde_json::to_string(&result)
@@ -688,6 +715,7 @@ pub fn rust_fan_out(
         changes: row_changes,
         error: None,
         error_type: None,
+        timings: None,
     };
 
     serde_json::to_string(&result)
@@ -725,6 +753,7 @@ pub struct FullAdvanceResult {
     pub error: Option<String>,
     pub error_type: Option<String>,
     pub reset: bool,
+    pub timings: Option<AdvanceTimings>,
 }
 
 /// Convert a diff::Row (HashMap) to a source::Row (serde_json::Map).
@@ -833,23 +862,51 @@ pub fn advance_pipelines_full(
     changes: &[Change],
     pipelines: &[FullPipelineConfig],
 ) -> FullAdvanceResult {
+    use std::time::Instant;
+    let profile = std::env::var("RUST_ADVANCE_PROFILE").unwrap_or_default() == "1";
+    let t_total = Instant::now();
+
     // Process pipelines in parallel — each gets its own RustTableSource
     let changes_arc = Arc::new(changes.to_vec());
 
-    let all_row_changes: Vec<Vec<RowChange>> = pipelines
+    let all_results: Vec<(Vec<RowChange>, Option<PipelineTimings>)> = pipelines
         .par_iter()
         .map(|pipeline| {
-            process_full_pipeline(db_path, pipeline, &changes_arc)
+            process_full_pipeline(db_path, pipeline, &changes_arc, profile)
         })
         .collect();
 
-    let row_changes: Vec<RowChange> = all_row_changes.into_iter().flatten().collect();
+    let mut row_changes = Vec::new();
+    let mut per_pipeline = Vec::new();
+    for (changes, timings) in all_results {
+        row_changes.extend(changes);
+        if let Some(t) = timings {
+            per_pipeline.push(t);
+        }
+    }
+
+    let timings = if profile {
+        let total_us = t_total.elapsed().as_micros() as u64;
+        eprintln!("[rust-advance-profile] total={}us pipelines={}", total_us, pipelines.len());
+        for pt in &per_pipeline {
+            eprintln!("  [pipeline {}] total={}us build={}us warmup={}us rewind={}us push={}us dedup={}us",
+                pt.query_id, pt.total_us, pt.build_us, pt.warmup_us, pt.rewind_us, pt.push_us, pt.dedup_filter_us);
+        }
+        Some(AdvanceTimings {
+            pipeline_count: pipelines.len() as u32,
+            per_pipeline,
+            total_us,
+        })
+    } else {
+        None
+    };
 
     FullAdvanceResult {
         changes: row_changes,
         error: None,
         error_type: None,
         reset: false,
+        timings,
     }
 }
 
@@ -857,7 +914,11 @@ fn process_full_pipeline(
     db_path: &str,
     pipeline: &FullPipelineConfig,
     changes: &[Change],
-) -> Vec<RowChange> {
+    profile: bool,
+) -> (Vec<RowChange>, Option<PipelineTimings>) {
+    use std::time::Instant;
+    let t_total = Instant::now();
+    let t_build_start = Instant::now();
     // Extract column info from the Source config
     let (table_name, columns, pk, sort) = match &pipeline.operator_config[0] {
         OperatorConfig::Source {
@@ -866,7 +927,7 @@ fn process_full_pipeline(
             primary_key,
             sort,
         } => (table_name.clone(), columns.clone(), primary_key.clone(), sort.clone()),
-        _ => return vec![],
+        _ => return (vec![], None),
     };
 
     // Create RustTableSource for this pipeline's root table
@@ -880,7 +941,7 @@ fn process_full_pipeline(
         Ok(s) => s,
         Err(e) => {
             eprintln!("advance_full: failed to create source for {table_name}: {e}");
-            return vec![];
+            return (vec![], None);
         }
     };
 
@@ -898,31 +959,35 @@ fn process_full_pipeline(
     let mut op_list = match build_push_operator_list(source_arc.clone(), &pipeline.operator_config, connection_id) {
         Ok(list) if list.is_empty() => {
             // No operators after Source — just convert changes directly
-            return changes_to_row_changes_direct(changes, pipeline, &table_name, &pk);
+            return (changes_to_row_changes_direct(changes, pipeline, &table_name, &pk), None);
         }
         Ok(list) => list,
         Err(e) => {
             eprintln!("advance_full: failed to build push list for {}: {e}", pipeline.query_id);
-            return vec![];
+            return (vec![], None);
         }
     };
+    let build_us = t_build_start.elapsed().as_micros() as u64;
 
     // Filter changes for this pipeline's table and push through
     let mut row_changes = Vec::new();
 
     // Warm-up fetch: populate stateful operators (TakeOperator, ExistsOperator).
     // Only operators with state (Take, Exists) need warm-up. Call fetch() on each.
+    let t_warmup_start = Instant::now();
     for op in op_list.iter_mut() {
         let op_type = op.op_type();
         if op_type == "take" || op_type == "exists" || op_type == "skip" || op_type == "cap" {
             let _ = op.fetch(&FetchRequest::default());
         }
     }
+    let warmup_us = t_warmup_start.elapsed().as_micros() as u64;
 
     // Rewind stateful operators from post-tx → pre-tx by pushing reverse
     // changes through the operator list. The warm-up fetched post-tx DB,
     // so we undo each root-table change: Add→Remove, Remove→Add, Edit→reverse Edit.
     // Output is discarded — only the operator state mutations matter.
+    let t_rewind_start = Instant::now();
     for change in changes.iter() {
         if change.table == pipeline.source_table {
             let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
@@ -948,7 +1013,10 @@ fn process_full_pipeline(
         }
     }
 
+    let rewind_us = t_rewind_start.elapsed().as_micros() as u64;
+
     // Collect child table mappings for child-change handling.
+    let t_push_start = Instant::now();
     let child_table_map = collect_child_table_map(&pipeline.operator_config);
     let children_of_map = collect_children_of_map(&pipeline.operator_config);
 
@@ -981,6 +1049,20 @@ fn process_full_pipeline(
                         &pipeline.primary_key,
                         &pipeline.all_primary_keys,
                     );
+                    // When the pipeline emits a Remove for a root row
+                    // (e.g. Take evicts a parent), emit removals for
+                    // its child rows from related subqueries.
+                    if let IvmChange::Remove(node) = oc {
+                        // Check if the node's relationships have actual child rows
+                        let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
+                        if !has_child_rows && !children_of_map.is_empty() {
+                            let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table, &children_of_map,
+                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                    }
                 }
             }
         } else if let Some(child_infos) = child_table_map.get(&change.table) {
@@ -1035,6 +1117,8 @@ fn process_full_pipeline(
         }
     }
 
+    let push_us = t_push_start.elapsed().as_micros() as u64;
+
     // Deduplicate by (table, row_key, change_type) — when both a root row and its
     // child are changed in the same transaction, JoinOperator.fetch_children() and
     // the direct child emit can produce duplicates.
@@ -1059,7 +1143,23 @@ fn process_full_pipeline(
         }
     }
 
-    row_changes
+    let dedup_filter_us = t_total.elapsed().as_micros() as u64 - build_us - warmup_us - rewind_us - push_us;
+
+    let timings = if profile {
+        Some(PipelineTimings {
+            query_id: pipeline.query_id.clone(),
+            build_us,
+            warmup_us,
+            rewind_us,
+            push_us,
+            dedup_filter_us,
+            total_us: t_total.elapsed().as_micros() as u64,
+        })
+    } else {
+        None
+    };
+
+    (row_changes, timings)
 }
 
 fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
@@ -1181,6 +1281,8 @@ struct ChildRelation {
     child_join_col: Vec<String>,   // column(s) in child table
     child_pk: Vec<String>,
     relationship_name: String,
+    child_order: Vec<(String, String)>,  // ORDER BY columns from child subquery
+    child_limit: Option<usize>,          // LIMIT from child subquery
 }
 
 fn collect_children_of_map(
@@ -1208,9 +1310,20 @@ fn collect_children_of_recursive(
                 relationship_name,
                 child,
             } => {
-                if let (Some(parent), Some(OperatorConfig::Source { table_name, primary_key, .. })) =
+                if let (Some(parent), Some(OperatorConfig::Source { table_name, primary_key, sort, .. })) =
                     (current_table, child.first())
                 {
+                    // Extract limit and order from child's Take operator if present
+                    let mut child_limit = None;
+                    let mut child_order = sort.clone(); // default from Source sort
+                    for cc in child.iter() {
+                        if let OperatorConfig::Take { limit, sort: take_sort, .. } = cc {
+                            child_limit = Some(*limit);
+                            if !take_sort.is_empty() {
+                                child_order = take_sort.clone();
+                            }
+                        }
+                    }
                     map.entry(parent.to_string())
                         .or_default()
                         .push(ChildRelation {
@@ -1219,6 +1332,8 @@ fn collect_children_of_recursive(
                             child_join_col: child_key.clone(),
                             child_pk: primary_key.clone(),
                             relationship_name: relationship_name.clone(),
+                            child_order,
+                            child_limit,
                         });
                 }
                 // Recurse into child config to find deeper levels
@@ -1279,11 +1394,21 @@ fn emit_descendant_removals(
             continue;
         }
 
-        let sql = format!(
+        let mut sql = format!(
             "SELECT * FROM \"{}\" WHERE {}",
             rel.child_table,
             conditions.join(" AND ")
         );
+        // Respect child subquery's ORDER BY and LIMIT
+        if !rel.child_order.is_empty() {
+            let order_clause: Vec<String> = rel.child_order.iter()
+                .map(|(col, dir)| format!("\"{}\" {}", col, dir.to_uppercase()))
+                .collect();
+            sql.push_str(&format!(" ORDER BY {}", order_clause.join(", ")));
+        }
+        if let Some(limit) = rel.child_limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => continue,
@@ -1638,6 +1763,26 @@ pub fn encode_advance_result_buf(result: &AdvanceResult) -> Vec<u8> {
         }
     }
 
+    // Append timings trailer if present (flag bit 1 in flags byte)
+    if let Some(ref timings) = result.timings {
+        // Patch flags byte to set bit 1
+        buf[4] |= 0x02;
+        // total_us
+        buf.extend_from_slice(&timings.total_us.to_le_bytes());
+        // pipeline_count
+        buf.extend_from_slice(&timings.pipeline_count.to_le_bytes());
+        // per-pipeline timings
+        for pt in &timings.per_pipeline {
+            encode_str(&mut buf, &pt.query_id);
+            buf.extend_from_slice(&pt.build_us.to_le_bytes());
+            buf.extend_from_slice(&pt.warmup_us.to_le_bytes());
+            buf.extend_from_slice(&pt.rewind_us.to_le_bytes());
+            buf.extend_from_slice(&pt.push_us.to_le_bytes());
+            buf.extend_from_slice(&pt.dedup_filter_us.to_le_bytes());
+            buf.extend_from_slice(&pt.total_us.to_le_bytes());
+        }
+    }
+
     buf
 }
 
@@ -1767,6 +1912,7 @@ pub fn rust_fan_out_buf(
         changes: row_changes,
         error: None,
         error_type: None,
+        timings: None,
     };
     Ok(Buffer::from(encode_advance_result_buf(&result)))
 }
@@ -1787,6 +1933,7 @@ pub fn rust_advance_full_buf(
         changes: full_result.changes,
         error: full_result.error,
         error_type: full_result.error_type,
+        timings: None,
     };
     Ok(Buffer::from(encode_advance_result_buf(&result)))
 }
@@ -1844,6 +1991,7 @@ pub fn rust_advance_from_ast_buf(
             changes: vec![],
             error: None,
             error_type: None,
+            timings: None,
         };
         return Ok(Buffer::from(encode_advance_result_buf(&result)));
     }
@@ -1902,6 +2050,7 @@ pub fn rust_advance_from_ast_buf(
         changes: full_result.changes,
         error: full_result.error,
         error_type: full_result.error_type,
+        timings: full_result.timings,
     };
     Ok(Buffer::from(encode_advance_result_buf(&result)))
 }
@@ -1997,6 +2146,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
             changes: vec![],
             error: None,
             error_type: None,
+            timings: None,
         };
         return Ok(Buffer::from(encode_advance_result_buf(&result)));
     }
@@ -2072,6 +2222,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
                         changes: vec![],
                         error: Some(format!("Hydration failed for {qid}: {e}")),
                         error_type: Some("hydration_error".to_string()),
+                        timings: None,
                     };
                     return Ok(Buffer::from(encode_advance_result_buf(&result)));
                 }
@@ -2084,6 +2235,7 @@ pub fn rust_hydrate(db_path: String, queries_json: String) -> napi::Result<Buffe
         changes: all_changes,
         error: None,
         error_type: None,
+        timings: None,
     };
     let encoded = encode_advance_result_buf(&result);
     let encode_us = t0.elapsed().as_micros();
@@ -2210,7 +2362,481 @@ fn coerce_value(val: serde_json::Value, value_type: &str) -> serde_json::Value {
     }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// ─── Persistent Pipeline ────────────────────────────────────────────────────
+
+use std::sync::Mutex;
+
+struct PipelineState {
+    source: Arc<RustTableSource>,
+    op_list: Vec<Box<dyn IvmOperator>>,
+    query_id: String,
+    source_table: String,
+    primary_key: Vec<String>,
+    column_types: Option<HashMap<String, HashMap<String, String>>>,
+    all_primary_keys: HashMap<String, Vec<String>>,
+    child_table_map: HashMap<String, Vec<ChildTableInfo>>,
+    children_of_map: HashMap<String, Vec<ChildRelation>>,
+    operator_config: Vec<OperatorConfig>,
+    has_operators: bool,
+    rel_to_table: HashMap<String, String>,
+}
+
+/// Persistent pipeline that keeps operator trees and HashMap state alive across
+/// hydrate/advance calls. Eliminates per-call pipeline rebuild overhead (~44%)
+/// and per-advance warmup/rewind cycles.
+#[napi]
+pub struct RustPipeline {
+    db_path: String,
+    pipelines: Mutex<Vec<PipelineState>>,
+}
+
+// SAFETY: RustPipeline is only accessed from the NAPI (JS main) thread.
+// The inner operator trees contain Arc<RustTableSource> which is already
+// declared Send+Sync. The Mutex provides interior mutability safely.
+unsafe impl Send for RustPipeline {}
+unsafe impl Sync for RustPipeline {}
+
+fn build_pipeline_state(
+    db_path: &str,
+    query: &crate::ast_to_config::HydrateQuery,
+    schema_cache: &mut crate::ast_to_config::SchemaCache,
+) -> Result<PipelineState, String> {
+    use crate::ast_to_config::{ast_to_operator_configs, collect_child_tables};
+    use crate::hydrate::build_push_operator_list;
+    use crate::query_builder::ColumnType;
+
+    let operator_config = ast_to_operator_configs(
+        schema_cache,
+        &query.ast,
+        &query.primary_key,
+    )?;
+
+    let split_edit_keys = collect_split_edit_keys(&query.ast);
+
+    let mut all_pks: HashMap<String, Vec<String>> = HashMap::new();
+    all_pks.insert(query.ast.table.clone(), query.primary_key.clone());
+    if let Some(ref ts_pks) = query.all_primary_keys {
+        for (table_name, pk) in ts_pks {
+            all_pks.insert(table_name.clone(), pk.clone());
+        }
+    }
+    for (rel_name, table_name) in collect_child_tables(&query.ast) {
+        if !all_pks.contains_key(&rel_name) {
+            let pk = if let Some(ref ts_pks) = query.all_primary_keys {
+                ts_pks.get(&table_name).cloned().unwrap_or_else(|| {
+                    schema_cache.get_primary_key(&table_name).unwrap_or_default()
+                })
+            } else {
+                schema_cache.get_primary_key(&table_name).unwrap_or_default()
+            };
+            all_pks.insert(rel_name, pk);
+        }
+    }
+
+    let rel_to_table: HashMap<String, String> = collect_child_tables(&query.ast)
+        .into_iter()
+        .collect();
+
+    let (table_name, columns, pk, sort) = match &operator_config[0] {
+        OperatorConfig::Source {
+            table_name,
+            columns,
+            primary_key,
+            sort,
+        } => (table_name.clone(), columns.clone(), primary_key.clone(), sort.clone()),
+        _ => return Err("first config must be a Source".to_string()),
+    };
+
+    let mut column_types = HashMap::new();
+    for c in &columns {
+        column_types.insert(c.clone(), ColumnType::String);
+    }
+    let mut source = RustTableSource::new(
+        db_path, 2, table_name.clone(), columns, column_types, pk.clone(),
+    ).map_err(|e| format!("failed to create source for {table_name}: {e}"))?;
+
+    let split_keys: Option<HashSet<String>> = if split_edit_keys.is_empty() {
+        None
+    } else {
+        Some(split_edit_keys.iter().cloned().collect())
+    };
+    let connection_id = source.connect(Some(sort), None, split_keys);
+    let source_arc = Arc::new(source);
+
+    let op_list_result = build_push_operator_list(
+        source_arc.clone(), &operator_config, connection_id,
+    );
+
+    let has_operators;
+    let mut op_list = match op_list_result {
+        Ok(list) if list.is_empty() => {
+            has_operators = false;
+            vec![]
+        }
+        Ok(list) => {
+            has_operators = true;
+            list
+        }
+        Err(e) => return Err(format!("failed to build push list: {e}")),
+    };
+
+    // Warm-up fetch: populate stateful operators (TakeState, etc.)
+    if has_operators {
+        for op in op_list.iter_mut() {
+            let op_type = op.op_type();
+            if op_type == "take" || op_type == "exists" || op_type == "skip" || op_type == "cap" {
+                let _ = op.fetch(&FetchRequest::default());
+            }
+        }
+    }
+
+    let child_table_map = collect_child_table_map(&operator_config);
+    let children_of_map = collect_children_of_map(&operator_config);
+
+    Ok(PipelineState {
+        source: source_arc,
+        op_list,
+        query_id: query.query_id.clone(),
+        source_table: query.ast.table.clone(),
+        primary_key: query.primary_key.clone(),
+        column_types: query.column_types.clone(),
+        all_primary_keys: all_pks,
+        child_table_map,
+        children_of_map,
+        operator_config,
+        has_operators,
+        rel_to_table,
+    })
+}
+
+fn advance_persistent_pipeline(
+    pipeline: &mut PipelineState,
+    changes: &[Change],
+    db_path: &str,
+) -> Vec<RowChange> {
+    if !pipeline.has_operators {
+        return changes_to_row_changes_direct(
+            changes,
+            &FullPipelineConfig {
+                query_id: pipeline.query_id.clone(),
+                source_table: pipeline.source_table.clone(),
+                operator_config: pipeline.operator_config.clone(),
+                primary_key: pipeline.primary_key.clone(),
+                split_edit_keys: vec![],
+                column_types: pipeline.column_types.clone(),
+                all_primary_keys: pipeline.all_primary_keys.clone(),
+                rel_to_table: pipeline.rel_to_table.clone(),
+            },
+            &pipeline.source_table,
+            &pipeline.primary_key,
+        );
+    }
+
+    fn push_through_all(change: IvmChange, ops: &mut [Box<dyn IvmOperator>]) -> Vec<IvmChange> {
+        let mut current = vec![change];
+        for op in ops.iter_mut() {
+            let mut next = Vec::new();
+            for c in current {
+                next.extend(op.push(c));
+            }
+            current = next;
+        }
+        current
+    }
+
+    let mut row_changes = Vec::new();
+
+    for change in changes.iter() {
+        if change.table == pipeline.source_table {
+            let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            for sc in source_changes {
+                let ivm_change = source_change_to_ivm_change(&sc);
+                let output_changes = push_through_all(ivm_change, &mut pipeline.op_list);
+                for oc in &output_changes {
+                    flatten_ivm_change_to_row_changes(
+                        &mut row_changes,
+                        oc,
+                        &pipeline.query_id,
+                        &change.table,
+                        &pipeline.primary_key,
+                        &pipeline.all_primary_keys,
+                    );
+                    // When the pipeline emits a Remove for a root row
+                    // (e.g. Take evicts a parent), we need to also emit
+                    // removals for its child rows from related subqueries.
+                    // The Remove node's relationships map is typically empty
+                    // because operators don't populate children on eviction,
+                    // so we query the DB for descendants.
+                    if let IvmChange::Remove(node) = oc {
+                        let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
+                        if !has_child_rows && !pipeline.children_of_map.is_empty() {
+                            let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                    }
+                }
+            }
+        } else if let Some(child_infos) = pipeline.child_table_map.get(&change.table) {
+            let child_infos = child_infos.clone();
+            for ci in &child_infos {
+                let child_source_changes = diff_change_to_source_changes(change, &ci.child_pk);
+                for sc in &child_source_changes {
+                    match sc {
+                        SourceChange::Remove(ref row) => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: None,
+                                change_type: "remove".to_string(),
+                            });
+                            let deleted_map: serde_json::Map<String, serde_json::Value> =
+                                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table,
+                                &pipeline.children_of_map, &pipeline.query_id,
+                                &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                        SourceChange::Add(ref row) => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                change_type: "add".to_string(),
+                            });
+                        }
+                        SourceChange::Edit { row, .. } => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                change_type: "edit".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate
+    {
+        let mut seen = HashSet::new();
+        row_changes.retain(|rc| {
+            let key = format!("{}|{}|{}", rc.table,
+                serde_json::to_string(&rc.row_key).unwrap_or_default(), rc.change_type);
+            seen.insert(key)
+        });
+    }
+
+    // Filter output columns
+    if let Some(ref ct) = pipeline.column_types {
+        for rc in &mut row_changes {
+            if let Some(ref mut row) = rc.row {
+                if let Some(cols) = ct.get(&rc.table) {
+                    row.retain(|k, _| cols.contains_key(k));
+                }
+            }
+        }
+    }
+
+    row_changes
+}
+
+#[napi]
+impl RustPipeline {
+    #[napi(constructor)]
+    pub fn new(db_path: String, queries_json: String) -> napi::Result<Self> {
+        use crate::ast_to_config::{HydrateQuery, SchemaCache};
+
+        let queries: Vec<HydrateQuery> = serde_json::from_str(&queries_json)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to parse queries JSON: {e}")))?;
+
+        let mut schema_cache = SchemaCache::new(&db_path);
+        let mut pipelines = Vec::with_capacity(queries.len());
+
+        for query in &queries {
+            let state = build_pipeline_state(&db_path, query, &mut schema_cache)
+                .map_err(|e| napi::Error::from_reason(format!(
+                    "Failed to build pipeline '{}': {e}", query.query_id
+                )))?;
+            pipelines.push(state);
+        }
+
+        Ok(Self {
+            db_path,
+            pipelines: Mutex::new(pipelines),
+        })
+    }
+
+    /// Run initial hydration: fetch from all persistent operator trees.
+    #[napi]
+    pub fn hydrate(&self) -> napi::Result<Buffer> {
+        let mut pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+
+        let mut all_row_changes = Vec::new();
+
+        for pipeline in pipelines.iter_mut() {
+            if pipeline.has_operators {
+                let last = pipeline.op_list.len() - 1;
+                let nodes = pipeline.op_list[last].fetch(&FetchRequest::default());
+                flatten_nodes_to_row_changes(
+                    &mut all_row_changes,
+                    &pipeline.query_id,
+                    &pipeline.source_table,
+                    &pipeline.primary_key,
+                    &nodes,
+                    &pipeline.all_primary_keys,
+                    &pipeline.column_types,
+                    &pipeline.rel_to_table,
+                );
+            } else {
+                let req = crate::source::FetchRequest::default();
+                if let Ok(nodes) = pipeline.source.fetch(0, &req) {
+                    let ivm_nodes: Vec<zero_ivm_rs::types::Node> = nodes.into_iter().map(|n| {
+                        zero_ivm_rs::types::Node {
+                            row: n.row,
+                            relationships: n.relationships.into_iter().map(|(k, v)| {
+                                (k, v.into_iter().map(|cn| zero_ivm_rs::types::Node {
+                                    row: cn.row,
+                                    relationships: HashMap::new(),
+                                }).collect())
+                            }).collect(),
+                        }
+                    }).collect();
+                    flatten_nodes_to_row_changes(
+                        &mut all_row_changes,
+                        &pipeline.query_id,
+                        &pipeline.source_table,
+                        &pipeline.primary_key,
+                        &ivm_nodes,
+                        &pipeline.all_primary_keys,
+                        &pipeline.column_types,
+                        &pipeline.rel_to_table,
+                    );
+                }
+            }
+        }
+
+        let result = AdvanceResult {
+            changes: all_row_changes,
+            error: None,
+            error_type: None,
+            timings: None,
+        };
+        Ok(Buffer::from(encode_advance_result_buf(&result)))
+    }
+
+    /// Push changes through persistent operator trees. No pipeline rebuild,
+    /// no warmup/rewind needed — state is maintained across calls.
+    #[napi]
+    pub fn advance(&self, changes_json: String) -> napi::Result<Buffer> {
+        let changes: Vec<Change> = serde_json::from_str(&changes_json)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+
+        if changes.is_empty() {
+            let result = AdvanceResult {
+                changes: vec![],
+                error: None,
+                error_type: None,
+                timings: None,
+            };
+            return Ok(Buffer::from(encode_advance_result_buf(&result)));
+        }
+
+        let mut pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+
+        let db_path = self.db_path.clone();
+        let mut all_row_changes = Vec::new();
+
+        for pipeline in pipelines.iter_mut() {
+            let row_changes = advance_persistent_pipeline(pipeline, &changes, &db_path);
+            all_row_changes.extend(row_changes);
+        }
+
+        let result = AdvanceResult {
+            changes: all_row_changes,
+            error: None,
+            error_type: None,
+            timings: None,
+        };
+        Ok(Buffer::from(encode_advance_result_buf(&result)))
+    }
+
+    /// Re-open SQLite connections at a new path without rebuilding operator trees.
+    #[napi]
+    pub fn swap_snapshot(&mut self, new_db_path: String) -> napi::Result<()> {
+        let mut pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+
+        for pipeline in pipelines.iter_mut() {
+            if let Some(source) = Arc::get_mut(&mut pipeline.source) {
+                source.swap_db(&new_db_path)
+                    .map_err(|e| napi::Error::from_reason(format!(
+                        "Failed to swap DB for pipeline '{}': {e}", pipeline.query_id
+                    )))?;
+            } else {
+                return Err(napi::Error::from_reason(format!(
+                    "Cannot swap DB for pipeline '{}': source is shared", pipeline.query_id
+                )));
+            }
+        }
+
+        drop(pipelines);
+        self.db_path = new_db_path;
+        Ok(())
+    }
+
+    /// Add a new query to the persistent pipeline set.
+    #[napi]
+    pub fn add_query(&self, query_json: String) -> napi::Result<()> {
+        use crate::ast_to_config::{HydrateQuery, SchemaCache};
+
+        let query: HydrateQuery = serde_json::from_str(&query_json)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to parse query JSON: {e}")))?;
+
+        let mut schema_cache = SchemaCache::new(&self.db_path);
+        let state = build_pipeline_state(&self.db_path, &query, &mut schema_cache)
+            .map_err(|e| napi::Error::from_reason(format!(
+                "Failed to build pipeline '{}': {e}", query.query_id
+            )))?;
+
+        let mut pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+        pipelines.push(state);
+        Ok(())
+    }
+
+    /// Remove a query from the persistent pipeline set.
+    #[napi]
+    pub fn remove_query(&self, query_id: String) -> napi::Result<()> {
+        let mut pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+        pipelines.retain(|p| p.query_id != query_id);
+        Ok(())
+    }
+
+    /// Returns the number of active pipelines.
+    #[napi]
+    pub fn pipeline_count(&self) -> napi::Result<u32> {
+        let pipelines = self.pipelines.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
+        Ok(pipelines.len() as u32)
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

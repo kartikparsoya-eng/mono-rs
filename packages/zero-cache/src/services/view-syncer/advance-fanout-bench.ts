@@ -95,10 +95,7 @@ type Pipeline = {
   primary_key: string[];
 };
 
-function tsEvaluateFilter(
-  changes: Change[],
-  pipelines: Pipeline[],
-): number {
+function tsEvaluateFilter(changes: Change[], pipelines: Pipeline[]): number {
   let total = 0;
   for (const pipeline of pipelines) {
     for (const change of changes) {

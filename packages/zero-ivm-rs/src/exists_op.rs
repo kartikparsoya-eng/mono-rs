@@ -191,7 +191,14 @@ impl Operator for ExistsOperator {
                         if old_count == 0 && new_count == 1 {
                             // 0->1 transition
                             if self.not_exists {
-                                vec![Change::Remove(node.clone())]
+                                // Exclude the added child from the remove
+                                // (it was never added to output).
+                                let mut modified = node.clone();
+                                modified.relationships.insert(
+                                    self.relationship_name.clone(),
+                                    vec![],
+                                );
+                                vec![Change::Remove(modified)]
                             } else {
                                 vec![Change::Add(node.clone())]
                             }
@@ -211,7 +218,16 @@ impl Operator for ExistsOperator {
                             if self.not_exists {
                                 vec![Change::Add(node.clone())]
                             } else {
-                                vec![Change::Remove(node.clone())]
+                                // Include the removed child in the remove
+                                // so downstream sees correct relationships.
+                                let removed_child_node =
+                                    child.change.as_ref().node().clone();
+                                let mut modified = node.clone();
+                                modified.relationships.insert(
+                                    self.relationship_name.clone(),
+                                    vec![removed_child_node],
+                                );
+                                vec![Change::Remove(modified)]
                             }
                         } else if self.passes_filter(new_count) {
                             vec![change]
@@ -408,5 +424,322 @@ mod tests {
         assert_eq!(result.len(), 1);
         // exists: 1->0 means parent disappears
         assert!(matches!(&result[0], Change::Remove(n) if n.row.get("id").unwrap() == &serde_json::json!(1)));
+        // The removed child should be included in the relationship
+        if let Change::Remove(n) = &result[0] {
+            let rel = n.relationships.get("children").unwrap();
+            assert_eq!(rel.len(), 1);
+            assert_eq!(rel[0].row.get("id").unwrap(), &serde_json::json!(10));
+        }
+    }
+
+    #[test]
+    fn test_not_exists_push_child_add_0_to_1_relationship_empty() {
+        // When NOT EXISTS removes a parent on 0->1 transition,
+        // the emitted Remove should have an empty relationship vec
+        // (the added child was never pushed to output).
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            true,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(10, 1))),
+            },
+        };
+
+        let result = op.push(child_add);
+        assert_eq!(result.len(), 1);
+        if let Change::Remove(n) = &result[0] {
+            let rel = n.relationships.get("children").unwrap();
+            assert!(rel.is_empty(), "relationship should be empty on NOT EXISTS remove");
+        } else {
+            panic!("expected Remove");
+        }
+    }
+
+    #[test]
+    fn test_exists_push_parent_add_passes_when_children_exist() {
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Parent Add should pass through since children exist
+        let result = op.push(Change::Add(make_node(1)));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    #[test]
+    fn test_exists_push_parent_add_blocked_when_no_children() {
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Parent Add should be blocked since no children
+        let result = op.push(Change::Add(make_node(1)));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_exists_push_edit_passes_when_children_exist() {
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(1));
+        old_row.insert("name".to_string(), serde_json::json!("old"));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(1));
+        new_row.insert("name".to_string(), serde_json::json!("new"));
+
+        let edit = Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        };
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
+
+    #[test]
+    fn test_exists_push_different_relationship_child_passthrough() {
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Child change for a DIFFERENT relationship should pass through
+        // if the exists filter holds
+        let child_change = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "other_rel".to_string(),
+                change: Box::new(Change::Add(make_node(99))),
+            },
+        };
+
+        let result = op.push(child_change);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_exists_push_child_edit_passthrough() {
+        // Child Edit for the exists relationship should passthrough
+        // (edits don't change count)
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_child_row = Row::new();
+        old_child_row.insert("id".to_string(), serde_json::json!(10));
+        old_child_row.insert("parent_id".to_string(), serde_json::json!(1));
+        let mut new_child_row = Row::new();
+        new_child_row.insert("id".to_string(), serde_json::json!(10));
+        new_child_row.insert("parent_id".to_string(), serde_json::json!(1));
+        new_child_row.insert("name".to_string(), serde_json::json!("updated"));
+
+        let child_edit = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Edit {
+                    node: Node { row: new_child_row, relationships: HashMap::new() },
+                    old_node: Node { row: old_child_row, relationships: HashMap::new() },
+                }),
+            },
+        };
+
+        let result = op.push(child_edit);
+        // Should pass through since edit doesn't change count
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_or_predicate_bypasses_exists_check() {
+        use crate::filter::Predicate;
+
+        let parents = vec![make_node(1), make_node(2)];
+        let children: Vec<Node> = vec![]; // No children at all
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        // EXISTS with or_predicate: id == 1 bypasses exists check
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )
+        .with_or_predicate(Some(Predicate::Eq(
+            "id".to_string(),
+            Value::from_json(&serde_json::json!(1)),
+        )));
+
+        // Fetch: parent 1 passes via or_predicate, parent 2 has no children
+        let result = op.fetch(&FetchRequest::default());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+
+        // Push: parent Add with id=1 should pass via or_predicate
+        let result = op.push(Change::Add(make_node(1)));
+        assert_eq!(result.len(), 1);
+
+        // Push: parent Add with id=2 should be blocked (no children, no or match)
+        let result = op.push(Change::Add(make_node(2)));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_exists_push_child_add_beyond_boundary() {
+        // Adding a second child (1->2) should just pass through
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Add second child -> 1->2, not a boundary
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(20, 1))),
+            },
+        };
+
+        let result = op.push(child_add);
+        // Should pass through as a Child change (exists still true)
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Child { .. }));
+    }
+
+    #[test]
+    fn test_not_exists_push_child_remove_1_to_0_transition() {
+        // NOT EXISTS: removing last child (1->0) should Add the parent back
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            true,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+        // Simulate: parent had 1 child
+        let pk = op.parent_key_str(&make_node(1).row);
+        op.parent_sizes.insert(pk, 1);
+
+        let child_remove = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Remove(make_node_with_parent(10, 1))),
+            },
+        };
+
+        let result = op.push(child_remove);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
     }
 }
