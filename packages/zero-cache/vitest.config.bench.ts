@@ -7,5 +7,10 @@ export default mergeConfig(benchConfig, {
     browser: {
       enabled: false,
     },
+    // Disable Rust IVM in PipelineDriver so TS benchmarks use pure TypeScript
+    // operators. Rust benchmarks call RustPipeline NAPI directly.
+    env: {
+      ZERO_DISABLE_RUST_IVM: '1',
+    },
   },
 });
