@@ -191,7 +191,7 @@ pub fn evaluate(predicate: &Predicate, row: &HashMap<String, Value>) -> bool {
         }
         Predicate::In(field, values) => row.get(field).map_or(false, |v| {
             if *v == Value::Null { return false; }
-            values.contains(v)
+            values.iter().any(|val| values_eq(v, val))
         }),
         Predicate::Like(field, pattern, ci) => {
             row.get(field).map_or(false, |v| match v {
@@ -799,5 +799,40 @@ mod tests {
         assert_eq!(compare_values(&Value::Null, &Value::Null), std::cmp::Ordering::Equal);
         assert_eq!(compare_values(&Value::Null, &Value::Number(1.0)), std::cmp::Ordering::Less);
         assert_eq!(compare_values(&Value::Number(1.0), &Value::Null), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_in_bool_number_coercion() {
+        // SQLite stores booleans as 0/1, but the AST may use Bool.
+        // The In predicate must coerce true<>1 and false<>0.
+        let pred = Predicate::In(
+            "active".into(),
+            vec![Value::Bool(true)],
+        );
+        // Row has Number(1) - should match Bool(true) via coercion
+        assert!(evaluate(&pred, &make_row(&[("active", Value::Number(1.0))])));
+        // Row has Number(0) - should NOT match Bool(true)
+        assert!(!evaluate(&pred, &make_row(&[("active", Value::Number(0.0))])));
+
+        // Reverse: predicate has Number(1), row has Bool(true)
+        let pred2 = Predicate::In(
+            "active".into(),
+            vec![Value::Number(1.0)],
+        );
+        assert!(evaluate(&pred2, &make_row(&[("active", Value::Bool(true))])));
+        assert!(!evaluate(&pred2, &make_row(&[("active", Value::Bool(false))])));
+
+        // false<>0 coercion
+        let pred3 = Predicate::In(
+            "active".into(),
+            vec![Value::Bool(false)],
+        );
+        assert!(evaluate(&pred3, &make_row(&[("active", Value::Number(0.0))])));
+        assert!(!evaluate(&pred3, &make_row(&[("active", Value::Number(1.0))])));
+
+        // Eq also uses values_eq
+        let pred_eq = Predicate::Eq("active".into(), Value::Bool(true));
+        assert!(evaluate(&pred_eq, &make_row(&[("active", Value::Number(1.0))])));
+        assert!(!evaluate(&pred_eq, &make_row(&[("active", Value::Number(0.0))])));
     }
 }

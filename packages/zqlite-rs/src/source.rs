@@ -86,8 +86,15 @@ pub struct FetchRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchConstraint {
-    pub key: String,
-    pub value: serde_json::Value,
+    pub columns: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl FetchConstraint {
+    pub fn single(key: String, value: serde_json::Value) -> Self {
+        let mut columns = std::collections::HashMap::new();
+        columns.insert(key, value);
+        Self { columns }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

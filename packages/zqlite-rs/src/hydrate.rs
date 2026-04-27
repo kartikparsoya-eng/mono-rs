@@ -51,8 +51,7 @@ impl Operator for LiveTableSource {
         let source_req = SourceFetchRequest {
             constraint: req.constraint.as_ref().map(|c| {
                 crate::source::FetchConstraint {
-                    key: c.key.clone(),
-                    value: c.value.clone(),
+                    columns: c.columns.clone(),
                 }
             }),
             start: req.start.as_ref().map(|s| crate::source::FetchStart {
@@ -1049,8 +1048,7 @@ impl Operator for SourceBridgeOperator {
         // Convert zero_ivm_rs::types::FetchRequest → source::FetchRequest
         let source_req = crate::source::FetchRequest {
             constraint: req.constraint.as_ref().map(|c| crate::source::FetchConstraint {
-                key: c.key.clone(),
-                value: c.value.clone(),
+                columns: c.columns.clone(),
             }),
             start: req.start.as_ref().map(|s| crate::source::FetchStart {
                 row: s.row.clone(),

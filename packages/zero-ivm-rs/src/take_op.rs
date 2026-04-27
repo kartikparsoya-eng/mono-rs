@@ -90,10 +90,13 @@ impl TakeOperator {
 
     fn constraint_for_row(&self, row: &Row) -> Option<crate::types::Constraint> {
         self.partition_key.as_ref().and_then(|pk| {
-            pk.first().map(|k| crate::types::Constraint {
-                key: k.clone(),
-                value: row.get(k).cloned().unwrap_or(serde_json::Value::Null),
-            })
+            if pk.is_empty() {
+                None
+            } else {
+                Some(crate::types::Constraint::from_pairs(
+                    pk.iter().map(|k| (k.clone(), row.get(k).cloned().unwrap_or(serde_json::Value::Null)))
+                ))
+            }
         })
     }
 
@@ -193,12 +196,8 @@ impl TakeOperator {
         if old_cmp == Greater {
             // Both outside
             if new_cmp == Greater || new_cmp == Equal {
-                // newCmp === 0 is "Invalid state. Row has duplicate primary key" in TS
-                // but we treat it as no-op for safety
-                if new_cmp == Equal {
-                    // TS asserts this can't happen, but let's be safe
-                    return vec![];
-                }
+                // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key')
+                debug_assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
                 return vec![];
             }
 
@@ -243,10 +242,8 @@ impl TakeOperator {
             return vec![Change::Edit { node, old_node }];
         }
 
-        // newCmp === 0 would be duplicate PK in TS — treat as edit for safety
-        if new_cmp == Equal {
-            return vec![Change::Edit { node, old_node }];
-        }
+        // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key')
+        debug_assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
 
         // Old inside, new outside (newCmp > 0)
         assert!(new_cmp == Greater);
@@ -286,8 +283,7 @@ impl Operator for TakeOperator {
         // Determine if we have a matching partition state
         let part_key = if self.partition_key.is_some() {
             if let Some(c) = &req.constraint {
-                let mut m = Row::new();
-                m.insert(c.key.clone(), c.value.clone());
+                let m: Row = c.columns.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 self.take_state_key(&m)
             } else {
                 // No constraint but we have partition key — use maxBound
@@ -572,7 +568,7 @@ mod tests {
             // Handle constraint filtering
             if let Some(ref c) = req.constraint {
                 result.retain(|n| {
-                    n.row.get(&c.key).cloned().unwrap_or(serde_json::Value::Null) == c.value
+                    c.columns.iter().all(|(k, v)| n.row.get(k).cloned().unwrap_or(serde_json::Value::Null) == *v)
                 });
             }
 
@@ -965,10 +961,10 @@ mod tests {
 
         // Fetch partition a
         let _ = op.fetch(&FetchRequest {
-            constraint: Some(crate::types::Constraint {
-                key: "group".to_string(),
-                value: serde_json::json!("a"),
-            }),
+            constraint: Some(crate::types::Constraint::single(
+                "group".to_string(),
+                serde_json::json!("a"),
+            )),
             start: None,
             reverse: false,
         });
@@ -976,10 +972,10 @@ mod tests {
 
         // Fetch partition b — maxBound should update to 5
         let _ = op.fetch(&FetchRequest {
-            constraint: Some(crate::types::Constraint {
-                key: "group".to_string(),
-                value: serde_json::json!("b"),
-            }),
+            constraint: Some(crate::types::Constraint::single(
+                "group".to_string(),
+                serde_json::json!("b"),
+            )),
             start: None,
             reverse: false,
         });

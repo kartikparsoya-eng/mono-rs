@@ -54,8 +54,27 @@ impl Change {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Constraint {
-    pub key: String,
-    pub value: serde_json::Value,
+    #[serde(flatten)]
+    pub columns: HashMap<String, serde_json::Value>,
+}
+
+impl Constraint {
+    /// Create a single-column constraint (most common case).
+    pub fn single(key: String, value: serde_json::Value) -> Self {
+        let mut columns = HashMap::new();
+        columns.insert(key, value);
+        Self { columns }
+    }
+
+    /// Create a multi-column constraint from key-value pairs.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, serde_json::Value)>) -> Self {
+        Self { columns: pairs.into_iter().collect() }
+    }
+
+    /// Check if a row matches all columns in this constraint.
+    pub fn matches_row(&self, row: &Row) -> bool {
+        self.columns.iter().all(|(k, v)| row.get(k) == Some(v))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

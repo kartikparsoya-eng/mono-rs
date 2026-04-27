@@ -10,8 +10,10 @@ fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 
 fn constraint_matches_row(constraint: &FetchConstraint, row: &Row) -> bool {
     let null = serde_json::Value::Null;
-    let val = row.get(&constraint.key).unwrap_or(&null);
-    values_equal(val, &constraint.value)
+    constraint.columns.iter().all(|(k, v)| {
+        let val = row.get(k).unwrap_or(&null);
+        values_equal(val, v)
+    })
 }
 
 fn row_matches_pk(a: &Row, b: &Row, primary_key: &[String]) -> bool {
@@ -311,10 +313,10 @@ mod tests {
             epoch: 1,
             change: SourceChange::Add(row(&[("id", json!(1)), ("color", json!("red"))])),
         };
-        let constraint = FetchConstraint {
-            key: "color".to_string(),
-            value: json!("blue"),
-        };
+        let constraint = FetchConstraint::single(
+            "color".to_string(),
+            json!("blue"),
+        );
         let result = compute_overlays(
             None,
             Some(&constraint),

@@ -156,6 +156,43 @@ const MUTATIONS: Step[] = [
     run: `DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`,
     undo: ``,
   },
+  // Compound key coverage: insert a new team member into acme/eng.
+  // Exercises compound join key Add path on departments→team_members.
+  {
+    label: 'insert tm-test-1 into acme/eng (compound key Add)',
+    run: `INSERT INTO team_members (id, "orgID", "deptID", name) VALUES ('tm-test-1', 'acme', 'eng', 'Eve')`,
+    undo: `DELETE FROM team_members WHERE id = 'tm-test-1'`,
+  },
+  // Compound key coverage: insert a team member with partial key match.
+  // orgID=acme matches departments, but deptID=hr does NOT match any
+  // department. Tests that compound key join correctly excludes partial
+  // matches during advance.
+  {
+    label: 'insert tm-test-2 with partial compound key (acme/hr — no dept)',
+    run: `INSERT INTO team_members (id, "orgID", "deptID", name) VALUES ('tm-test-2', 'acme', 'hr', 'Frank')`,
+    undo: `DELETE FROM team_members WHERE id = 'tm-test-2'`,
+  },
+  // Compound key coverage: insert a new department. Exercises parent-side
+  // Add through compound key join.
+  {
+    label: 'insert department acme/legal (compound key parent Add)',
+    run: `INSERT INTO departments ("orgID", "deptID", name) VALUES ('acme', 'legal', 'Legal')`,
+    undo: `DELETE FROM departments WHERE "orgID" = 'acme' AND "deptID" = 'legal'`,
+  },
+  // Compound key coverage: update a department name. Exercises Edit
+  // propagation on a compound PK table.
+  {
+    label: 'update acme/eng department name (compound key Edit)',
+    run: `UPDATE departments SET name = 'Engineering (updated)' WHERE "orgID" = 'acme' AND "deptID" = 'eng'`,
+    undo: `UPDATE departments SET name = 'Engineering' WHERE "orgID" = 'acme' AND "deptID" = 'eng'`,
+  },
+  // Compound key coverage: delete a team member. Exercises Remove path
+  // on compound key child table.
+  {
+    label: 'delete tm3 from acme/sales (compound key child Remove)',
+    run: `DELETE FROM team_members WHERE id = 'tm3'`,
+    undo: `INSERT INTO team_members (id, "orgID", "deptID", name) VALUES ('tm3', 'acme', 'sales', 'Carol')`,
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -536,6 +573,8 @@ async function cleanupDb(sql: postgres.Sql): Promise<void> {
       await sql`DELETE FROM conversations WHERE id = 'co-test-1'`;
       await sql`DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`;
       await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
+      await sql`DELETE FROM team_members WHERE id IN ('tm-test-1', 'tm-test-2')`;
+      await sql`DELETE FROM departments WHERE "orgID" = 'acme' AND "deptID" = 'legal'`;
     } catch (e) {
       console.error(
         `[cleanupDb] explicit DELETE failed (attempt ${attempt}): ${(e as Error).message}`,

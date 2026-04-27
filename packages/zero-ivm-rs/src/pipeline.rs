@@ -184,7 +184,7 @@ impl Operator for SourceOperator {
         let mut result: Vec<Node> = self.rows.clone();
 
         if let Some(ref constraint) = req.constraint {
-            result.retain(|node| node.row.get(&constraint.key) == Some(&constraint.value));
+            result.retain(|node| constraint.matches_row(&node.row));
         }
 
         result.sort_by(|a, b| compare_rows(&a.row, &b.row, &self.sort));
@@ -660,10 +660,10 @@ mod tests {
         }];
         let mut op = SourceOperator::new(rows, sort);
         let result = op.fetch(&FetchRequest {
-            constraint: Some(Constraint {
-                key: "status".to_string(),
-                value: serde_json::json!("a"),
-            }),
+            constraint: Some(Constraint::single(
+                "status".to_string(),
+                serde_json::json!("a"),
+            )),
             ..Default::default()
         });
         assert_eq!(result.len(), 1);

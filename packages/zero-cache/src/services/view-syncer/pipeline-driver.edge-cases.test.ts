@@ -96,6 +96,44 @@ describe('pipeline-driver edge cases', () => {
       INSERT INTO COMMENTS (id, issueID, upvotes, _0_version) VALUES ('20', '2', 1, '123');
       INSERT INTO COMMENTS (id, issueID, upvotes, _0_version) VALUES ('21', '2', 10000, '123');
       INSERT INTO COMMENTS (id, issueID, upvotes, _0_version) VALUES ('22', '2', 20000, '123');
+
+      -- Compound-key tables for j3 (compound join key) and c1 (compound partition key)
+      CREATE TABLE departments (
+        "orgID" TEXT NOT NULL,
+        "deptID" TEXT NOT NULL,
+        name TEXT,
+        _0_version TEXT NOT NULL,
+        PRIMARY KEY ("orgID", "deptID")
+      );
+      CREATE TABLE team_members (
+        id TEXT PRIMARY KEY,
+        "orgID" TEXT NOT NULL,
+        "deptID" TEXT NOT NULL,
+        name TEXT,
+        _0_version TEXT NOT NULL
+      );
+      CREATE TABLE scores (
+        id TEXT PRIMARY KEY,
+        region TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        points INTEGER NOT NULL,
+        _0_version TEXT NOT NULL
+      );
+
+      INSERT INTO departments VALUES ('acme', 'eng', 'Engineering', '123');
+      INSERT INTO departments VALUES ('acme', 'sales', 'Sales', '123');
+      INSERT INTO departments VALUES ('globex', 'eng', 'Engineering', '123');
+      INSERT INTO team_members VALUES ('tm1', 'acme', 'eng', 'Alice', '123');
+      INSERT INTO team_members VALUES ('tm2', 'acme', 'eng', 'Bob', '123');
+      INSERT INTO team_members VALUES ('tm3', 'acme', 'sales', 'Carol', '123');
+      INSERT INTO team_members VALUES ('tm4', 'globex', 'eng', 'Dave', '123');
+      -- scores: 3 in us/gold, 2 in us/silver, 1 in eu/gold
+      INSERT INTO scores VALUES ('s1', 'us', 'gold', 100, '123');
+      INSERT INTO scores VALUES ('s2', 'us', 'gold', 90, '123');
+      INSERT INTO scores VALUES ('s3', 'us', 'gold', 80, '123');
+      INSERT INTO scores VALUES ('s4', 'us', 'silver', 70, '123');
+      INSERT INTO scores VALUES ('s5', 'us', 'silver', 60, '123');
+      INSERT INTO scores VALUES ('s6', 'eu', 'gold', 50, '123');
       `);
 
     populateFromExistingTables(db, listTables(db, false));
@@ -126,8 +164,32 @@ describe('pipeline-driver edge cases', () => {
     })
     .primaryKey('id');
 
+  const departments = table('departments')
+    .columns({
+      orgID: string(),
+      deptID: string(),
+      name: string(),
+    })
+    .primaryKey('orgID', 'deptID');
+  const teamMembers = table('team_members')
+    .columns({
+      id: string(),
+      orgID: string(),
+      deptID: string(),
+      name: string(),
+    })
+    .primaryKey('id');
+  const scores = table('scores')
+    .columns({
+      id: string(),
+      region: string(),
+      tier: string(),
+      points: number(),
+    })
+    .primaryKey('id');
+
   const clientSchema = createSchema({
-    tables: [issues, comments],
+    tables: [issues, comments, departments, teamMembers, scores],
   });
 
   const ISSUES_AND_COMMENTS: AST = {
@@ -163,6 +225,9 @@ describe('pipeline-driver edge cases', () => {
   const messages = new ReplicationMessages({
     issues: 'id',
     comments: 'id',
+    departments: ['orgID', 'deptID'],
+    team_members: 'id',
+    scores: 'id',
     [mutationsTableName]: ['clientGroupID', 'clientID', 'mutationID'],
   });
 
@@ -1260,6 +1325,391 @@ describe('pipeline-driver edge cases', () => {
     expect(rows).toHaveLength(2);
     const ids = rows.map(r => (r as {rowKey: {id: string}}).rowKey.id).sort();
     expect(ids).toEqual(['21', '22']);
+  });
+
+  // f1: IN predicate with bool↔number coercion.
+  // SQLite stores booleans as 0/1. WHERE closed IN (true) must match closed=1.
+  test('IN filter with boolean value matches numeric storage (bool↔number coercion)', () => {
+    const ISSUES_IN_BOOL: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'simple',
+        op: 'IN',
+        left: {type: 'column', name: 'closed'},
+        right: {type: 'literal', value: [true]},
+      },
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-in-bool',
+        'qInBool',
+        ISSUES_IN_BOOL,
+        startTimer(),
+      ),
+    ];
+
+    const issueRows = hydrated.filter(
+      c => c !== 'yield' && c.table === 'issues',
+    );
+    // Issue '2' has closed=1 (true). Issues '1','3' have closed=0 (false).
+    expect(issueRows).toHaveLength(1);
+    expect(issueRows[0]).toEqual(expect.objectContaining({rowKey: {id: '2'}}));
+  });
+
+  // f1 advance: IN with boolean coercion during push path.
+  test('IN bool↔number coercion works during advance', () => {
+    const ISSUES_IN_FALSE: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'simple',
+        op: 'IN',
+        left: {type: 'column', name: 'closed'},
+        right: {type: 'literal', value: [false]},
+      },
+    };
+
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-in-bool-adv',
+        'qInBoolAdv',
+        ISSUES_IN_FALSE,
+        startTimer(),
+      ),
+    ];
+
+    // Insert a new open issue (closed=0 → false) — should match IN (false)
+    replicator.processTransaction(
+      '134',
+      messages.insert('issues', {id: '4', closed: 0}),
+    );
+
+    const result = changes();
+    const filtered = result.filter(c => c.queryID === 'qInBoolAdv');
+    expect(filtered).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 0, rowKey: {id: '4'}}),
+      ]),
+    );
+
+    // Insert a closed issue (closed=1 → true) — should NOT match IN (false)
+    replicator.processTransaction(
+      '135',
+      messages.insert('issues', {id: '5', closed: 1}),
+    );
+
+    const result2 = changes();
+    const filtered2 = result2.filter(c => c.queryID === 'qInBoolAdv');
+    expect(filtered2).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({rowKey: {id: '5'}})]),
+    );
+  });
+
+  // j4: Parent edit with unchanged join key passes through as EDIT (not split).
+  test('parent edit with unchanged join key produces EDIT diff', () => {
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-join-edit',
+        'qJoinEdit',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    ];
+
+    // Update issue '2' closed field (join key 'id' unchanged)
+    replicator.processTransaction(
+      '134',
+      messages.update('issues', {id: '2', closed: 0}),
+    );
+
+    const result = changes();
+    const issueEdits = result.filter(
+      c =>
+        c.queryID === 'qJoinEdit' &&
+        c.table === 'issues' &&
+        c.rowKey.id === '2',
+    );
+    // Should be an EDIT (type 2), not Remove+Add
+    expect(issueEdits).toHaveLength(1);
+    expect(issueEdits[0]).toEqual(
+      expect.objectContaining({type: 2, rowKey: {id: '2'}}),
+    );
+  });
+
+  // j3: Compound join key — departments joined to team_members on (orgID, deptID).
+  // Verifies that only children matching BOTH key columns are returned.
+  test('compound join key hydration returns only matching children', () => {
+    const DEPTS_WITH_MEMBERS: AST = {
+      table: 'departments',
+      orderBy: [
+        ['orgID', 'asc'],
+        ['deptID', 'asc'],
+      ],
+      related: [
+        {
+          system: 'client',
+          correlation: {
+            parentField: ['orgID', 'deptID'],
+            childField: ['orgID', 'deptID'],
+          },
+          subquery: {
+            table: 'team_members',
+            alias: 'team_members',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      ],
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-compound-join',
+        'qCompoundJoin',
+        DEPTS_WITH_MEMBERS,
+        startTimer(),
+      ),
+    ];
+
+    const deptRows = hydrated.filter(
+      c => c !== 'yield' && c.table === 'departments',
+    );
+    const memberRows = hydrated.filter(
+      c => c !== 'yield' && c.table === 'team_members',
+    );
+
+    // 3 departments
+    expect(deptRows).toHaveLength(3);
+
+    // acme/eng → tm1, tm2; acme/sales → tm3; globex/eng → tm4
+    expect(memberRows).toHaveLength(4);
+
+    // Verify no cross-matching: tm3 (acme/sales) must NOT appear under acme/eng
+    const acmeEngMembers = memberRows.filter(
+      c =>
+        c !== 'yield' &&
+        (c as {row: {orgID: string; deptID: string}}).row.orgID === 'acme' &&
+        (c as {row: {orgID: string; deptID: string}}).row.deptID === 'eng',
+    );
+    expect(acmeEngMembers).toHaveLength(2);
+    const acmeEngIds = acmeEngMembers
+      .map(r => (r as {rowKey: {id: string}}).rowKey.id)
+      .sort();
+    expect(acmeEngIds).toEqual(['tm1', 'tm2']);
+  });
+
+  // j3 advance: Insert a new team_member with compound key — only the
+  // matching department should see the new child.
+  test('compound join key advance: insert child matches correct parent', () => {
+    const DEPTS_WITH_MEMBERS: AST = {
+      table: 'departments',
+      orderBy: [
+        ['orgID', 'asc'],
+        ['deptID', 'asc'],
+      ],
+      related: [
+        {
+          system: 'client',
+          correlation: {
+            parentField: ['orgID', 'deptID'],
+            childField: ['orgID', 'deptID'],
+          },
+          subquery: {
+            table: 'team_members',
+            alias: 'team_members',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      ],
+    };
+
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-compound-adv',
+        'qCompoundAdv',
+        DEPTS_WITH_MEMBERS,
+        startTimer(),
+      ),
+    ];
+
+    // Insert member for acme/sales
+    replicator.processTransaction(
+      '134',
+      messages.insert('team_members', {
+        id: 'tm5',
+        orgID: 'acme',
+        deptID: 'sales',
+        name: 'Eve',
+      }),
+    );
+
+    const result = changes();
+    const memberAdds = result.filter(
+      c =>
+        c.queryID === 'qCompoundAdv' &&
+        c.table === 'team_members' &&
+        c.type === 0,
+    );
+    expect(memberAdds).toHaveLength(1);
+    expect(memberAdds[0]).toEqual(
+      expect.objectContaining({rowKey: {id: 'tm5'}}),
+    );
+  });
+
+  // j3 advance: Insert child with first key matching but second key NOT matching
+  // any department — should NOT appear in changes.
+  test('compound join key advance: child with partial key match excluded', () => {
+    const DEPTS_WITH_MEMBERS: AST = {
+      table: 'departments',
+      orderBy: [
+        ['orgID', 'asc'],
+        ['deptID', 'asc'],
+      ],
+      related: [
+        {
+          system: 'client',
+          correlation: {
+            parentField: ['orgID', 'deptID'],
+            childField: ['orgID', 'deptID'],
+          },
+          subquery: {
+            table: 'team_members',
+            alias: 'team_members',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      ],
+    };
+
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-compound-partial',
+        'qCompoundPartial',
+        DEPTS_WITH_MEMBERS,
+        startTimer(),
+      ),
+    ];
+
+    // Insert member for acme/hr — no department with deptID='hr' exists
+    replicator.processTransaction(
+      '134',
+      messages.insert('team_members', {
+        id: 'tm6',
+        orgID: 'acme',
+        deptID: 'hr',
+        name: 'Frank',
+      }),
+    );
+
+    const result = changes();
+    const memberAdds = result.filter(
+      c =>
+        c.queryID === 'qCompoundPartial' &&
+        c.table === 'team_members' &&
+        c.type === 0,
+    );
+    // tm6 matches orgID='acme' but deptID='hr' has no parent — should not appear
+    const tm6 = memberAdds.filter(c => c.rowKey.id === 'tm6');
+    expect(tm6).toHaveLength(0);
+  });
+
+  // c1: Compound partition key with LIMIT — each (region, tier) partition
+  // should independently cap at the limit.
+  test('LIMIT with compound partition-like ORDER BY returns correct window', () => {
+    // ORDER BY region, tier, points DESC, id ASC — with LIMIT 2 per implicit window
+    // Since AST LIMIT is global (not per-partition), test global LIMIT with
+    // compound ORDER BY to verify multi-column sorting works correctly.
+    const SCORES_LIMIT: AST = {
+      table: 'scores',
+      orderBy: [
+        ['region', 'asc'],
+        ['tier', 'asc'],
+        ['points', 'desc'],
+        ['id', 'asc'],
+      ],
+      limit: 3,
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-scores-limit',
+        'qScoresLimit',
+        SCORES_LIMIT,
+        startTimer(),
+      ),
+    ];
+
+    const scoreRows = hydrated.filter(
+      c => c !== 'yield' && c.table === 'scores',
+    );
+    // ORDER: eu/gold/50(s6), us/gold/100(s1), us/gold/90(s2), us/gold/80(s3), us/silver/70(s4), us/silver/60(s5)
+    // LIMIT 3: s6, s1, s2
+    expect(scoreRows).toHaveLength(3);
+    const ids = scoreRows
+      .map(r => (r as {rowKey: {id: string}}).rowKey.id)
+      .sort();
+    expect(ids).toEqual(['s1', 's2', 's6']);
+  });
+
+  // c1: LIMIT advance — inserting a row that enters the window pushes one out.
+  test('LIMIT with compound ORDER BY reacts to insert', () => {
+    const SCORES_LIMIT: AST = {
+      table: 'scores',
+      orderBy: [
+        ['region', 'asc'],
+        ['tier', 'asc'],
+        ['points', 'desc'],
+        ['id', 'asc'],
+      ],
+      limit: 3,
+    };
+
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-scores-adv',
+        'qScoresAdv',
+        SCORES_LIMIT,
+        startTimer(),
+      ),
+    ];
+
+    // Insert a new eu/bronze score that sorts first (eu < us, bronze < gold)
+    replicator.processTransaction(
+      '134',
+      messages.insert('scores', {
+        id: 's7',
+        region: 'eu',
+        tier: 'bronze',
+        points: 200,
+      }),
+    );
+
+    const result = changes();
+    const scoreChanges = result.filter(
+      c => c.queryID === 'qScoresAdv' && c.table === 'scores',
+    );
+
+    // s7 (eu/bronze/200) sorts before s6 (eu/gold/50) — enters window
+    expect(scoreChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 0, rowKey: {id: 's7'}}),
+      ]),
+    );
+    // s2 (us/gold/90) — was 3rd, now pushed to 4th — exits window
+    expect(scoreChanges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({type: 1, rowKey: {id: 's2'}}),
+      ]),
+    );
   });
 
   test('ZERO_DISABLE_RUST_IVM=1 forces TS path and produces correct output', () => {

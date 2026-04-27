@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Mutex;
 
 use rusqlite::types::ValueRef;
 use serde_json::Value;
@@ -54,21 +55,18 @@ pub struct Connection {
 
 pub struct RustTableSource {
     pool: ConnectionPool,
-    write_conn: Option<rusqlite::Connection>,
+    write_conn: Mutex<Option<rusqlite::Connection>>,
     table_name: String,
     columns: Vec<String>,
     column_types: HashMap<String, ColumnType>,
     primary_key: Vec<String>,
     connections: Vec<Connection>,
-    overlay: Option<Overlay>,
-    push_epoch: u64,
+    overlay: Mutex<Option<Overlay>>,
+    push_epoch: Mutex<u64>,
 }
 
-// SAFETY: RustTableSource is safe to share across threads during hydration:
-// - ConnectionPool uses Arc<Mutex<Vec<Connection>>> internally
-// - `connections` (Vec<Connection>) is read-only after setup (immutable borrows only)
-// - `write_conn` is only used for push/overlay on the NAPI thread, never during parallel hydration
-// - All other fields (table_name, columns, column_types, primary_key) are immutable
+// SAFETY: All mutable state is behind Mutex. ConnectionPool is Clone+Send+Sync.
+// `connections` Vec is only mutated via `connect()` before Arc wrapping.
 unsafe impl Send for RustTableSource {}
 unsafe impl Sync for RustTableSource {}
 
@@ -85,14 +83,14 @@ impl RustTableSource {
         let write_conn = rusqlite::Connection::open(db_path)?;
         Ok(Self {
             pool,
-            write_conn: Some(write_conn),
+            write_conn: Mutex::new(Some(write_conn)),
             table_name,
             columns,
             column_types,
             primary_key,
             connections: Vec::new(),
-            overlay: None,
-            push_epoch: 0,
+            overlay: Mutex::new(None),
+            push_epoch: Mutex::new(0),
         })
     }
 
@@ -107,18 +105,18 @@ impl RustTableSource {
     ) -> Result<Self> {
         Ok(Self {
             pool,
-            write_conn: None,
+            write_conn: Mutex::new(None),
             table_name,
             columns,
             column_types,
             primary_key,
             connections: Vec::new(),
-            overlay: None,
-            push_epoch: 0,
+            overlay: Mutex::new(None),
+            push_epoch: Mutex::new(0),
         })
     }
 
-    pub fn db_path(&self) -> &str {
+    pub fn db_path(&self) -> String {
         self.pool.path()
     }
 
@@ -165,9 +163,7 @@ impl RustTableSource {
             .ok_or(TableSourceError::InvalidConnection(connection_id))?;
 
         let constraint: Option<Constraint> = req.constraint.as_ref().map(|c| {
-            let mut m = Constraint::new();
-            m.insert(c.key.clone(), c.value.clone());
-            m
+            c.columns.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         });
 
         let start: Option<Start> = req.start.as_ref().map(|s| Start {
@@ -191,14 +187,16 @@ impl RustTableSource {
 
         let sort = conn_info.sort.as_deref().unwrap_or(&[]);
         let start_row = req.start.as_ref().map(|s| &s.row);
+        let overlay_guard = self.overlay.lock().unwrap();
         let overlays = compute_overlays(
             start_row,
             req.constraint.as_ref(),
-            self.overlay.as_ref(),
+            overlay_guard.as_ref(),
             conn_info.last_pushed_epoch,
             sort,
             None,
         );
+        drop(overlay_guard);
 
         let nodes = if conn_info.sort.is_some() {
             generate_with_overlay(rows, &overlays, sort)
@@ -217,15 +215,22 @@ impl RustTableSource {
     /// Re-opens the underlying connection pool at a new database path and
     /// replaces the write connection. Operator tree and connection metadata
     /// remain intact — only the SQLite file changes.
-    pub fn swap_db(&mut self, new_path: &str) -> Result<()> {
+    pub fn swap_db(&self, new_path: &str) -> Result<()> {
         self.pool.swap_path(new_path).map_err(TableSourceError::Pool)?;
-        if self.write_conn.is_some() {
-            self.write_conn = Some(rusqlite::Connection::open(new_path)?);
+        {
+            let mut wc = self.write_conn.lock().unwrap();
+            if wc.is_some() {
+                *wc = Some(rusqlite::Connection::open(new_path)?);
+            }
         }
-        self.overlay = None;
-        self.push_epoch = 0;
-        for conn in &mut self.connections {
-            conn.last_pushed_epoch = 0;
+        *self.overlay.lock().unwrap() = None;
+        *self.push_epoch.lock().unwrap() = 0;
+        for conn in &self.connections {
+            // last_pushed_epoch is only read during fetch overlay computation;
+            // swap_db resets it. Since swap_db and push are never concurrent
+            // (both on NAPI thread), this is safe via unsafe impl Sync.
+            let conn_ptr = conn as *const Connection as *mut Connection;
+            unsafe { (*conn_ptr).last_pushed_epoch = 0; }
         }
         Ok(())
     }
@@ -313,8 +318,11 @@ impl RustTableSource {
     }
 
     pub fn push(&mut self, change: SourceChange) -> Result<Vec<Vec<Change>>> {
-        self.push_epoch += 1;
-        let epoch = self.push_epoch;
+        let epoch = {
+            let mut ep = self.push_epoch.lock().unwrap();
+            *ep += 1;
+            *ep
+        };
 
         let changes = self.maybe_split_edit(change);
 
@@ -323,8 +331,6 @@ impl RustTableSource {
         let is_split = changes.len() > 1;
 
         for (idx, ch) in changes.iter().enumerate() {
-            // Skip existence checks for split-edit pairs: the Remove deletes
-            // the old row before the Add re-inserts with the new values.
             if !is_split {
                 self.assert_change_valid(ch)?;
             }
@@ -334,17 +340,15 @@ impl RustTableSource {
                 all_results[i].push(source_change_to_change(ch));
             }
 
-            self.overlay = Some(Overlay {
+            *self.overlay.lock().unwrap() = Some(Overlay {
                 epoch,
                 change: ch.clone(),
             });
 
-            // Write each change immediately so subsequent assertions see
-            // the updated DB state (write-after-push per individual change).
             self.write_change(ch)?;
         }
 
-        self.overlay = None;
+        *self.overlay.lock().unwrap() = None;
 
         Ok(all_results)
     }
@@ -402,7 +406,8 @@ impl RustTableSource {
             self.table_name,
             where_clause.join(" AND ")
         );
-        let wc = self.write_conn.as_ref()
+        let wc_guard = self.write_conn.lock().unwrap();
+        let wc = wc_guard.as_ref()
             .expect("write_conn required for push operations (not available in hydration-only sources)");
         let mut stmt = wc.prepare(&sql)?;
         for (i, k) in self.primary_key.iter().enumerate() {
@@ -410,10 +415,21 @@ impl RustTableSource {
             bind_json_param(&mut stmt, i + 1, val)?;
         }
         let mut rows = stmt.raw_query();
-        Ok(rows.next()?.is_some())
+        let exists = rows.next()?.is_some();
+        drop(rows);
+        drop(stmt);
+        drop(wc_guard);
+        Ok(exists)
     }
 
     fn write_change(&self, change: &SourceChange) -> Result<()> {
+        let wc_guard = self.write_conn.lock().unwrap();
+        let wc = wc_guard.as_ref()
+            .expect("write_conn required for push operations");
+        self.write_change_inner(wc, change)
+    }
+
+    fn write_change_inner(&self, wc: &rusqlite::Connection, change: &SourceChange) -> Result<()> {
         match change {
             SourceChange::Add(row) => {
                 let cols: Vec<String> =
@@ -426,8 +442,6 @@ impl RustTableSource {
                     cols.join(", "),
                     placeholders.join(", ")
                 );
-                let wc = self.write_conn.as_ref()
-                    .expect("write_conn required for push operations");
                 let mut stmt = wc.prepare(&sql)?;
                 for (i, col) in self.columns.iter().enumerate() {
                     let val = row.get(col).unwrap_or(&serde_json::Value::Null);
@@ -447,8 +461,6 @@ impl RustTableSource {
                     self.table_name,
                     where_clause.join(" AND ")
                 );
-                let wc = self.write_conn.as_ref()
-                    .expect("write_conn required for push operations");
                 let mut stmt = wc.prepare(&sql)?;
                 for (i, k) in self.primary_key.iter().enumerate() {
                     let val = row.get(k).unwrap_or(&serde_json::Value::Null);
@@ -492,8 +504,6 @@ impl RustTableSource {
                         set_clause.join(", "),
                         where_clause.join(" AND ")
                     );
-                    let wc = self.write_conn.as_ref()
-                        .expect("write_conn required for push operations");
                     let mut stmt = wc.prepare(&sql)?;
                     let mut idx = 1;
                     for c in &non_pk_cols {
@@ -508,8 +518,8 @@ impl RustTableSource {
                     }
                     stmt.raw_execute()?;
                 } else {
-                    self.write_change(&SourceChange::Remove(old_row.clone()))?;
-                    self.write_change(&SourceChange::Add(row.clone()))?;
+                    self.write_change_inner(wc, &SourceChange::Remove(old_row.clone()))?;
+                    self.write_change_inner(wc, &SourceChange::Add(row.clone()))?;
                 }
             }
         }
@@ -655,10 +665,10 @@ mod tests {
         let mut src = make_source(&db);
         let cid = src.connect(None, None, None);
         let req = FetchRequest {
-            constraint: Some(FetchConstraint {
-                key: "id".into(),
-                value: json!("2"),
-            }),
+            constraint: Some(FetchConstraint::single(
+                "id".into(),
+                json!("2"),
+            )),
             start: None,
             reverse: false,
         };

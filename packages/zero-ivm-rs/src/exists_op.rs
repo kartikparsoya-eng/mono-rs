@@ -13,6 +13,9 @@ pub struct ExistsOperator {
     child_key: Vec<String>,
     parent_sizes: HashMap<String, usize>,
     or_predicate: Option<Predicate>,
+    // TS: #inPush — disables cache reuse during push to avoid stale results
+    // when relationships are transiently inconsistent during incremental processing.
+    in_push: bool,
 }
 
 impl ExistsOperator {
@@ -33,6 +36,7 @@ impl ExistsOperator {
             child_key,
             parent_sizes: HashMap::new(),
             or_predicate: None,
+            in_push: false,
         }
     }
 
@@ -60,12 +64,11 @@ impl ExistsOperator {
 
     fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
         let constraint = if !self.parent_key.is_empty() && !self.child_key.is_empty() {
-            parent_row.get(&self.parent_key[0]).map(|v| {
-                crate::types::Constraint {
-                    key: self.child_key[0].clone(),
-                    value: v.clone(),
-                }
-            })
+            Some(crate::types::Constraint::from_pairs(
+                self.parent_key.iter().zip(self.child_key.iter()).map(|(pk, ck)| {
+                    (ck.clone(), parent_row.get(pk).cloned().unwrap_or(serde_json::Value::Null))
+                })
+            ))
         } else {
             None
         };
@@ -104,10 +107,27 @@ impl ExistsOperator {
             count > 0
         }
     }
+
+    /// Get child count for a parent, using cache when not in_push (e1).
+    /// TS: during push, cache is disabled (#inPush skips cache reads).
+    /// During fetch, cache is used.
+    fn get_or_fetch_count(&mut self, row: &Row) -> usize {
+        let pk = self.parent_key_str(row);
+        if !self.in_push {
+            if let Some(&count) = self.parent_sizes.get(&pk) {
+                return count;
+            }
+        }
+        let count = self.fetch_child_count(row);
+        self.parent_sizes.insert(pk, count);
+        count
+    }
 }
 
 impl Operator for ExistsOperator {
     fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        // TS: endFilter() clears #cache. We clear at start of each fetch (e2).
+        self.parent_sizes.clear();
         let parent_nodes = self.input.fetch(req);
         let mut result = Vec::new();
 
@@ -130,6 +150,21 @@ impl Operator for ExistsOperator {
     }
 
     fn push(&mut self, change: Change) -> Vec<Change> {
+        // TS: assert(!this.#inPush, 'Unexpected re-entrancy') (e1)
+        debug_assert!(!self.in_push, "Unexpected re-entrancy");
+        self.in_push = true;
+        let result = self.push_impl(change);
+        self.in_push = false;
+        result
+    }
+
+    fn op_type(&self) -> &'static str {
+        "exists"
+    }
+}
+
+impl ExistsOperator {
+    fn push_impl(&mut self, change: Change) -> Vec<Change> {
         match &change {
             Change::Add(_) | Change::Remove(_) => {
                 let row = change.node().row.clone();
@@ -170,9 +205,13 @@ impl Operator for ExistsOperator {
                     return vec![change];
                 }
                 if child.relationship_name != self.relationship_name {
-                    // Different relationship: pass through with filter
+                    // Different relationship: pass through with filter (e3)
                     let pk = self.parent_key_str(&node.row);
-                    let count = self.parent_sizes.get(&pk).copied().unwrap_or(0);
+                    let count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
+                        let c = self.fetch_child_count(&node.row);
+                        self.parent_sizes.insert(pk.clone(), c);
+                        c
+                    });
                     if self.passes_filter(count) {
                         return vec![change];
                     }
@@ -184,7 +223,9 @@ impl Operator for ExistsOperator {
 
                 match inner_change {
                     Change::Add(_) => {
-                        let old_count = self.parent_sizes.get(&pk).copied().unwrap_or(0);
+                        let old_count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
+                            self.fetch_child_count(&node.row)
+                        });
                         let new_count = old_count + 1;
                         self.parent_sizes.insert(pk, new_count);
 
@@ -209,7 +250,9 @@ impl Operator for ExistsOperator {
                         }
                     }
                     Change::Remove(_) => {
-                        let old_count = self.parent_sizes.get(&pk).copied().unwrap_or(1);
+                        let old_count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
+                            self.fetch_child_count(&node.row)
+                        });
                         let new_count = old_count.saturating_sub(1);
                         self.parent_sizes.insert(pk, new_count);
 
@@ -237,7 +280,9 @@ impl Operator for ExistsOperator {
                     }
                     Change::Edit { .. } | Change::Child { .. } => {
                         // Edit/child of child: pass through if filter holds
-                        let count = self.parent_sizes.get(&pk).copied().unwrap_or(0);
+                        let count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
+                            self.fetch_child_count(&node.row)
+                        });
                         if self.passes_filter(count) {
                             vec![change]
                         } else {
@@ -247,10 +292,6 @@ impl Operator for ExistsOperator {
                 }
             }
         }
-    }
-
-    fn op_type(&self) -> &'static str {
-        "exists"
     }
 }
 
@@ -741,5 +782,78 @@ mod tests {
         let result = op.push(child_remove);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    // ===== e1: in_push guard test =====
+
+    #[test]
+    fn test_in_push_flag_cleared_after_push() {
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+        let mut op = ExistsOperator::new(
+            input, child_input, "children".to_string(), false,
+            vec!["id".to_string()], vec!["parent_id".to_string()],
+        );
+        let _ = op.fetch(&FetchRequest::default());
+
+        assert!(!op.in_push);
+        let _ = op.push(Change::Add(make_node(1)));
+        // in_push must be false after push completes
+        assert!(!op.in_push);
+    }
+
+    // ===== e2: cache cleared on fetch =====
+
+    #[test]
+    fn test_cache_cleared_on_fetch() {
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let input = Box::new(MockInput { nodes: parents.clone() });
+        let child_input = Box::new(MockInput { nodes: children });
+        let mut op = ExistsOperator::new(
+            input, child_input, "children".to_string(), false,
+            vec!["id".to_string()], vec!["parent_id".to_string()],
+        );
+
+        let _ = op.fetch(&FetchRequest::default());
+        assert!(!op.parent_sizes.is_empty());
+
+        // Second fetch should clear and rebuild cache
+        op.input = Box::new(MockInput { nodes: parents });
+        let _ = op.fetch(&FetchRequest::default());
+        // Cache should be populated but not accumulating stale entries
+        assert!(!op.parent_sizes.is_empty());
+    }
+
+    // ===== e3: unwrap_or defaults replaced with recomputation =====
+
+    #[test]
+    fn test_child_add_without_prior_fetch_recomputes_count() {
+        // e3: If parent_sizes has no entry, child Add should recompute (not default 0)
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)]; // 1 existing child
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+        let mut op = ExistsOperator::new(
+            input, child_input, "children".to_string(), false,
+            vec!["id".to_string()], vec!["parent_id".to_string()],
+        );
+        // Don't call fetch — parent_sizes is empty
+
+        // Push child add. Without e3 fix, old_count defaults to 0 → thinks it's 0→1 transition.
+        // With fix, it recomputes and finds 1 existing child → 1→2, not a boundary.
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(20, 1))),
+            },
+        };
+        let result = op.push(child_add);
+        // Should pass through as Child (1→2, not a 0→1 boundary)
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Child { .. }));
     }
 }

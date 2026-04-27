@@ -39,14 +39,12 @@ fn serialize_pk(primary_key: &[String], row: &Row) -> String {
 /// Build a single-key constraint for partition-scoped fetches.
 fn partition_constraint(partition_key: Option<&[String]>, row: &Row) -> Option<Constraint> {
     let pk = partition_key?;
-    if pk.len() == 1 {
-        Some(Constraint {
-            key: pk[0].clone(),
-            value: row.get(&pk[0]).cloned().unwrap_or(serde_json::Value::Null),
-        })
-    } else {
-        None
+    if pk.is_empty() {
+        return None;
     }
+    Some(Constraint::from_pairs(
+        pk.iter().map(|k| (k.clone(), row.get(k).cloned().unwrap_or(serde_json::Value::Null)))
+    ))
 }
 
 impl CapOperator {
@@ -163,7 +161,13 @@ impl Operator for CapOperator {
                 result
             }
             Change::Edit { old_node, .. } => {
-                let part_key = cap_state_key(self.partition_key.as_deref(), &old_node.row);
+                let old_part_key = cap_state_key(self.partition_key.as_deref(), &old_node.row);
+                let new_part_key = cap_state_key(self.partition_key.as_deref(), &change.node().row);
+                debug_assert_eq!(
+                    old_part_key, new_part_key,
+                    "Cap: partition key must not change on edit"
+                );
+                let part_key = old_part_key;
                 let old_pk = serialize_pk(&self.primary_key, &old_node.row);
                 let new_pk = serialize_pk(&self.primary_key, &change.node().row);
                 let state = match self.states.get_mut(&part_key) {
@@ -418,5 +422,40 @@ mod tests {
         // No fetch → no state initialized
         assert_eq!(op.push(Change::Add(make_node(1))).len(), 0);
         assert_eq!(op.push(Change::Remove(make_node(1))).len(), 0);
+    }
+
+    #[test]
+    fn test_partition_constraint_multi_column() {
+        // c1: partition_constraint should use first column for DB constraint
+        // but cap_state_key should use all columns for state keying.
+        let row: Row = vec![
+            ("region".to_string(), serde_json::json!("us")),
+            ("tier".to_string(), serde_json::json!("gold")),
+            ("id".to_string(), serde_json::json!(1)),
+        ]
+        .into_iter()
+        .collect();
+        let pk = vec!["region".to_string(), "tier".to_string()];
+
+        // partition_constraint uses first column
+        let c = partition_constraint(Some(&pk), &row).unwrap();
+        assert_eq!(c.columns.get("region"), Some(&serde_json::json!("us")));
+        assert_eq!(c.columns.get("tier"), Some(&serde_json::json!("gold")));
+
+        // cap_state_key uses all columns
+        let key = cap_state_key(Some(&pk), &row);
+        assert!(key.contains("us"));
+        assert!(key.contains("gold"));
+
+        // Different tier → different state key
+        let row2: Row = vec![
+            ("region".to_string(), serde_json::json!("us")),
+            ("tier".to_string(), serde_json::json!("silver")),
+            ("id".to_string(), serde_json::json!(2)),
+        ]
+        .into_iter()
+        .collect();
+        let key2 = cap_state_key(Some(&pk), &row2);
+        assert_ne!(key, key2);
     }
 }

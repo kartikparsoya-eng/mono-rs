@@ -50,3 +50,20 @@ CREATE TABLE attachments (
 CREATE INDEX messages_conversation_idx ON messages("conversationId");
 CREATE INDEX attachments_conversation_idx ON attachments("conversationId");
 CREATE INDEX participants_channel_idx ON participants("channelId");
+
+-- Compound-key tables for compound join key coverage.
+CREATE TABLE departments (
+  "orgID"   TEXT NOT NULL,
+  "deptID"  TEXT NOT NULL,
+  name      TEXT,
+  PRIMARY KEY ("orgID", "deptID")
+);
+
+CREATE TABLE team_members (
+  id       TEXT PRIMARY KEY,
+  "orgID"  TEXT NOT NULL,
+  "deptID" TEXT NOT NULL,
+  name     TEXT
+);
+
+CREATE INDEX team_members_org_dept_idx ON team_members("orgID", "deptID");

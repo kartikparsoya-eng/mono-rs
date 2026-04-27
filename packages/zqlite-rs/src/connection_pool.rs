@@ -37,7 +37,7 @@ type Result<T> = std::result::Result<T, PoolError>;
 #[derive(Clone)]
 pub struct ConnectionPool {
     connections: Arc<Mutex<Vec<Connection>>>,
-    path: String,
+    path: Arc<Mutex<String>>,
     pool_size: usize,
 }
 
@@ -59,7 +59,7 @@ impl ConnectionPool {
 
         Ok(Self {
             connections: Arc::new(Mutex::new(conns)),
-            path: path.to_owned(),
+            path: Arc::new(Mutex::new(path.to_owned())),
             pool_size,
         })
     }
@@ -111,8 +111,8 @@ impl ConnectionPool {
     }
 
     /// Returns the database path.
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn path(&self) -> String {
+        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns the configured pool size.
@@ -129,7 +129,7 @@ impl ConnectionPool {
     /// Re-opens all connections at a new database path. Each connection gets
     /// a fresh `BEGIN DEFERRED` snapshot. All `PooledConnection` guards must
     /// be dropped before calling this — checked via available count.
-    pub fn swap_path(&mut self, new_path: &str) -> Result<()> {
+    pub fn swap_path(&self, new_path: &str) -> Result<()> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI;
@@ -146,7 +146,7 @@ impl ConnectionPool {
             conns.push(conn);
         }
         drop(conns);
-        self.path = new_path.to_owned();
+        *self.path.lock().map_err(|_| PoolError::Poisoned)? = new_path.to_owned();
         Ok(())
     }
 }

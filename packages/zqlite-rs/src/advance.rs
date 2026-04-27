@@ -1092,22 +1092,30 @@ fn process_full_pipeline(
                             );
                         }
                         SourceChange::Add(ref row) => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
                             let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
                             row_changes.push(RowChange {
                                 query_id: pipeline.query_id.clone(),
                                 table: ci.relationship_name.clone(),
                                 row_key,
-                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                row: Some(row_map.into_iter().collect()),
                                 change_type: "add".to_string(),
                             });
                         }
                         SourceChange::Edit { row, .. } => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
                             let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
                             row_changes.push(RowChange {
                                 query_id: pipeline.query_id.clone(),
                                 table: ci.relationship_name.clone(),
                                 row_key,
-                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                row: Some(row_map.into_iter().collect()),
                                 change_type: "edit".to_string(),
                             });
                         }
@@ -1181,26 +1189,88 @@ fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
 
 #[derive(Debug, Clone)]
 struct ChildTableInfo {
+    parent_table: String,
     parent_key: Vec<String>,
     child_key: Vec<String>,
     relationship_name: String,
     child_pk: Vec<String>,
 }
 
+/// Check if a child row has a matching parent in the DB for ALL join key columns.
+/// For single-column keys this is always true (the child_table_map lookup already filtered).
+/// For compound keys this prevents false matches on the first column only.
+fn child_row_has_parent(
+    db_path: &str,
+    ci: &ChildTableInfo,
+    child_row: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if ci.parent_key.len() <= 1 {
+        return true;
+    }
+    let mut where_parts = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    for (pcol, ccol) in ci.parent_key.iter().zip(ci.child_key.iter()) {
+        let child_val = child_row.get(ccol).cloned().unwrap_or(serde_json::Value::Null);
+        if child_val.is_null() {
+            return false;
+        }
+        where_parts.push(format!("\"{}\" = ?", pcol));
+        match &child_val {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    params.push(rusqlite::types::Value::Integer(i));
+                } else if let Some(f) = n.as_f64() {
+                    params.push(rusqlite::types::Value::Real(f));
+                }
+            }
+            serde_json::Value::String(s) => {
+                params.push(rusqlite::types::Value::Text(s.clone()));
+            }
+            serde_json::Value::Bool(b) => {
+                params.push(rusqlite::types::Value::Integer(if *b { 1 } else { 0 }));
+            }
+            _ => return false,
+        }
+    }
+    let sql = format!(
+        "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
+        ci.parent_table,
+        where_parts.join(" AND ")
+    );
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match rusqlite::Connection::open_with_flags(db_path, flags) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|v| {
+        v as &dyn rusqlite::types::ToSql
+    }).collect();
+    stmt.exists(param_refs.as_slice()).unwrap_or(false)
+}
+
 fn collect_child_table_map(
     configs: &[OperatorConfig],
 ) -> HashMap<String, Vec<ChildTableInfo>> {
     let mut map: HashMap<String, Vec<ChildTableInfo>> = HashMap::new();
-    collect_child_table_map_recursive(configs, &mut map);
+    collect_child_table_map_recursive(configs, None, &mut map);
     map
 }
 
 fn collect_child_table_map_recursive(
     configs: &[OperatorConfig],
+    current_parent_table: Option<&str>,
     map: &mut HashMap<String, Vec<ChildTableInfo>>,
 ) {
     for config in configs {
         match config {
+            OperatorConfig::Source { table_name, .. } => {
+                collect_child_table_map_recursive(&configs[1..], Some(table_name), map);
+                return;
+            }
             OperatorConfig::Join {
                 parent_key,
                 child_key,
@@ -1216,13 +1286,14 @@ fn collect_child_table_map_recursive(
                     map.entry(table_name.clone())
                         .or_default()
                         .push(ChildTableInfo {
+                            parent_table: current_parent_table.unwrap_or("").to_string(),
                             parent_key: parent_key.clone(),
                             child_key: child_key.clone(),
                             relationship_name: relationship_name.clone(),
                             child_pk: primary_key.clone(),
                         });
                 }
-                collect_child_table_map_recursive(child, map);
+                collect_child_table_map_recursive(child, current_parent_table, map);
             }
             OperatorConfig::Exists {
                 parent_key,
@@ -1240,13 +1311,14 @@ fn collect_child_table_map_recursive(
                     map.entry(table_name.clone())
                         .or_default()
                         .push(ChildTableInfo {
+                            parent_table: current_parent_table.unwrap_or("").to_string(),
                             parent_key: parent_key.clone(),
                             child_key: child_key.clone(),
                             relationship_name: relationship_name.clone(),
                             child_pk: primary_key.clone(),
                         });
                 }
-                collect_child_table_map_recursive(child, map);
+                collect_child_table_map_recursive(child, current_parent_table, map);
             }
             OperatorConfig::OrExists { branches, .. } => {
                 for branch in branches {
@@ -1259,13 +1331,14 @@ fn collect_child_table_map_recursive(
                         map.entry(table_name.clone())
                             .or_default()
                             .push(ChildTableInfo {
+                                parent_table: current_parent_table.unwrap_or("").to_string(),
                                 parent_key: branch.parent_key.clone(),
                                 child_key: branch.child_key.clone(),
                                 relationship_name: branch.relationship_name.clone(),
                                 child_pk: primary_key.clone(),
                             });
                     }
-                    collect_child_table_map_recursive(&branch.child, map);
+                    collect_child_table_map_recursive(&branch.child, current_parent_table, map);
                 }
             }
             _ => {}
@@ -2603,22 +2676,30 @@ fn advance_persistent_pipeline(
                             );
                         }
                         SourceChange::Add(ref row) => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
                             let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
                             row_changes.push(RowChange {
                                 query_id: pipeline.query_id.clone(),
                                 table: ci.relationship_name.clone(),
                                 row_key,
-                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                row: Some(row_map.into_iter().collect()),
                                 change_type: "add".to_string(),
                             });
                         }
                         SourceChange::Edit { row, .. } => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
                             let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
                             row_changes.push(RowChange {
                                 query_id: pipeline.query_id.clone(),
                                 table: ci.relationship_name.clone(),
                                 row_key,
-                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                row: Some(row_map.into_iter().collect()),
                                 change_type: "edit".to_string(),
                             });
                         }
@@ -2781,16 +2862,10 @@ impl RustPipeline {
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
 
         for pipeline in pipelines.iter_mut() {
-            if let Some(source) = Arc::get_mut(&mut pipeline.source) {
-                source.swap_db(&new_db_path)
-                    .map_err(|e| napi::Error::from_reason(format!(
-                        "Failed to swap DB for pipeline '{}': {e}", pipeline.query_id
-                    )))?;
-            } else {
-                return Err(napi::Error::from_reason(format!(
-                    "Cannot swap DB for pipeline '{}': source is shared", pipeline.query_id
-                )));
-            }
+            pipeline.source.swap_db(&new_db_path)
+                .map_err(|e| napi::Error::from_reason(format!(
+                    "Failed to swap DB for pipeline '{}': {e}", pipeline.query_id
+                )))?;
         }
 
         drop(pipelines);
@@ -3960,6 +4035,167 @@ mod tests {
         assert_eq!(err_len, 15); // "something broke"
         let err_msg = std::str::from_utf8(&buf[7..7 + err_len]).unwrap();
         assert_eq!(err_msg, "something broke");
+    }
+
+    // ─── Persistent Pipeline Benchmark ──────────────────────────────────────
+    //
+    // Run with: cargo test -p zqlite-rs bench_persistent_pipeline_sequential_vs_parallel --release -- --nocapture
+    //
+    // Creates a real SQLite DB, builds N persistent pipelines with Take operators,
+    // and compares sequential iteration vs rayon par_iter for advance.
+
+    fn create_bench_db(dir: &tempfile::TempDir, num_rows: usize) -> String {
+        let db_path = dir.path().join("bench.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                age INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                score REAL NOT NULL DEFAULT 0.0
+            );",
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare("INSERT INTO users (id, name, age, active, score) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .unwrap();
+        for i in 0..num_rows {
+            stmt.execute(rusqlite::params![
+                format!("u{}", i),
+                format!("User {}", i),
+                20 + (i % 60) as i64,
+                if i % 5 == 0 { 0 } else { 1 },
+                (i as f64) * 1.5,
+            ])
+            .unwrap();
+        }
+        drop(stmt);
+        drop(conn);
+        db_path_str
+    }
+
+    fn make_bench_query(query_id: &str, limit: usize) -> String {
+        serde_json::json!({
+            "query_id": query_id,
+            "ast": {
+                "table": "users",
+                "orderBy": [["age", "asc"]],
+                "limit": limit,
+            },
+            "primary_key": ["id"],
+        })
+        .to_string()
+    }
+
+    fn make_bench_changes(count: usize) -> Vec<Change> {
+        (0..count)
+            .map(|i| {
+                let mut next = std::collections::HashMap::new();
+                next.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                next.insert("name".to_string(), serde_json::json!(format!("Updated {}", i)));
+                next.insert("age".to_string(), serde_json::json!(25 + (i % 40) as i64));
+                next.insert("active".to_string(), serde_json::json!(1));
+                next.insert("score".to_string(), serde_json::json!((i as f64) * 2.0));
+
+                let mut prev = std::collections::HashMap::new();
+                prev.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                prev.insert("name".to_string(), serde_json::json!(format!("User {}", i)));
+                prev.insert("age".to_string(), serde_json::json!(20 + (i % 60) as i64));
+                prev.insert("active".to_string(), serde_json::json!(1));
+                prev.insert("score".to_string(), serde_json::json!((i as f64) * 1.5));
+
+                Change {
+                    table: "users".to_string(),
+                    prev_values: vec![prev],
+                    next_value: Some(next),
+                    row_key: serde_json::json!(format!("u{}", i)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bench_persistent_pipeline_sequential_vs_parallel() {
+        use std::time::Instant;
+        use crate::ast_to_config::{HydrateQuery, SchemaCache};
+
+        let num_pipelines = 20;
+        let num_rows = 1000;
+        let num_changes = 50;
+        let iterations = 100;
+
+        // Setup
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_bench_db(&dir, num_rows);
+
+        // Build persistent pipelines
+        let mut schema_cache = SchemaCache::new(&db_path);
+        let mut pipelines: Vec<PipelineState> = Vec::new();
+        for i in 0..num_pipelines {
+            let query_json = make_bench_query(&format!("q{}", i), 10 + (i % 20));
+            let query: HydrateQuery = serde_json::from_str(&query_json).unwrap();
+            let state = build_pipeline_state(&db_path, &query, &mut schema_cache).unwrap();
+            pipelines.push(state);
+        }
+
+        let changes = make_bench_changes(num_changes);
+
+        // Warm up
+        for pipeline in pipelines.iter_mut() {
+            let _ = advance_persistent_pipeline(pipeline, &changes, &db_path);
+        }
+
+        // ── Sequential ──
+        let start = Instant::now();
+        let mut seq_total_changes = 0;
+        for _ in 0..iterations {
+            for pipeline in pipelines.iter_mut() {
+                let row_changes = advance_persistent_pipeline(pipeline, &changes, &db_path);
+                seq_total_changes += row_changes.len();
+            }
+        }
+        let seq_elapsed = start.elapsed();
+
+        // ── Parallel (rayon) ──
+        // We need per-pipeline mutexes for par_iter since we need &mut access
+        let pipeline_mutexes: Vec<Mutex<PipelineState>> = pipelines
+            .into_iter()
+            .map(|p| Mutex::new(p))
+            .collect();
+
+        let start = Instant::now();
+        let mut par_total_changes = 0;
+        for _ in 0..iterations {
+            let batch_changes: Vec<RowChange> = pipeline_mutexes
+                .par_iter()
+                .flat_map(|pm| {
+                    let mut pipeline = pm.lock().unwrap();
+                    advance_persistent_pipeline(&mut pipeline, &changes, &db_path)
+                })
+                .collect();
+            par_total_changes += batch_changes.len();
+        }
+        let par_elapsed = start.elapsed();
+
+        // Results
+        println!("\n╔══════════════════════════════════════════════════════════╗");
+        println!("║  Persistent Pipeline Advance Benchmark                  ║");
+        println!("╠══════════════════════════════════════════════════════════╣");
+        println!("║  Pipelines: {:<6}  Rows: {:<6}  Changes: {:<6}       ║", num_pipelines, num_rows, num_changes);
+        println!("║  Iterations: {:<6}                                     ║", iterations);
+        println!("╠══════════════════════════════════════════════════════════╣");
+        println!("║  Sequential:  {:>10.2?}  ({} row changes)    ║", seq_elapsed, seq_total_changes);
+        println!("║  Parallel:    {:>10.2?}  ({} row changes)    ║", par_elapsed, par_total_changes);
+        println!("║  Speedup:     {:>10.2}x                               ║",
+            seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64());
+        println!("╚══════════════════════════════════════════════════════════╝\n");
+
+        // Sanity check: both produce same number of changes
+        assert_eq!(seq_total_changes, par_total_changes,
+            "sequential and parallel must produce the same number of row changes");
     }
 }
 use zero_ivm_rs::types::FetchRequest;

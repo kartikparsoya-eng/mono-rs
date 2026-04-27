@@ -57,3 +57,16 @@ INSERT INTO attachments (id, "messageId", "conversationId", filename, "createdAt
   ('a-4', 'm-6', 'co-4', 'design-v2.pdf',  4102),
   ('a-5', 'm-7', 'co-4', 'gantt.png',      4201),
   ('a-6', 'm-8', 'co-5', 'roadmap.pdf',    5101);
+
+-- 3 departments across 2 orgs (compound PK: orgID + deptID).
+INSERT INTO departments ("orgID", "deptID", name) VALUES
+  ('acme',   'eng',   'Engineering'),
+  ('acme',   'sales', 'Sales'),
+  ('globex', 'eng',   'Engineering');
+
+-- 4 team members joining to departments on (orgID, deptID).
+INSERT INTO team_members (id, "orgID", "deptID", name) VALUES
+  ('tm1', 'acme',   'eng',   'Alice'),
+  ('tm2', 'acme',   'eng',   'Bob'),
+  ('tm3', 'acme',   'sales', 'Carol'),
+  ('tm4', 'globex', 'eng',   'Dave');

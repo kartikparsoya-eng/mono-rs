@@ -65,6 +65,23 @@ const attachment = table('attachments')
   })
   .primaryKey('id');
 
+const department = table('departments')
+  .columns({
+    orgID: string(),
+    deptID: string(),
+    name: string().optional(),
+  })
+  .primaryKey('orgID', 'deptID');
+
+const teamMember = table('team_members')
+  .columns({
+    id: string(),
+    orgID: string(),
+    deptID: string(),
+    name: string().optional(),
+  })
+  .primaryKey('id');
+
 // Relationships mirroring source: every correlated subquery our test
 // queries need (attachments-on-conversation, channel-on-conversation,
 // participants-on-channel) must be reachable through these.
@@ -146,14 +163,41 @@ const participantRelationships = relationships(participant, ({one}) => ({
   }),
 }));
 
+const departmentRelationships = relationships(department, ({many}) => ({
+  teamMembers: many({
+    sourceField: ['orgID', 'deptID'],
+    destField: ['orgID', 'deptID'],
+    destSchema: teamMember,
+  }),
+}));
+
+const teamMemberRelationships = relationships(teamMember, ({one}) => ({
+  department: one({
+    sourceField: ['orgID', 'deptID'],
+    destField: ['orgID', 'deptID'],
+    destSchema: department,
+  }),
+}));
+
 export const schema = createSchema({
-  tables: [channel, user, participant, conversation, message, attachment],
+  tables: [
+    channel,
+    user,
+    participant,
+    conversation,
+    message,
+    attachment,
+    department,
+    teamMember,
+  ],
   relationships: [
     channelRelationships,
     conversationRelationships,
     messageRelationships,
     attachmentRelationships,
     participantRelationships,
+    departmentRelationships,
+    teamMemberRelationships,
   ],
 });
 
@@ -175,5 +219,7 @@ export const permissions = definePermissions<AuthData, typeof schema>(
     conversations: ANYONE_CAN_DO_ANYTHING,
     messages: ANYONE_CAN_DO_ANYTHING,
     attachments: ANYONE_CAN_DO_ANYTHING,
+    departments: ANYONE_CAN_DO_ANYTHING,
+    team_members: ANYONE_CAN_DO_ANYTHING,
   }),
 );

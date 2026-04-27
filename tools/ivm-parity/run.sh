@@ -50,6 +50,12 @@ lsof -ti:${TS_PORT},${TS_ADMIN_PORT},${RS_PORT},${RS_ADMIN_PORT} 2>/dev/null | x
 rm -f /tmp/ivm-parity-ts.db* /tmp/ivm-parity-rs.db*
 sleep 1
 
+# Drop and recreate CVR/CDB databases for clean state
+for DB in parity_cvr_ts parity_cdb_ts parity_cvr_rs parity_cdb_rs; do
+  psql "${PG_URL_POSTGRES}" -c "DROP DATABASE IF EXISTS ${DB}" > /dev/null 2>&1 || true
+  psql "${PG_URL_POSTGRES}" -c "CREATE DATABASE ${DB}" > /dev/null 2>&1 || true
+done
+
 # ── 1. Fix zero-ivm-rs symlink (breaks after npm run build) ─────────
 MONO_ROOT="../.."
 if [ ! -f "${MONO_ROOT}/packages/zero/out/zero-ivm-rs/index.js" ]; then
@@ -89,6 +95,10 @@ if [ ! -f schema.json ] || [ zero-schema.ts -nt schema.json ]; then
     -p tools/ivm-parity/zero-schema.ts \
     --output-file tools/ivm-parity/schema.json)
 fi
+
+# Deploy permissions to the database
+echo "[parity] deploying permissions to PG..."
+psql "${PG_URL}" -v ON_ERROR_STOP=1 -f schema.json > /dev/null
 
 # ── 5. Start TS server (Rust IVM off, query planner off) ─────────────
 echo "[parity] starting TS zero-cache on :${TS_PORT} (Rust OFF, QP OFF)..."
