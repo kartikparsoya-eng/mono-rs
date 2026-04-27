@@ -216,13 +216,16 @@ impl RustTableSource {
     /// replaces the write connection. Operator tree and connection metadata
     /// remain intact — only the SQLite file changes.
     pub fn swap_db(&self, new_path: &str) -> Result<()> {
+        let same_path = self.pool.path() == new_path;
         self.pool.swap_path(new_path).map_err(TableSourceError::Pool)?;
-        {
+        if !same_path {
+            // Different DB file — must reopen write connection.
             let mut wc = self.write_conn.lock().unwrap();
             if wc.is_some() {
                 *wc = Some(rusqlite::Connection::open(new_path)?);
             }
         }
+        // Always reset overlay and epoch — the snapshot data has changed.
         *self.overlay.lock().unwrap() = None;
         *self.push_epoch.lock().unwrap() = 0;
         for conn in &self.connections {

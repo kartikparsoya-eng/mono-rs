@@ -130,6 +130,16 @@ impl ConnectionPool {
     /// a fresh `BEGIN DEFERRED` snapshot. All `PooledConnection` guards must
     /// be dropped before calling this — checked via available count.
     pub fn swap_path(&self, new_path: &str) -> Result<()> {
+        let current_path = self.path.lock().map_err(|_| PoolError::Poisoned)?.clone();
+
+        if new_path == current_path {
+            // Same DB file (WAL mode) — just refresh the read snapshot
+            // by ending the current transaction and starting a new one.
+            // This is the fast path: no Connection::open syscalls.
+            return self.set_snapshot();
+        }
+
+        // Different path — must reopen all connections.
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI;
