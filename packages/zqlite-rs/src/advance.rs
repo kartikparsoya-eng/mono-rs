@@ -696,9 +696,10 @@ pub fn rust_fan_out(
 
 // ─── Full Advance (Phase 24) ────────────────────────────────────────────────
 
-use crate::hydrate::build_push_operator_chain;
+use crate::hydrate::build_push_operator_list;
 use crate::source::SourceChange;
 use crate::table_source::RustTableSource;
+use zero_ivm_rs::operator::Operator as IvmOperator;
 use zero_ivm_rs::pipeline::OperatorConfig;
 use zero_ivm_rs::types::Change as IvmChange;
 
@@ -710,6 +711,12 @@ pub struct FullPipelineConfig {
     pub primary_key: Vec<String>,
     #[serde(default)]
     pub split_edit_keys: Vec<String>,
+    #[serde(default)]
+    pub column_types: Option<HashMap<String, HashMap<String, String>>>,
+    #[serde(default)]
+    pub all_primary_keys: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub rel_to_table: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -883,41 +890,171 @@ fn process_full_pipeline(
     } else {
         Some(pipeline.split_edit_keys.iter().cloned().collect())
     };
-    source.connect(Some(sort), None, split_keys);
+    let connection_id = source.connect(Some(sort), None, split_keys);
 
     let source_arc = Arc::new(source);
 
-    // Build push operator chain (everything after Source)
-    let mut op_chain = match build_push_operator_chain(source_arc.clone(), &pipeline.operator_config) {
-        Ok(Some(chain)) => chain,
-        Ok(None) => {
+    // Build flat list of push operators (inner to outer)
+    let mut op_list = match build_push_operator_list(source_arc.clone(), &pipeline.operator_config, connection_id) {
+        Ok(list) if list.is_empty() => {
             // No operators after Source — just convert changes directly
             return changes_to_row_changes_direct(changes, pipeline, &table_name, &pk);
         }
+        Ok(list) => list,
         Err(e) => {
-            eprintln!("advance_full: failed to build push chain for {}: {e}", pipeline.query_id);
+            eprintln!("advance_full: failed to build push list for {}: {e}", pipeline.query_id);
             return vec![];
         }
     };
 
     // Filter changes for this pipeline's table and push through
     let mut row_changes = Vec::new();
-    for change in changes.iter() {
-        if change.table != pipeline.source_table {
-            continue;
-        }
 
-        let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
-        for sc in source_changes {
-            let ivm_change = source_change_to_ivm_change(&sc);
-            let output_changes = op_chain.push(ivm_change);
-            for oc in &output_changes {
-                row_changes.extend(ivm_change_to_row_changes(
-                    oc,
-                    &pipeline.query_id,
-                    &change.table,
-                    &pipeline.primary_key,
-                ));
+    // Warm-up fetch: populate stateful operators (TakeOperator, ExistsOperator).
+    // Only operators with state (Take, Exists) need warm-up. Call fetch() on each.
+    for op in op_list.iter_mut() {
+        let op_type = op.op_type();
+        if op_type == "take" || op_type == "exists" || op_type == "skip" || op_type == "cap" {
+            let _ = op.fetch(&FetchRequest::default());
+        }
+    }
+
+    // Rewind stateful operators from post-tx → pre-tx by pushing reverse
+    // changes through the operator list. The warm-up fetched post-tx DB,
+    // so we undo each root-table change: Add→Remove, Remove→Add, Edit→reverse Edit.
+    // Output is discarded — only the operator state mutations matter.
+    for change in changes.iter() {
+        if change.table == pipeline.source_table {
+            let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            for sc in &source_changes {
+                let reverse = match sc {
+                    SourceChange::Add(row) => source_change_to_ivm_change(&SourceChange::Remove(row.clone())),
+                    SourceChange::Remove(row) => source_change_to_ivm_change(&SourceChange::Add(row.clone())),
+                    SourceChange::Edit { row, old_row } => source_change_to_ivm_change(&SourceChange::Edit {
+                        row: old_row.clone(),
+                        old_row: row.clone(),
+                    }),
+                };
+                // Push through each operator sequentially (inner to outer)
+                let mut current_changes = vec![reverse];
+                for op in op_list.iter_mut() {
+                    let mut next_changes = Vec::new();
+                    for c in current_changes {
+                        next_changes.extend(op.push(c));
+                    }
+                    current_changes = next_changes;
+                }
+            }
+        }
+    }
+
+    // Collect child table mappings for child-change handling.
+    let child_table_map = collect_child_table_map(&pipeline.operator_config);
+    let children_of_map = collect_children_of_map(&pipeline.operator_config);
+
+    // Helper: push a change through all operators sequentially
+    fn push_through_all(change: IvmChange, ops: &mut [Box<dyn IvmOperator>]) -> Vec<IvmChange> {
+        let mut current = vec![change];
+        for op in ops.iter_mut() {
+            let mut next = Vec::new();
+            for c in current {
+                next.extend(op.push(c));
+            }
+            current = next;
+        }
+        current
+    }
+
+    for change in changes.iter() {
+        if change.table == pipeline.source_table {
+            // Root table change — push through all operators sequentially
+            let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            for sc in source_changes {
+                let ivm_change = source_change_to_ivm_change(&sc);
+                let output_changes = push_through_all(ivm_change, &mut op_list);
+                for oc in &output_changes {
+                    flatten_ivm_change_to_row_changes(
+                        &mut row_changes,
+                        oc,
+                        &pipeline.query_id,
+                        &change.table,
+                        &pipeline.primary_key,
+                        &pipeline.all_primary_keys,
+                    );
+                }
+            }
+        } else if let Some(child_infos) = child_table_map.get(&change.table) {
+            // Child table change — emit removes directly as RowChanges.
+            // For adds, the root handler already covers them via JoinOperator
+            // fetch_children() (post-tx DB has the new rows).
+            // For removes, the post-transaction DB lacks the deleted rows,
+            // so we must emit them directly here.
+            for ci in child_infos {
+                let child_source_changes = diff_change_to_source_changes(change, &ci.child_pk);
+                for sc in &child_source_changes {
+                    match sc {
+                        SourceChange::Remove(ref row) => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: None,
+                                change_type: "remove".to_string(),
+                            });
+                            // Emit descendant removals for multi-level joins
+                            let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table, &children_of_map,
+                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                        SourceChange::Add(ref row) => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                change_type: "add".to_string(),
+                            });
+                        }
+                        SourceChange::Edit { row, .. } => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                                change_type: "edit".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate by (table, row_key, change_type) — when both a root row and its
+    // child are changed in the same transaction, JoinOperator.fetch_children() and
+    // the direct child emit can produce duplicates.
+    {
+        let mut seen = HashSet::new();
+        row_changes.retain(|rc| {
+            let key = format!("{}|{}|{}", rc.table, serde_json::to_string(&rc.row_key).unwrap_or_default(), rc.change_type);
+            seen.insert(key)
+        });
+    }
+
+    // Filter output rows to only include columns specified in column_types.
+    // Without this, Rust returns ALL SQLite columns while TS only returns
+    // the columns from the query's schema.
+    if let Some(ref ct) = pipeline.column_types {
+        for rc in &mut row_changes {
+            if let Some(ref mut row) = rc.row {
+                if let Some(cols) = ct.get(&rc.table) {
+                    row.retain(|k, _| cols.contains_key(k));
+                }
             }
         }
     }
@@ -937,6 +1074,437 @@ fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
             node: make_node(row),
             old_node: make_node(old_row),
         },
+    }
+}
+
+// ─── Child Table Map (for routing child changes to parent pipelines) ────────
+
+#[derive(Debug, Clone)]
+struct ChildTableInfo {
+    parent_key: Vec<String>,
+    child_key: Vec<String>,
+    relationship_name: String,
+    child_pk: Vec<String>,
+}
+
+fn collect_child_table_map(
+    configs: &[OperatorConfig],
+) -> HashMap<String, Vec<ChildTableInfo>> {
+    let mut map: HashMap<String, Vec<ChildTableInfo>> = HashMap::new();
+    collect_child_table_map_recursive(configs, &mut map);
+    map
+}
+
+fn collect_child_table_map_recursive(
+    configs: &[OperatorConfig],
+    map: &mut HashMap<String, Vec<ChildTableInfo>>,
+) {
+    for config in configs {
+        match config {
+            OperatorConfig::Join {
+                parent_key,
+                child_key,
+                relationship_name,
+                child,
+            } => {
+                if let Some(OperatorConfig::Source {
+                    table_name,
+                    primary_key,
+                    ..
+                }) = child.first()
+                {
+                    map.entry(table_name.clone())
+                        .or_default()
+                        .push(ChildTableInfo {
+                            parent_key: parent_key.clone(),
+                            child_key: child_key.clone(),
+                            relationship_name: relationship_name.clone(),
+                            child_pk: primary_key.clone(),
+                        });
+                }
+                collect_child_table_map_recursive(child, map);
+            }
+            OperatorConfig::Exists {
+                parent_key,
+                child_key,
+                relationship_name,
+                child,
+                ..
+            } => {
+                if let Some(OperatorConfig::Source {
+                    table_name,
+                    primary_key,
+                    ..
+                }) = child.first()
+                {
+                    map.entry(table_name.clone())
+                        .or_default()
+                        .push(ChildTableInfo {
+                            parent_key: parent_key.clone(),
+                            child_key: child_key.clone(),
+                            relationship_name: relationship_name.clone(),
+                            child_pk: primary_key.clone(),
+                        });
+                }
+                collect_child_table_map_recursive(child, map);
+            }
+            OperatorConfig::OrExists { branches, .. } => {
+                for branch in branches {
+                    if let Some(OperatorConfig::Source {
+                        table_name,
+                        primary_key,
+                        ..
+                    }) = branch.child.first()
+                    {
+                        map.entry(table_name.clone())
+                            .or_default()
+                            .push(ChildTableInfo {
+                                parent_key: branch.parent_key.clone(),
+                                child_key: branch.child_key.clone(),
+                                relationship_name: branch.relationship_name.clone(),
+                                child_pk: primary_key.clone(),
+                            });
+                    }
+                    collect_child_table_map_recursive(&branch.child, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Maps parent_table_name → Vec<ChildRelation>. Inverse of child_table_map.
+#[derive(Debug, Clone)]
+struct ChildRelation {
+    child_table: String,
+    parent_join_col: Vec<String>,  // column(s) in parent table
+    child_join_col: Vec<String>,   // column(s) in child table
+    child_pk: Vec<String>,
+    relationship_name: String,
+}
+
+fn collect_children_of_map(
+    configs: &[OperatorConfig],
+) -> HashMap<String, Vec<ChildRelation>> {
+    let mut map: HashMap<String, Vec<ChildRelation>> = HashMap::new();
+    collect_children_of_recursive(configs, None, &mut map);
+    map
+}
+
+fn collect_children_of_recursive(
+    configs: &[OperatorConfig],
+    current_table: Option<&str>,
+    map: &mut HashMap<String, Vec<ChildRelation>>,
+) {
+    for config in configs {
+        match config {
+            OperatorConfig::Source { table_name, .. } => {
+                collect_children_of_recursive(&configs[1..], Some(table_name), map);
+                return;
+            }
+            OperatorConfig::Join {
+                parent_key,
+                child_key,
+                relationship_name,
+                child,
+            } => {
+                if let (Some(parent), Some(OperatorConfig::Source { table_name, primary_key, .. })) =
+                    (current_table, child.first())
+                {
+                    map.entry(parent.to_string())
+                        .or_default()
+                        .push(ChildRelation {
+                            child_table: table_name.clone(),
+                            parent_join_col: parent_key.clone(),
+                            child_join_col: child_key.clone(),
+                            child_pk: primary_key.clone(),
+                            relationship_name: relationship_name.clone(),
+                        });
+                }
+                // Recurse into child config to find deeper levels
+                collect_children_of_recursive(child, None, map);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_descendant_removals(
+    db_path: &str,
+    deleted_row: &serde_json::Map<String, serde_json::Value>,
+    deleted_table: &str,
+    children_of: &HashMap<String, Vec<ChildRelation>>,
+    query_id: &str,
+    column_types: &Option<HashMap<String, HashMap<String, String>>>,
+    row_changes: &mut Vec<RowChange>,
+) {
+    let child_rels = match children_of.get(deleted_table) {
+        Some(rels) => rels,
+        None => return,
+    };
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for rel in child_rels {
+        // Build WHERE clause: child_join_col[i] = deleted_row[parent_join_col[i]]
+        let mut conditions = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        let mut skip = false;
+        for (pcol, ccol) in rel.parent_join_col.iter().zip(rel.child_join_col.iter()) {
+            if let Some(val) = deleted_row.get(pcol) {
+                conditions.push(format!("\"{}\" = ?", ccol));
+                match val {
+                    serde_json::Value::String(s) => params.push(rusqlite::types::Value::Text(s.clone())),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            params.push(rusqlite::types::Value::Integer(i));
+                        } else if let Some(f) = n.as_f64() {
+                            params.push(rusqlite::types::Value::Real(f));
+                        }
+                    }
+                    serde_json::Value::Null => { skip = true; break; }
+                    _ => { skip = true; break; }
+                }
+            } else {
+                skip = true;
+                break;
+            }
+        }
+        if skip || conditions.is_empty() {
+            continue;
+        }
+
+        let sql = format!(
+            "SELECT * FROM \"{}\" WHERE {}",
+            rel.child_table,
+            conditions.join(" AND ")
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let rows_iter = match stmt.query_map(param_refs.as_slice(), |r| {
+            let mut map = serde_json::Map::new();
+            for (i, name) in col_names.iter().enumerate() {
+                let val: rusqlite::types::Value = r.get(i)?;
+                let json_val = match val {
+                    rusqlite::types::Value::Null => serde_json::Value::Null,
+                    rusqlite::types::Value::Integer(n) => serde_json::json!(n),
+                    rusqlite::types::Value::Real(f) => serde_json::json!(f),
+                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                    rusqlite::types::Value::Blob(b) => serde_json::Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &b)),
+                };
+                map.insert(name.clone(), json_val);
+            }
+            Ok(map)
+        }) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        for row_result in rows_iter {
+            if let Ok(child_row) = row_result {
+                let row_key = extract_row_key_from_map(&child_row, &rel.child_pk);
+                let mut row_map: HashMap<String, serde_json::Value> = child_row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                if let Some(ref ct) = column_types {
+                    if let Some(cols) = ct.get(&rel.relationship_name) {
+                        row_map.retain(|k, _| cols.contains_key(k));
+                    }
+                }
+                row_changes.push(RowChange {
+                    query_id: query_id.to_string(),
+                    table: rel.relationship_name.clone(),
+                    row_key,
+                    row: None,
+                    change_type: "remove".to_string(),
+                });
+                // Recurse for deeper levels
+                emit_descendant_removals(
+                    db_path, &child_row, &rel.child_table, children_of,
+                    query_id, column_types, row_changes,
+                );
+            }
+        }
+    }
+}
+
+// ─── Flatten IVM Changes to RowChanges ──────────────────────────────────────
+
+fn extract_row_key_from_source_row(
+    row: &crate::source::Row,
+    pk: &[String],
+) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = pk
+        .iter()
+        .filter_map(|k| row.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
+    serde_json::Value::Object(map)
+}
+
+fn extract_row_key_from_map(
+    row: &serde_json::Map<String, serde_json::Value>,
+    pk: &[String],
+) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = pk
+        .iter()
+        .filter_map(|k| row.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
+    serde_json::Value::Object(map)
+}
+
+fn flatten_ivm_change_to_row_changes(
+    out: &mut Vec<RowChange>,
+    change: &IvmChange,
+    query_id: &str,
+    root_table: &str,
+    root_pk: &[String],
+    all_pks: &HashMap<String, Vec<String>>,
+) {
+    match change {
+        IvmChange::Add(node) => {
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: root_table.to_string(),
+                row_key: extract_row_key_from_map(&node.row, root_pk),
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "add".to_string(),
+            });
+            flatten_node_relationships(out, query_id, node, "add", all_pks);
+        }
+        IvmChange::Remove(node) => {
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: root_table.to_string(),
+                row_key: extract_row_key_from_map(&node.row, root_pk),
+                row: None,
+                change_type: "remove".to_string(),
+            });
+            flatten_node_relationships(out, query_id, node, "remove", all_pks);
+        }
+        IvmChange::Edit { node, .. } => {
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: root_table.to_string(),
+                row_key: extract_row_key_from_map(&node.row, root_pk),
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "edit".to_string(),
+            });
+        }
+        IvmChange::Child { node, child } => {
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: root_table.to_string(),
+                row_key: extract_row_key_from_map(&node.row, root_pk),
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "edit".to_string(),
+            });
+            flatten_child_change(out, query_id, child, all_pks);
+        }
+    }
+}
+
+fn flatten_child_change(
+    out: &mut Vec<RowChange>,
+    query_id: &str,
+    child_data: &zero_ivm_rs::types::ChildData,
+    all_pks: &HashMap<String, Vec<String>>,
+) {
+    let child_table = &child_data.relationship_name;
+    let child_pk = all_pks.get(child_table);
+    match &*child_data.change {
+        IvmChange::Add(node) => {
+            let row_key = match child_pk {
+                Some(pk) => extract_row_key_from_map(&node.row, pk),
+                None => serde_json::Value::Object(node.row.clone()),
+            };
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: child_table.to_string(),
+                row_key,
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "add".to_string(),
+            });
+            flatten_node_relationships(out, query_id, node, "add", all_pks);
+        }
+        IvmChange::Remove(node) => {
+            let row_key = match child_pk {
+                Some(pk) => extract_row_key_from_map(&node.row, pk),
+                None => serde_json::Value::Object(node.row.clone()),
+            };
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: child_table.to_string(),
+                row_key,
+                row: None,
+                change_type: "remove".to_string(),
+            });
+            flatten_node_relationships(out, query_id, node, "remove", all_pks);
+        }
+        IvmChange::Edit { node, .. } => {
+            let row_key = match child_pk {
+                Some(pk) => extract_row_key_from_map(&node.row, pk),
+                None => serde_json::Value::Object(node.row.clone()),
+            };
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: child_table.to_string(),
+                row_key,
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "edit".to_string(),
+            });
+        }
+        IvmChange::Child { node, child } => {
+            let row_key = match child_pk {
+                Some(pk) => extract_row_key_from_map(&node.row, pk),
+                None => serde_json::Value::Object(node.row.clone()),
+            };
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: child_table.to_string(),
+                row_key,
+                row: Some(node.row.clone().into_iter().collect()),
+                change_type: "edit".to_string(),
+            });
+            flatten_child_change(out, query_id, child, all_pks);
+        }
+    }
+}
+
+fn flatten_node_relationships(
+    out: &mut Vec<RowChange>,
+    query_id: &str,
+    node: &zero_ivm_rs::types::Node,
+    change_type: &str,
+    all_pks: &HashMap<String, Vec<String>>,
+) {
+    for (rel_name, children) in &node.relationships {
+        let rel_pk = all_pks.get(rel_name);
+        for child_node in children {
+            let row_key = match rel_pk {
+                Some(pk) => extract_row_key_from_map(&child_node.row, pk),
+                None => serde_json::Value::Object(child_node.row.clone()),
+            };
+            let row = if change_type == "remove" {
+                None
+            } else {
+                Some(child_node.row.clone().into_iter().collect())
+            };
+            out.push(RowChange {
+                query_id: query_id.to_string(),
+                table: rel_name.to_string(),
+                row_key,
+                row,
+                change_type: change_type.to_string(),
+            });
+            flatten_node_relationships(out, query_id, child_node, change_type, all_pks);
+        }
     }
 }
 
@@ -1215,6 +1783,121 @@ pub fn rust_advance_full_buf(
         .map_err(|e| napi::Error::from_reason(format!("Failed to parse pipeline_configs: {e}")))?;
 
     let full_result = advance_pipelines_full(&db_path, &changes, &pipelines);
+    let result = AdvanceResult {
+        changes: full_result.changes,
+        error: full_result.error,
+        error_type: full_result.error_type,
+    };
+    Ok(Buffer::from(encode_advance_result_buf(&result)))
+}
+
+/// Collect split_edit_keys from an AST: all parent correlation keys from
+/// related joins and exists subqueries. When a parent row's correlation key
+/// changes, the edit must be split into remove+add so the join/exists operator
+/// sees it as a membership change rather than an in-place update.
+fn collect_split_edit_keys(ast: &crate::ast_to_config::Ast) -> Vec<String> {
+    let mut keys = std::collections::HashSet::new();
+    if let Some(related) = &ast.related {
+        for rel in related {
+            for field in &rel.correlation.parent_field {
+                keys.insert(field.clone());
+            }
+        }
+    }
+    fn collect_from_cond(cond: &crate::ast_to_config::Condition, keys: &mut std::collections::HashSet<String>) {
+        match cond {
+            crate::ast_to_config::Condition::And { conditions } |
+            crate::ast_to_config::Condition::Or { conditions } => {
+                for c in conditions {
+                    collect_from_cond(c, keys);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(cond) = &ast.where_cond {
+        collect_from_cond(cond, &mut keys);
+    }
+    keys.into_iter().collect()
+}
+
+/// NAPI entry point: full advance from AST format.
+/// Takes the same queries_json format as rust_hydrate (Vec<HydrateQuery>),
+/// plus changes_json (Vec<Change>). Internally translates AST → OperatorConfig
+/// via ast_to_operator_configs, then runs advance_pipelines_full.
+#[napi]
+pub fn rust_advance_from_ast_buf(
+    db_path: String,
+    changes_json: String,
+    queries_json: String,
+) -> napi::Result<Buffer> {
+    use crate::ast_to_config::{HydrateQuery, SchemaCache, ast_to_operator_configs, collect_child_tables};
+
+    let changes: Vec<Change> = serde_json::from_str(&changes_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+
+    let queries: Vec<HydrateQuery> = serde_json::from_str(&queries_json)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to parse queries JSON: {e}")))?;
+
+    if queries.is_empty() || changes.is_empty() {
+        let result = AdvanceResult {
+            changes: vec![],
+            error: None,
+            error_type: None,
+        };
+        return Ok(Buffer::from(encode_advance_result_buf(&result)));
+    }
+
+    let mut schema_cache = SchemaCache::new(&db_path);
+
+    let mut full_configs: Vec<FullPipelineConfig> = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let operator_config = ast_to_operator_configs(
+            &mut schema_cache,
+            &query.ast,
+            &query.primary_key,
+        )
+        .map_err(|e| napi::Error::from_reason(format!(
+            "AST translation failed for query '{}': {e}", query.query_id
+        )))?;
+
+        let split_edit_keys = collect_split_edit_keys(&query.ast);
+
+        // Build all_primary_keys map: rel_name → pk columns.
+        // Uses TS-provided PKs (Zero schema) when available, falls back to SQLite PRAGMA.
+        let mut all_pks: HashMap<String, Vec<String>> = HashMap::new();
+        all_pks.insert(query.ast.table.clone(), query.primary_key.clone());
+        if let Some(ref ts_pks) = query.all_primary_keys {
+            for (table_name, pk) in ts_pks {
+                all_pks.insert(table_name.clone(), pk.clone());
+            }
+        }
+        for (rel_name, table_name) in collect_child_tables(&query.ast) {
+            if !all_pks.contains_key(&rel_name) {
+                let pk = if let Some(ref ts_pks) = query.all_primary_keys {
+                    ts_pks.get(&table_name).cloned().unwrap_or_else(|| {
+                        schema_cache.get_primary_key(&table_name).unwrap_or_default()
+                    })
+                } else {
+                    schema_cache.get_primary_key(&table_name).unwrap_or_default()
+                };
+                all_pks.insert(rel_name, pk);
+            }
+        }
+
+        full_configs.push(FullPipelineConfig {
+            query_id: query.query_id.clone(),
+            source_table: query.ast.table.clone(),
+            operator_config,
+            primary_key: query.primary_key.clone(),
+            split_edit_keys,
+            column_types: query.column_types.clone(),
+            all_primary_keys: all_pks,
+            rel_to_table: HashMap::new(),
+        });
+    }
+
+    let full_result = advance_pipelines_full(&db_path, &changes, &full_configs);
     let result = AdvanceResult {
         changes: full_result.changes,
         error: full_result.error,
@@ -2653,3 +3336,4 @@ mod tests {
         assert_eq!(err_msg, "something broke");
     }
 }
+use zero_ivm_rs::types::FetchRequest;

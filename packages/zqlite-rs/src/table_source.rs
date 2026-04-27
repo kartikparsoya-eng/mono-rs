@@ -222,6 +222,22 @@ impl RustTableSource {
         &self.primary_key
     }
 
+    pub fn fetch_with_constraint(
+        &self,
+        connection_id: usize,
+        constraint: &crate::source::FetchConstraint,
+    ) -> Vec<crate::source::Row> {
+        let req = crate::source::FetchRequest {
+            constraint: Some(constraint.clone()),
+            start: None,
+            reverse: false,
+        };
+        match self.fetch(connection_id, &req) {
+            Ok(nodes) => nodes.into_iter().map(|n| n.row).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     pub fn connection(&self, id: usize) -> Option<&Connection> {
         self.connections.get(id)
     }

@@ -72,15 +72,23 @@ type RustDispatchPokeFn = (
   vsPipelinesJson: string,
 ) => Buffer;
 
+type RustAdvanceFromAstBufFn = (
+  dbPath: string,
+  changesJson: string,
+  queriesJson: string,
+) => Buffer;
+
 let rustFanOutFn: RustFanOutFn | undefined;
 let rustHydrateFn: RustHydrateFn | undefined;
 let rustDispatchPokeFn: RustDispatchPokeFn | undefined;
+let rustAdvanceFromAstBufFn: RustAdvanceFromAstBufFn | undefined;
 try {
   const esmRequire = createRequire(import.meta.url);
   const bindings = esmRequire('zqlite-rs');
   rustFanOutFn = bindings?.rustFanOut;
   rustHydrateFn = bindings?.rustHydrate;
   rustDispatchPokeFn = bindings?.rustDispatchPoke;
+  rustAdvanceFromAstBufFn = bindings?.rustAdvanceFromAstBuf;
 } catch (e) {
   // Log so operators know Rust acceleration is unavailable.
   // eslint-disable-next-line no-console
@@ -88,6 +96,7 @@ try {
   rustFanOutFn = undefined;
   rustHydrateFn = undefined;
   rustDispatchPokeFn = undefined;
+  rustAdvanceFromAstBufFn = undefined;
 }
 
 const DISABLE_RUST_DISPATCH =
@@ -1476,9 +1485,10 @@ export class PipelineDriver {
       USE_RUST_ADVANCE &&
       this.#pipelines.size > 0 &&
       this.#pipelineConfigs.size === this.#pipelines.size &&
-      // When dual-exec is enabled, allow ALL operator types through
-      // so they get compared. In production, restrict to filter-only.
+      // When dual-exec is enabled or the full AST-based advance is available,
+      // allow ALL operator types. Otherwise restrict to filter-only fan-out.
       (isDualExecEnabled() ||
+        rustAdvanceFromAstBufFn !== undefined ||
         [...this.#pipelineConfigs.values()].every(c =>
           c.operators.every(op => op.type === 'filter'),
         )) &&
@@ -1605,9 +1615,7 @@ export class PipelineDriver {
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
   } {
-    assert(rustFanOutFn, 'Rust fan-out not available');
-
-    // Use TS diff (correct two-snapshot isolation) then Rust for Rayon fan-out
+    // Use TS diff (correct two-snapshot isolation) then Rust for fan-out
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
@@ -1615,7 +1623,7 @@ export class PipelineDriver {
     const {prev, curr, changes: numChanges} = diff;
 
     this.#lc.debug?.(
-      `rust_fan_out ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelineConfigs.size} pipelines`,
+      `rust_advance ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelines.size} pipelines`,
     );
 
     // Collect changes from TS diff iterator
@@ -1629,40 +1637,51 @@ export class PipelineDriver {
       collectedChanges.push(change);
     }
 
-    const changesJson = JSON.stringify(collectedChanges);
-    const pipelineConfigsJson = this.#serializePipelineConfigs();
+    let changes: Iterable<RowChange | 'yield'>;
 
-    const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
-
-    const result = JSON.parse(resultJson) as {
-      changes: Array<{
-        queryID: string;
-        table: string;
-        row_key: Row;
-        row: Row | null;
-        type: string;
-      }>;
-      error?: string;
-      error_type?: string;
-    };
-
-    if (result.error) {
-      throw new Error(result.error);
+    if (rustAdvanceFromAstBufFn) {
+      // Full AST-based advance: supports all operator types
+      const rustChanges = this.#runRustAdvanceFromAst(
+        curr.db.db.name,
+        collectedChanges,
+      );
+      changes = rustChanges;
+    } else {
+      // Legacy filter-only fan-out
+      assert(rustFanOutFn, 'Rust fan-out not available');
+      const changesJson = JSON.stringify(collectedChanges);
+      const pipelineConfigsJson = this.#serializePipelineConfigs();
+      const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
+      const result = JSON.parse(resultJson) as {
+        changes: Array<{
+          queryID: string;
+          table: string;
+          row_key: Row;
+          row: Row | null;
+          type: string;
+        }>;
+        error?: string;
+        error_type?: string;
+      };
+      if (result.error) {
+        throw new Error(result.error);
+      }
+      changes = this.#convertRustChanges(
+        result.changes,
+        this.#combinedPermissionTables(),
+      );
     }
 
     for (const table of this.#tables.values()) {
       table.setDB(curr.db.db);
     }
     this.#ensureCostModelExistsIfEnabled(curr.db.db);
-    this.#lc.debug?.(`Rust fan-out advanced to ${curr.version}`);
+    this.#lc.debug?.(`Rust advance advanced to ${curr.version}`);
 
     return {
       version: curr.version,
       numChanges,
-      changes: this.#convertRustChanges(
-        result.changes,
-        this.#combinedPermissionTables(),
-      ),
+      changes,
     };
   }
 
@@ -1995,34 +2014,43 @@ export class PipelineDriver {
       `dual-exec: ${this.#pipelineConfigs.size} pipelines (full tree)`,
     );
 
-    // 2. Run Rust fan-out on collected changes
+    // 2. Run Rust advance on collected changes
+    // Prefer full AST-based advance (supports all operator types) over
+    // filter-only fan-out when the binding is available.
     let rustChanges: RowChange[] = [];
     try {
-      const changesJson = JSON.stringify(collectedChanges);
-      const pipelineConfigsJson = this.#serializePipelineConfigs();
-      const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
-      const result = JSON.parse(resultJson) as {
-        changes: Array<{
-          queryID: string;
-          table: string;
-          row_key: Row;
-          row: Row | null;
-          type: string;
-        }>;
-        error?: string;
-      };
-      if (!result.error) {
-        rustChanges = materializeChanges(
-          this.#convertRustChanges(
-            result.changes,
-            this.#combinedPermissionTables(),
-          ),
+      if (rustAdvanceFromAstBufFn) {
+        rustChanges = this.#runRustAdvanceFromAst(
+          curr.db.db.name,
+          collectedChanges,
         );
       } else {
-        this.#lc.warn?.(`[dual-exec] Rust fan-out error: ${result.error}`);
+        const changesJson = JSON.stringify(collectedChanges);
+        const pipelineConfigsJson = this.#serializePipelineConfigs();
+        const resultJson = rustFanOutFn(changesJson, pipelineConfigsJson);
+        const result = JSON.parse(resultJson) as {
+          changes: Array<{
+            queryID: string;
+            table: string;
+            row_key: Row;
+            row: Row | null;
+            type: string;
+          }>;
+          error?: string;
+        };
+        if (!result.error) {
+          rustChanges = materializeChanges(
+            this.#convertRustChanges(
+              result.changes,
+              this.#combinedPermissionTables(),
+            ),
+          );
+        } else {
+          this.#lc.warn?.(`[dual-exec] Rust fan-out error: ${result.error}`);
+        }
       }
     } catch (e) {
-      this.#lc.warn?.(`[dual-exec] Rust fan-out exception: ${e}`);
+      this.#lc.warn?.(`[dual-exec] Rust advance exception: ${e}`);
     }
 
     // 3. Run TS path on the same collected changes via synthetic diff
@@ -2056,6 +2084,67 @@ export class PipelineDriver {
     // Compare after all TS changes have been yielded.
     // TS is always the source of truth; this validates Rust correctness.
     dualExecCompare('advance', tsChanges, rustChanges, this.#lc);
+  }
+
+  /**
+   * Run the full Rust advance path using AST-based operator chain.
+   * Builds HydrateQuery payloads from stored pipeline ASTs and sends
+   * them with the collected changes to rust_advance_from_ast_buf.
+   */
+  #runRustAdvanceFromAst(
+    dbPath: string,
+    collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }>,
+  ): RowChange[] {
+    assert(rustAdvanceFromAstBufFn, 'Rust advance from AST not available');
+
+    const queries: Array<{
+      query_id: string;
+      ast: AST;
+      primary_key: string[];
+      column_types: Record<string, Record<string, string>>;
+      all_primary_keys: Record<string, string[]>;
+    }> = [];
+
+    for (const [queryID, pipeline] of this.#pipelines) {
+      const ast = pipeline.transformedAst;
+      const tableName = ast.table ?? '';
+      const pk = this.#primaryKeys?.get(tableName) ?? [];
+      queries.push({
+        query_id: queryID,
+        ast,
+        primary_key: [...pk],
+        column_types: this.#collectColumnTypes(ast),
+        all_primary_keys: this.#collectAllPrimaryKeys(ast),
+      });
+    }
+
+    if (queries.length === 0) {
+      return [];
+    }
+
+    const changesJson = JSON.stringify(collectedChanges);
+    const queriesJson = JSON.stringify(queries);
+    const resultBuf = rustAdvanceFromAstBufFn(dbPath, changesJson, queriesJson);
+    const decoded = decodeAdvanceResultBuf(resultBuf);
+
+    if (decoded.error) {
+      this.#lc.warn?.(
+        `[dual-exec] Rust advance-from-ast error: ${decoded.error}`,
+      );
+      return [];
+    }
+
+    return materializeChanges(
+      this.#convertDispatchChanges(
+        decoded.changes,
+        this.#combinedPermissionTables(),
+      ),
+    );
   }
 
   /** Implements `BuilderDelegate.getSource()` */

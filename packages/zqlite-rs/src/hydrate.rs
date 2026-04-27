@@ -943,9 +943,70 @@ fn build_next_operator(
 /// Build an operator chain suitable for push propagation (advance path).
 /// Uses sequential JoinOperator/ExistsOperator which have proper push() implementations.
 /// The chain starts AFTER the root Source — the caller pushes changes directly into it.
+/// Build a flat list of push operators (inner to outer) for sequential push.
+/// Each operator can be pushed through independently. TakeOperator keeps
+/// the SourceBridge as input for replacement fetches during push.
+/// For warm-up, call fetch() on the first operator that has state (e.g. TakeOperator).
+pub fn build_push_operator_list(
+    source: Arc<RustTableSource>,
+    configs: &[OperatorConfig],
+    connection_id: usize,
+) -> Result<Vec<Box<dyn Operator>>, String> {
+    if configs.is_empty() {
+        return Err("empty operator config".to_string());
+    }
+
+    // Skip the root Source config
+    let rest = match &configs[0] {
+        OperatorConfig::Source { .. } => &configs[1..],
+        _ => return Err("first config must be a Source".to_string()),
+    };
+
+    if rest.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut operators: Vec<Box<dyn Operator>> = Vec::new();
+
+    for config in rest {
+        match config {
+            OperatorConfig::Take { .. } | OperatorConfig::Skip { .. } | OperatorConfig::Cap { .. } => {
+                // These operators need SourceBridge for fetch-based state management
+                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
+                let op = build_push_next_operator(source.clone(), bridge, config)?;
+                operators.push(op);
+            }
+            OperatorConfig::Exists { .. } | OperatorConfig::OrExists { .. } => {
+                // Exists operators need their child source for count tracking
+                let dummy = Box::new(PassthroughOperator::new());
+                let op = build_push_next_operator(source.clone(), dummy, config)?;
+                operators.push(op);
+            }
+            OperatorConfig::Filter { .. } => {
+                let dummy = Box::new(PassthroughOperator::new());
+                let op = build_push_next_operator(source.clone(), dummy, config)?;
+                operators.push(op);
+            }
+            OperatorConfig::Join { .. } => {
+                // Join just attaches children during push — parent input not used for push
+                let dummy = Box::new(PassthroughOperator::new());
+                let op = build_push_next_operator(source.clone(), dummy, config)?;
+                operators.push(op);
+            }
+            OperatorConfig::Source { .. } => {
+                return Err("unexpected Source in non-root position".to_string());
+            }
+        }
+    }
+
+    Ok(operators)
+}
+
+/// Build a nested chain for fetch (warm-up). Returns the outermost operator.
 pub fn build_push_operator_chain(
     source: Arc<RustTableSource>,
     configs: &[OperatorConfig],
+    connection_id: usize,
 ) -> Result<Option<Box<dyn Operator>>, String> {
     if configs.is_empty() {
         return Err("empty operator config".to_string());
@@ -961,13 +1022,65 @@ pub fn build_push_operator_chain(
         return Ok(None);
     }
 
-    // Build a dummy root that will receive pushed changes
-    let root: Box<dyn Operator> = Box::new(PassthroughOperator::new());
+    // Build a source-backed root so TakeOperator/SkipOperator can fetch from DB
+    let root: Box<dyn Operator> = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
     let mut current = root;
     for config in rest {
         current = build_push_next_operator(source.clone(), current, config)?;
     }
     Ok(Some(current))
+}
+
+/// A bridge operator that connects the RustTableSource to the push chain.
+/// fetch() queries the actual SQLite DB; push() passes through.
+struct SourceBridgeOperator {
+    source: Arc<RustTableSource>,
+    connection_id: usize,
+}
+
+impl SourceBridgeOperator {
+    fn new(source: Arc<RustTableSource>, connection_id: usize) -> Self {
+        Self { source, connection_id }
+    }
+}
+
+impl Operator for SourceBridgeOperator {
+    fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+        // Convert zero_ivm_rs::types::FetchRequest → source::FetchRequest
+        let source_req = crate::source::FetchRequest {
+            constraint: req.constraint.as_ref().map(|c| crate::source::FetchConstraint {
+                key: c.key.clone(),
+                value: c.value.clone(),
+            }),
+            start: req.start.as_ref().map(|s| crate::source::FetchStart {
+                row: s.row.clone(),
+                basis: s.basis.clone(),
+            }),
+            reverse: req.reverse,
+        };
+        match self.source.fetch(self.connection_id, &source_req) {
+            Ok(nodes) => {
+                nodes.into_iter().map(|n| Node {
+                row: n.row,
+                relationships: n.relationships.into_iter().map(|(k, v)| {
+                    (k, v.into_iter().map(|cn| Node { row: cn.row, relationships: std::collections::HashMap::new() }).collect())
+                }).collect(),
+            }).collect()
+            }
+            Err(e) => {
+                eprintln!("SourceBridgeOperator::fetch error: {e}");
+                vec![]
+            }
+        }
+    }
+
+    fn push(&mut self, change: Change) -> Vec<Change> {
+        vec![change]
+    }
+
+    fn op_type(&self) -> &'static str {
+        "source_bridge"
+    }
 }
 
 /// A no-op operator used as the root of push chains.
