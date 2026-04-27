@@ -1712,6 +1712,269 @@ describe('pipeline-driver edge cases', () => {
     );
   });
 
+  // e1/e2/e3: EXISTS becomes true after child insert — parent should appear.
+  test('EXISTS advance: inserting first child makes parent appear', () => {
+    const ISSUES_EXISTS: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'correlatedSubquery',
+        op: 'EXISTS',
+        related: {
+          system: 'client',
+          correlation: {
+            parentField: ['id'],
+            childField: ['issueID'],
+          },
+          subquery: {
+            table: 'comments',
+            alias: 'comments',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      },
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-exists',
+        'qExists',
+        ISSUES_EXISTS,
+        startTimer(),
+      ),
+    ];
+
+    // Issues '1' and '2' have comments, issue '3' does not.
+    const hydratedIssues = hydrated.filter(
+      c => c !== 'yield' && c.table === 'issues',
+    );
+    expect(hydratedIssues).toHaveLength(2);
+    const hydratedIds = hydratedIssues
+      .map(r => (r as {rowKey: {id: string}}).rowKey.id)
+      .sort();
+    expect(hydratedIds).toEqual(['1', '2']);
+
+    // Insert a comment for issue '3' — EXISTS should now include it
+    replicator.processTransaction(
+      '134',
+      messages.insert('comments', {id: '30', issueID: '3', upvotes: 0}),
+    );
+
+    const result = changes();
+    const issueAdds = result.filter(
+      c => c.queryID === 'qExists' && c.table === 'issues' && c.type === 0,
+    );
+    expect(issueAdds).toHaveLength(1);
+    expect(issueAdds[0]).toEqual(expect.objectContaining({rowKey: {id: '3'}}));
+  });
+
+  // e1/e2/e3: NOT EXISTS becomes false after child insert — parent disappears.
+  test('NOT EXISTS advance: inserting child removes parent from results', () => {
+    const ISSUES_NOT_EXISTS: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'correlatedSubquery',
+        op: 'NOT EXISTS',
+        related: {
+          system: 'client',
+          correlation: {
+            parentField: ['id'],
+            childField: ['issueID'],
+          },
+          subquery: {
+            table: 'comments',
+            alias: 'comments',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      },
+    };
+
+    pipelines.init(clientSchema);
+    const hydrated = [
+      ...pipelines.addQuery(
+        'hash-not-exists-adv',
+        'qNotExistsAdv',
+        ISSUES_NOT_EXISTS,
+        startTimer(),
+      ),
+    ];
+
+    // Only issue '3' has no comments
+    const hydratedIssues = hydrated.filter(
+      c => c !== 'yield' && c.table === 'issues',
+    );
+    expect(hydratedIssues).toHaveLength(1);
+    expect(hydratedIssues[0]).toEqual(
+      expect.objectContaining({rowKey: {id: '3'}}),
+    );
+
+    // Insert a comment for issue '3' — NOT EXISTS should now exclude it
+    replicator.processTransaction(
+      '134',
+      messages.insert('comments', {id: '30', issueID: '3', upvotes: 0}),
+    );
+
+    const result = changes();
+    const issueRemoves = result.filter(
+      c =>
+        c.queryID === 'qNotExistsAdv' && c.table === 'issues' && c.type === 1,
+    );
+    expect(issueRemoves).toHaveLength(1);
+    expect(issueRemoves[0]).toEqual(
+      expect.objectContaining({rowKey: {id: '3'}}),
+    );
+  });
+
+  // e1/e2/e3: Deleting the last child makes EXISTS parent disappear.
+  test('EXISTS advance: deleting last child removes parent from results', () => {
+    const ISSUES_EXISTS: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'correlatedSubquery',
+        op: 'EXISTS',
+        related: {
+          system: 'client',
+          correlation: {
+            parentField: ['id'],
+            childField: ['issueID'],
+          },
+          subquery: {
+            table: 'comments',
+            alias: 'comments',
+            orderBy: [['id', 'asc']],
+          },
+        },
+      },
+    };
+
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-exists-del',
+        'qExistsDel',
+        ISSUES_EXISTS,
+        startTimer(),
+      ),
+    ];
+
+    // Delete the only comment for issue '1' (comment '10')
+    replicator.processTransaction(
+      '134',
+      messages.delete('comments', {id: '10'}),
+    );
+
+    const result = changes();
+    const issueRemoves = result.filter(
+      c => c.queryID === 'qExistsDel' && c.table === 'issues' && c.type === 1,
+    );
+    // Issue '1' had only 1 comment; deleting it should make EXISTS false
+    expect(issueRemoves).toHaveLength(1);
+    expect(issueRemoves[0]).toEqual(
+      expect.objectContaining({rowKey: {id: '1'}}),
+    );
+  });
+
+  // j1: Inserting ONLY a child row (no parent insert) into a join query.
+  // push_child must find existing parent and emit child ADD under it.
+  test('join advance: child-only insert matches existing parent', () => {
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-join-child',
+        'qJoinChild',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    ];
+
+    // Insert only a new comment for existing issue '1'
+    replicator.processTransaction(
+      '134',
+      messages.insert('comments', {id: '11', issueID: '1', upvotes: 42}),
+    );
+
+    const result = changes();
+    const commentAdds = result.filter(
+      c => c.queryID === 'qJoinChild' && c.table === 'comments' && c.type === 0,
+    );
+    expect(commentAdds).toHaveLength(1);
+    expect(commentAdds[0]).toEqual(
+      expect.objectContaining({rowKey: {id: '11'}}),
+    );
+
+    // No issue changes should occur (parent already existed)
+    const issueChanges = result.filter(
+      c => c.queryID === 'qJoinChild' && c.table === 'issues',
+    );
+    expect(issueChanges).toHaveLength(0);
+  });
+
+  // j1: Deleting a child row from a join query — only child REMOVE, parent stays.
+  test('join advance: child-only delete removes child, parent stays', () => {
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-join-child-del',
+        'qJoinChildDel',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    ];
+
+    // Delete comment '10' (belongs to issue '1')
+    replicator.processTransaction(
+      '134',
+      messages.delete('comments', {id: '10'}),
+    );
+
+    const result = changes();
+    const commentRemoves = result.filter(
+      c =>
+        c.queryID === 'qJoinChildDel' && c.table === 'comments' && c.type === 1,
+    );
+    expect(commentRemoves).toHaveLength(1);
+    expect(commentRemoves[0]).toEqual(
+      expect.objectContaining({rowKey: {id: '10'}}),
+    );
+
+    // Issue '1' should NOT be removed (it still exists as a parent)
+    const issueRemoves = result.filter(
+      c =>
+        c.queryID === 'qJoinChildDel' && c.table === 'issues' && c.type === 1,
+    );
+    expect(issueRemoves).toHaveLength(0);
+  });
+
+  // j1: Insert child with no matching parent — should NOT appear in join results.
+  test('join advance: orphan child insert produces no changes', () => {
+    pipelines.init(clientSchema);
+    [
+      ...pipelines.addQuery(
+        'hash-join-orphan',
+        'qJoinOrphan',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    ];
+
+    // Insert comment for non-existent issue '999'
+    replicator.processTransaction(
+      '134',
+      messages.insert('comments', {id: '99', issueID: '999', upvotes: 0}),
+    );
+
+    const result = changes();
+    const commentAdds = result.filter(
+      c =>
+        c.queryID === 'qJoinOrphan' && c.table === 'comments' && c.type === 0,
+    );
+    expect(commentAdds).toHaveLength(0);
+  });
+
   test('ZERO_DISABLE_RUST_IVM=1 forces TS path and produces correct output', () => {
     const origEnv = process.env.ZERO_DISABLE_RUST_IVM;
     try {

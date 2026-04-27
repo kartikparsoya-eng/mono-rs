@@ -1197,16 +1197,13 @@ struct ChildTableInfo {
 }
 
 /// Check if a child row has a matching parent in the DB for ALL join key columns.
-/// For single-column keys this is always true (the child_table_map lookup already filtered).
-/// For compound keys this prevents false matches on the first column only.
+/// This prevents orphan child rows (whose FK points to a non-existent parent)
+/// from being emitted as changes.
 fn child_row_has_parent(
     db_path: &str,
     ci: &ChildTableInfo,
     child_row: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    if ci.parent_key.len() <= 1 {
-        return true;
-    }
     let mut where_parts = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     for (pcol, ccol) in ci.parent_key.iter().zip(ci.child_key.iter()) {
