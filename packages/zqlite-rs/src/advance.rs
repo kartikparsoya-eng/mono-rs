@@ -2434,7 +2434,7 @@ fn coerce_value(val: serde_json::Value, value_type: &str) -> serde_json::Value {
 
 // ─── Persistent Pipeline ────────────────────────────────────────────────────
 
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 struct PipelineState {
     source: Arc<RustTableSource>,
@@ -2456,13 +2456,16 @@ struct PipelineState {
 /// and per-advance warmup/rewind cycles.
 #[napi]
 pub struct RustPipeline {
-    db_path: String,
-    pipelines: Mutex<Vec<PipelineState>>,
+    db_path: Mutex<String>,
+    pipelines: RwLock<Vec<Mutex<PipelineState>>>,
 }
 
-// SAFETY: RustPipeline is only accessed from the NAPI (JS main) thread.
-// The inner operator trees contain Arc<RustTableSource> which is already
-// declared Send+Sync. The Mutex provides interior mutability safely.
+// SAFETY: RustPipeline fields are Send+Sync:
+// - db_path: Mutex<String> is Send+Sync
+// - pipelines: RwLock<Vec<Mutex<PipelineState>>> where PipelineState contains
+//   Arc<RustTableSource> (Send+Sync) and Vec<Box<dyn Operator + Send>>.
+//   All inner types are Send. The RwLock+Mutex combination provides safe
+//   interior mutability. Rayon par_iter requires Send.
 unsafe impl Send for RustPipeline {}
 unsafe impl Sync for RustPipeline {}
 
@@ -2747,29 +2750,30 @@ impl RustPipeline {
                 .map_err(|e| napi::Error::from_reason(format!(
                     "Failed to build pipeline '{}': {e}", query.query_id
                 )))?;
-            pipelines.push(state);
+            pipelines.push(Mutex::new(state));
         }
 
         Ok(Self {
-            db_path,
-            pipelines: Mutex::new(pipelines),
+            db_path: Mutex::new(db_path),
+            pipelines: RwLock::new(pipelines),
         })
     }
 
     /// Run initial hydration: fetch from all persistent operator trees.
     #[napi]
     pub fn hydrate(&self) -> napi::Result<Buffer> {
-        let mut pipelines = self.pipelines.lock()
+        let pipelines = self.pipelines.read()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
 
-        let mut all_row_changes = Vec::new();
+        let all_row_changes: Vec<RowChange> = pipelines.par_iter().flat_map(|pipeline_mutex| {
+            let mut pipeline = pipeline_mutex.lock().unwrap();
+            let mut row_changes = Vec::new();
 
-        for pipeline in pipelines.iter_mut() {
             if pipeline.has_operators {
                 let last = pipeline.op_list.len() - 1;
                 let nodes = pipeline.op_list[last].fetch(&FetchRequest::default());
                 flatten_nodes_to_row_changes(
-                    &mut all_row_changes,
+                    &mut row_changes,
                     &pipeline.query_id,
                     &pipeline.source_table,
                     &pipeline.primary_key,
@@ -2793,7 +2797,7 @@ impl RustPipeline {
                         }
                     }).collect();
                     flatten_nodes_to_row_changes(
-                        &mut all_row_changes,
+                        &mut row_changes,
                         &pipeline.query_id,
                         &pipeline.source_table,
                         &pipeline.primary_key,
@@ -2804,7 +2808,9 @@ impl RustPipeline {
                     );
                 }
             }
-        }
+
+            row_changes
+        }).collect();
 
         let result = AdvanceResult {
             changes: all_row_changes,
@@ -2832,16 +2838,15 @@ impl RustPipeline {
             return Ok(Buffer::from(encode_advance_result_buf(&result)));
         }
 
-        let mut pipelines = self.pipelines.lock()
+        let pipelines = self.pipelines.read()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
 
-        let db_path = self.db_path.clone();
-        let mut all_row_changes = Vec::new();
+        let db_path = self.db_path.lock().unwrap().clone();
 
-        for pipeline in pipelines.iter_mut() {
-            let row_changes = advance_persistent_pipeline(pipeline, &changes, &db_path);
-            all_row_changes.extend(row_changes);
-        }
+        let all_row_changes: Vec<RowChange> = pipelines.par_iter().flat_map(|pipeline_mutex| {
+            let mut pipeline = pipeline_mutex.lock().unwrap();
+            advance_persistent_pipeline(&mut pipeline, &changes, &db_path)
+        }).collect();
 
         let result = AdvanceResult {
             changes: all_row_changes,
@@ -2854,19 +2859,21 @@ impl RustPipeline {
 
     /// Re-open SQLite connections at a new path without rebuilding operator trees.
     #[napi]
-    pub fn swap_snapshot(&mut self, new_db_path: String) -> napi::Result<()> {
-        let mut pipelines = self.pipelines.lock()
+    pub fn swap_snapshot(&self, new_db_path: String) -> napi::Result<()> {
+        let pipelines = self.pipelines.read()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
 
-        for pipeline in pipelines.iter_mut() {
+        // swap_db is safe to call concurrently — each source has its own Mutex<Connection>
+        pipelines.par_iter().try_for_each(|pipeline_mutex| {
+            let pipeline = pipeline_mutex.lock().unwrap();
             pipeline.source.swap_db(&new_db_path)
                 .map_err(|e| napi::Error::from_reason(format!(
                     "Failed to swap DB for pipeline '{}': {e}", pipeline.query_id
-                )))?;
-        }
+                )))
+        })?;
 
         drop(pipelines);
-        self.db_path = new_db_path;
+        *self.db_path.lock().unwrap() = new_db_path;
         Ok(())
     }
 
@@ -2878,31 +2885,32 @@ impl RustPipeline {
         let query: HydrateQuery = serde_json::from_str(&query_json)
             .map_err(|e| napi::Error::from_reason(format!("Failed to parse query JSON: {e}")))?;
 
-        let mut schema_cache = SchemaCache::new(&self.db_path);
-        let state = build_pipeline_state(&self.db_path, &query, &mut schema_cache)
+        let db_path = self.db_path.lock().unwrap().clone();
+        let mut schema_cache = SchemaCache::new(&db_path);
+        let state = build_pipeline_state(&db_path, &query, &mut schema_cache)
             .map_err(|e| napi::Error::from_reason(format!(
                 "Failed to build pipeline '{}': {e}", query.query_id
             )))?;
 
-        let mut pipelines = self.pipelines.lock()
+        let mut pipelines = self.pipelines.write()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
-        pipelines.push(state);
+        pipelines.push(Mutex::new(state));
         Ok(())
     }
 
     /// Remove a query from the persistent pipeline set.
     #[napi]
     pub fn remove_query(&self, query_id: String) -> napi::Result<()> {
-        let mut pipelines = self.pipelines.lock()
+        let mut pipelines = self.pipelines.write()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
-        pipelines.retain(|p| p.query_id != query_id);
+        pipelines.retain(|p| p.lock().unwrap().query_id != query_id);
         Ok(())
     }
 
     /// Returns the number of active pipelines.
     #[napi]
     pub fn pipeline_count(&self) -> napi::Result<u32> {
-        let pipelines = self.pipelines.lock()
+        let pipelines = self.pipelines.read()
             .map_err(|e| napi::Error::from_reason(format!("Pipeline lock poisoned: {e}")))?;
         Ok(pipelines.len() as u32)
     }
