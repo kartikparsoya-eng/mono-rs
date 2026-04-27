@@ -604,6 +604,7 @@ export class PipelineDriver {
 
       // Capture Take storage reference so we can initialize it after Rust hydration.
       let takeStorage: Storage | null = null;
+      let hasChildTakes = false;
       const input = buildPipeline(
         resolvedQuery,
         {
@@ -617,6 +618,8 @@ export class PipelineDriver {
             // and are partitioned — they don't need this initialization.
             if (name === ':take') {
               takeStorage = storage;
+            } else if (name.includes(':take')) {
+              hasChildTakes = true;
             }
             return storage;
           },
@@ -696,12 +699,16 @@ export class PipelineDriver {
         // input.fetch(), so child Takes have empty storage and silently
         // drop all pushes. Running a fetch through the pipeline triggers
         // each child Take's #initialFetch, populating their partition state.
-        for (const node of input.fetch({})) {
-          if (node === 'yield') {
-            continue;
+        // Skip this expensive SQLite re-query when there are no child Takes
+        // (filter-only queries, simple LIMIT queries without subqueries).
+        if (hasChildTakes) {
+          for (const node of input.fetch({})) {
+            if (node === 'yield') {
+              continue;
+            }
+            // Discard results — we only need the side effect of
+            // initializing Take state in child subquery pipelines.
           }
-          // Discard results — we only need the side effect of
-          // initializing Take state in child subquery pipelines.
         }
       } else {
         yield* hydrateInternal(
@@ -867,6 +874,7 @@ export class PipelineDriver {
       existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
       existsCorrelations: Map<string, readonly string[]>;
       takeStorage: Storage | null;
+      hasChildTakes: boolean;
       input: Input;
       debugDelegate: Debug | undefined;
       rustEligible: boolean;
@@ -902,6 +910,7 @@ export class PipelineDriver {
       const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
 
       let takeStorage: Storage | null = null;
+      let hasChildTakes = false;
       const input = buildPipeline(
         resolvedQuery,
         {
@@ -912,6 +921,8 @@ export class PipelineDriver {
             const storage = this.#createStorage();
             if (name === ':take') {
               takeStorage = storage;
+            } else if (name.includes(':take')) {
+              hasChildTakes = true;
             }
             return storage;
           },
@@ -976,6 +987,7 @@ export class PipelineDriver {
         existsTypes,
         existsCorrelations,
         takeStorage,
+        hasChildTakes,
         input,
         debugDelegate,
         rustEligible,
@@ -1072,12 +1084,15 @@ export class PipelineDriver {
           // input.fetch(), so child Takes have empty storage and silently
           // drop all pushes. Running a fetch through the pipeline triggers
           // each child Take's #initialFetch, populating their partition state.
-          for (const node of p.input.fetch({})) {
-            if (node === 'yield') {
-              continue;
+          // Skip this expensive SQLite re-query when there are no child Takes.
+          if (p.hasChildTakes) {
+            for (const node of p.input.fetch({})) {
+              if (node === 'yield') {
+                continue;
+              }
+              // Discard results — we only need the side effect of
+              // initializing Take state in child subquery pipelines.
             }
-            // Discard results — we only need the side effect of
-            // initializing Take state in child subquery pipelines.
           }
         } else {
           yield* hydrateInternal(
