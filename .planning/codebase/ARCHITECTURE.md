@@ -1,6 +1,7 @@
 # Architecture
 
 ## Pattern
+
 Zero is a **local-first sync engine** using Incremental View Maintenance (IVM). The architecture follows a pipeline pattern:
 
 ```
@@ -16,6 +17,7 @@ PostgreSQL (source of truth)
 ## Core Layers
 
 ### Layer 0: Data Access (`zqlite`)
+
 - `packages/zqlite/src/db.ts` — `Database` class wrapping `@rocicorp/zero-sqlite3`
   - `prepare(sql)` → `Statement`
   - `exec(sql)` — raw SQL execution
@@ -25,6 +27,7 @@ PostgreSQL (source of truth)
 - `Statement` class: `run()`, `get()`, `all()`, `iterate()`
 
 ### Layer 1: IVM Data Sources (`zqlite`)
+
 - `packages/zqlite/src/table-source.ts` — `TableSource` implements `Input` interface
   - `fetch(req)` — generates SQL from AST, returns rows
   - `toSQLiteRow()` — converts raw SQLite rows to JS objects (bottleneck: `Object.fromEntries` per row)
@@ -33,6 +36,7 @@ PostgreSQL (source of truth)
   - `get(key)`, `set(key, value)`, `del(key)`, `scan(options)`
 
 ### Layer 2: IVM Pipeline (`zql`)
+
 - `packages/zql/src/ivm/` — IVM operator library
   - Operators: `join.ts`, `filter.ts`, `sort.ts`, `take.ts`, `exists.ts`, `cap.ts`
   - Core interfaces in `operator.ts`: `Input`, `Output`, `Storage`, `FetchRequest`
@@ -42,15 +46,18 @@ PostgreSQL (source of truth)
 ### Layer 3: Services (`zero-cache`)
 
 #### Change Source
+
 - `packages/zero-cache/src/services/change-source/pg/` — PostgreSQL logical replication
 - `packages/zero-cache/src/services/change-source/pg/initial-sync.ts` — bulk initial data load
 
 #### Replicator
+
 - `packages/zero-cache/src/services/replicator/` — applies PG changes to SQLite
 - `change-processor.ts` (934 lines) — CDC writer, transforms PG changes to SQLite ops
 - Schema metadata: `schema/change-log.ts`, `column-metadata.ts`, `table-metadata.ts`, `replication-state.ts`
 
 #### View Syncer
+
 - `packages/zero-cache/src/services/view-syncer/` — per-client IVM
 - `pipeline-driver.ts` (900+ lines) — orchestrates IVM pipeline
   - `#advance()` (lines 621-715) — **hottest code path**, processes changes through operators
@@ -69,12 +76,14 @@ PostgreSQL (source of truth)
 3. **IVM → Client:** Pipeline produces diffs → serialized via `zero-protocol` → pushed over WebSocket
 
 ## Key Interfaces
+
 - `Input` (`operator.ts`): `fetch(req)`, `cleanup(req)`, `setOutput(output)`, `getSchema()`
 - `Output` (`operator.ts`): `push(change)`
 - `Storage` (`operator.ts`): `get(key)`, `set(key, value)`, `del(key)`, `scan(options)`
 - `FetchRequest`: `constraint`, `start`, `reverse`
 
 ## Entry Points
+
 - `packages/zero-cache/src/server/runner/main.ts` — server entry
 - `packages/zero-cache/src/services/runner.ts` — service orchestrator
 - `packages/zero-cache/src/services/life-cycle.ts` — lifecycle management

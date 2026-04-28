@@ -115,6 +115,7 @@ packages/zql/src/ivm/
 ```
 
 ## Naming Conventions
+
 - Source: `feature.ts`, Tests: `feature.test.ts` (co-located)
 - PG-dependent tests: `feature.pg.test.ts`
 - Internal modules: `internal/` subdirectory

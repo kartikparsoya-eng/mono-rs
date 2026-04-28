@@ -15,11 +15,11 @@ Fixed INT-01 (edit semantics mismatch) in advance.rs by implementing primary-key
 
 ## Tasks Completed
 
-| # | Task | Status | Notes |
-|---|------|--------|-------|
-| 1 | Fix edit semantics in advance.rs | Done | Added find_prev_by_pk(), primary_key: Vec<String> to PipelineConfig |
-| 2 | Remove dead Operator enum variants | Done | Only Operator::Filter remains, explanatory comment added |
-| 3 | Fix env var edge case test | Skipped | Blocked by D-35 (no test modifications); documented limitation |
+| #   | Task                               | Status  | Notes                                                               |
+| --- | ---------------------------------- | ------- | ------------------------------------------------------------------- |
+| 1   | Fix edit semantics in advance.rs   | Done    | Added find_prev_by_pk(), primary_key: Vec<String> to PipelineConfig |
+| 2   | Remove dead Operator enum variants | Done    | Only Operator::Filter remains, explanatory comment added            |
+| 3   | Fix env var edge case test         | Skipped | Blocked by D-35 (no test modifications); documented limitation      |
 
 ## Key Changes
 
@@ -39,4 +39,5 @@ Fixed INT-01 (edit semantics mismatch) in advance.rs by implementing primary-key
 ## Key Files
 
 key-files.modified:
-  - packages/zqlite-rs/src/advance.rs
+
+- packages/zqlite-rs/src/advance.rs

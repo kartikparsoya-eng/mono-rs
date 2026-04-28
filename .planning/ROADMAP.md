@@ -207,6 +207,23 @@ Plans:
 6. Stress test: 100+ concurrent clients, sustained changes, no panics or deadlocks
 7. Results documented with before/after comparisons
 
+### Phase 29: Dual-Exec Correctness Hardening
+
+**Goal:** Close all dual-execution coverage gaps — add hydration dual-exec comparison, lift the filter-only gate for dual-exec advance, add Take/Limit tests, and implement the missing fuzz fan-out test.
+
+**Requirements:** COR-01 (dual-exec hydration), COR-02 (lift filter-only gate), COR-03 (Take/Limit tests), COR-04 (fuzz fan-out)
+
+**Depends on:** Phase 28
+
+**Success Criteria:**
+
+1. `#dualExecHydrate()` — runs both Rust and TS hydration, compares full result trees, throws in strict mode on mismatch
+2. `#reevaluateRustAdvance()` filter-only gate removed when `ZERO_DUAL_EXEC` is set — all operator types dual-exec compared
+3. Pipeline-driver tests with `limit` (Take operator) — hydration and advance paths
+4. NOT EXISTS advance test added
+5. `test.todo` for `rust_fan_out vs TS` in fuzz-ivm.test.ts implemented
+6. All 29 existing tests still pass, dual-exec strict mode passes
+
 ---
 
 ## Summary
@@ -222,5 +239,6 @@ Plans:
 | 26    | Pipeline-Driver TS Integration         | INT-01, INT-02, INT-03 | 22, 24, 25 | 7          |
 | 27    | Cross-ViewSyncer Poke Dispatch         | XVS-01, XVS-02         | 24, 26     | 6          |
 | 28    | E2E Validation & Benchmarks            | E2E-01, E2E-02, BEN-01 | 26, 27     | 7          |
+| 29    | Dual-Exec Correctness Hardening        | COR-01..04             | 28         | 6          |
 
-**9 phases** | **22 requirements** | Dependency graph has two parallel tracks (hydration: 20→21→22→23, advance: 20→21→24) converging at Phase 26
+**10 phases** | **22 requirements** | Dependency graph has two parallel tracks (hydration: 20→21→22→23, advance: 20→21→24) converging at Phase 26

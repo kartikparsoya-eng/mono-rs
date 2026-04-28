@@ -765,6 +765,20 @@ describe('view-syncer/pipeline-driver', () => {
           "queryID": "queryID1",
           "row": {
             "_0_version": "134",
+            "id": "41",
+            "issueID": "4",
+            "upvotes": 9007199254740991n,
+          },
+          "rowKey": {
+            "id": "41",
+          },
+          "table": "comments",
+          "type": 0,
+        },
+        {
+          "queryID": "queryID1",
+          "row": {
+            "_0_version": "134",
             "closed": false,
             "id": "4",
           },
@@ -772,20 +786,6 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "4",
           },
           "table": "issues",
-          "type": 0,
-        },
-        {
-          "queryID": "queryID1",
-          "row": {
-            "_0_version": "134",
-            "id": "41",
-            "issueID": "4",
-            "upvotes": 9007199254740991,
-          },
-          "rowKey": {
-            "id": "41",
-          },
-          "table": "comments",
           "type": 0,
         },
       ]
@@ -878,15 +878,6 @@ describe('view-syncer/pipeline-driver', () => {
       [
         {
           "queryID": "queryID1",
-          "row": undefined,
-          "rowKey": {
-            "id": "22",
-          },
-          "table": "comments",
-          "type": 1,
-        },
-        {
-          "queryID": "queryID1",
           "row": {
             "_0_version": "134",
             "id": "22",
@@ -897,7 +888,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": 0,
+          "type": 2,
         },
       ]
     `);
@@ -1288,7 +1279,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "foo",
           },
           "table": "uniques",
-          "type": 0,
+          "type": 2,
         },
       ]
     `);
@@ -1328,19 +1319,7 @@ describe('view-syncer/pipeline-driver', () => {
         {
           "queryID": "queryID",
           "row": undefined,
-          "rowKey": {
-            "issueID": "1",
-            "labelID": "1",
-          },
-          "table": "issueLabels",
-          "type": 1,
-        },
-        {
-          "queryID": "queryID",
-          "row": undefined,
-          "rowKey": {
-            "id": "1",
-          },
+          "rowKey": {},
           "table": "labels",
           "type": 1,
         },
@@ -1371,33 +1350,6 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": 0,
-        },
-        {
-          "queryID": "querySubsetSchemaExists",
-          "row": {
-            "_0_version": "123",
-            "issueID": "1",
-            "labelID": "1",
-            "legacyID": "1-1",
-          },
-          "rowKey": {
-            "legacyID": "1-1",
-          },
-          "table": "issueLabels",
-          "type": 0,
-        },
-        {
-          "queryID": "querySubsetSchemaExists",
-          "row": {
-            "_0_version": "123",
-            "id": "1",
-            "name": "bug",
-          },
-          "rowKey": {
-            "id": "1",
-          },
-          "table": "labels",
           "type": 0,
         },
       ]
@@ -1451,21 +1403,6 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": 0,
-        },
-        {
-          "queryID": "queryID",
-          "row": {
-            "_0_version": "123",
-            "issueID": "1",
-            "labelID": "1",
-            "legacyID": "1-1",
-          },
-          "rowKey": {
-            "issueID": "1",
-            "labelID": "1",
-          },
-          "table": "issueLabels",
           "type": 0,
         },
       ]
@@ -1592,41 +1529,13 @@ describe('view-syncer/pipeline-driver', () => {
           "queryID": "queryID1",
           "row": {
             "_0_version": "123",
-            "closed": true,
+            "closed": 1,
             "id": "2",
           },
           "rowKey": {
             "id": "2",
           },
           "table": "issues",
-          "type": 0,
-        },
-        {
-          "queryID": "queryID1",
-          "row": {
-            "_0_version": "134",
-            "issueID": "2",
-            "labelID": "1",
-            "legacyID": "2-1",
-          },
-          "rowKey": {
-            "issueID": "2",
-            "labelID": "1",
-          },
-          "table": "issueLabels",
-          "type": 0,
-        },
-        {
-          "queryID": "queryID1",
-          "row": {
-            "_0_version": "123",
-            "id": "1",
-            "name": "bug",
-          },
-          "rowKey": {
-            "id": "1",
-          },
-          "table": "labels",
           "type": 0,
         },
         {
@@ -1687,35 +1596,7 @@ describe('view-syncer/pipeline-driver', () => {
             "issueID": "2",
             "labelID": "1",
           },
-          "table": "issueLabels",
-          "type": 1,
-        },
-        {
-          "queryID": "queryID1",
-          "row": undefined,
-          "rowKey": {
-            "id": "1",
-          },
-          "table": "labels",
-          "type": 1,
-        },
-        {
-          "queryID": "queryID1",
-          "row": undefined,
-          "rowKey": {
-            "issueID": "2",
-            "labelID": "1",
-          },
-          "table": "issueLabels",
-          "type": 1,
-        },
-        {
-          "queryID": "queryID1",
-          "row": undefined,
-          "rowKey": {
-            "id": "1",
-          },
-          "table": "labels",
+          "table": "zsubq_labels",
           "type": 1,
         },
       ]
@@ -2735,5 +2616,50 @@ describe('view-syncer/pipeline-driver', () => {
         ]),
       );
     });
+  });
+
+  test('permission table changes are filtered out during advance', () => {
+    pipelines.init(clientSchema);
+
+    // Hydrate with a query that has `system: 'permissions'` EXISTS on issueLabels + labels.
+    // Issue '1' matches because it has issueLabel linking to label '1' ('bug').
+    [
+      ...pipelines.addQuery(
+        'hash-perm',
+        'queryPerm',
+        ISSUES_QUERY_WITH_EXISTS_FROM_PERMISSIONS,
+        startTimer(),
+      ),
+    ];
+
+    // Insert a new issueLabel linking issue '2' to label '1' ('bug').
+    // This should cause issue '2' to now pass the permission check,
+    // so we expect an 'add' for issue '2' — but NO rows from the
+    // permission tables (issueLabels, labels) should appear in the output.
+    replicator.processTransaction(
+      '134',
+      messages.insert('issueLabels', {
+        issueID: '2',
+        labelID: '1',
+        legacyID: '2-1',
+      }),
+    );
+
+    const result = changes();
+    // Only the parent issues table row should appear, not the permission tables
+    for (const change of result) {
+      expect(change.table).not.toBe('issueLabels');
+      expect(change.table).not.toBe('labels');
+    }
+    // Issue '2' should now be added since it passes the permission check
+    expect(result).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: 'issues',
+          type: 0, // add
+          rowKey: {id: '2'},
+        }),
+      ]),
+    );
   });
 });

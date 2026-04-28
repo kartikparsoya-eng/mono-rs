@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::filter::{Predicate, Value, compare_values, evaluate_json_row};
 use crate::operator::Operator;
-use crate::types::{Change, ChildData, FetchRequest, Node, Row};
+use crate::types::{Change, ChildData, Constraint, FetchRequest, Node, Row};
 
 pub struct ExistsOperator {
     input: Box<dyn Operator>,
@@ -160,6 +160,47 @@ impl Operator for ExistsOperator {
 
     fn op_type(&self) -> &'static str {
         "exists"
+    }
+
+    /// Handle a raw child change (from the child source, not yet wrapped).
+    /// Finds matching parents, wraps as Change::Child, then delegates to push().
+    fn push_child(&mut self, change: Change) -> Vec<Change> {
+        let child_row = change.node().row.clone();
+        // Build reverse constraint: child_key → parent_key
+        let constraint = if !self.child_key.is_empty() && !self.parent_key.is_empty() {
+            Some(Constraint::from_pairs(
+                self.child_key.iter().zip(self.parent_key.iter()).map(|(ck, pk)| {
+                    (pk.clone(), child_row.get(ck).cloned().unwrap_or(serde_json::Value::Null))
+                })
+            ))
+        } else {
+            None
+        };
+
+        // Check for null keys
+        if let Some(ref c) = constraint {
+            if c.columns.values().any(|v| v.is_null()) {
+                return vec![];
+            }
+        }
+
+        let parent_nodes = self.input.fetch(&FetchRequest {
+            constraint,
+            ..Default::default()
+        });
+
+        let mut output = Vec::new();
+        for parent_node in parent_nodes {
+            let wrapped = Change::Child {
+                node: parent_node,
+                child: ChildData {
+                    relationship_name: self.relationship_name.clone(),
+                    change: Box::new(change.clone()),
+                },
+            };
+            output.extend(self.push(wrapped));
+        }
+        output
     }
 }
 

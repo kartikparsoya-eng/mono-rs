@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::cap_op::CapOperator;
 use crate::exists_op::ExistsOperator;
+use crate::or_exists_op::OrExistsOperator;
 use crate::filter::{Predicate, Value};
 use crate::filter_op::FilterOperator;
 use crate::join_op::JoinOperator;
@@ -92,7 +93,7 @@ fn parse_sort(sort: &[(String, String)]) -> Vec<SortSpec> {
         .collect()
 }
 
-fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, String> {
+pub fn parse_predicate(value: &serde_json::Value) -> std::result::Result<Predicate, String> {
     let obj = value.as_object().ok_or("predicate must be an object")?;
 
     if let Some(field) = obj.get("field") {
@@ -308,10 +309,30 @@ pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn
                 };
                 Box::new(SkipOperator::new(input, bound, sort_specs))
             }
-            OperatorConfig::OrExists { .. } => {
-                // OrExists is handled by the hydration path's ParallelOrExistsOperator.
-                // In the push path, this should not appear (TS handles advance).
-                return Err("OrExists not supported in push path".to_string());
+            OperatorConfig::OrExists {
+                branches,
+                or_condition,
+            } => {
+                let input = current.ok_or("or_exists requires an input operator")?;
+                let or_pred = if let Some(oc) = or_condition {
+                    Some(parse_predicate(oc)?)
+                } else {
+                    None
+                };
+                let branch_data: Vec<_> = branches
+                    .iter()
+                    .map(|b| {
+                        let child_op = build_operator(&b.child)?;
+                        Ok((
+                            child_op,
+                            b.relationship_name.clone(),
+                            b.not_exists,
+                            b.parent_key.clone(),
+                            b.child_key.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Box::new(OrExistsOperator::new(input, branch_data, or_pred))
             }
             OperatorConfig::Cap {
                 limit,

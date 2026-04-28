@@ -14,6 +14,7 @@ Replace the initial-sync SQLite INSERT path with a Rust bulk-insert method IF be
 ## Implementation Decisions
 
 ### D-19: Benchmark-gated implementation
+
 - Phase 6 is conditional on benchmark results
 - Measure napi crossing overhead as % of total initial-sync time
 - Decision rule:
@@ -23,57 +24,68 @@ Replace the initial-sync SQLite INSERT path with a Rust bulk-insert method IF be
 - This decision rule to be documented in CLAUDE.md
 
 ### D-20: TransactionPool stays TS
+
 - Parallel worker orchestration is coordination logic, not compute
 - Only the flush() SQLite INSERT hot loop is a candidate for Rust
 
 ### D-21: Benchmark methodology
+
 - Must measure actual initial-sync with representative data (not micro-benchmark)
 - Isolate: time in flush() vs time in PG COPY network + decode
 - Use existing `initial-sync-bench.pg.test.ts` as basis
 
 ### Prior decisions that apply
+
 - D-13: Write path stays TS (may be partially overridden by D-19 rule)
 - Phase 1: Statement.run() already in Rust — baseline is established
 
 </decisions>
 
 <canonical_refs>
+
 ## Canonical References
 
 **Downstream agents MUST read these before planning or implementing.**
 
 ### Initial Sync
+
 - `packages/zero-cache/src/services/change-source/pg/initial-sync.ts` — Main sync logic (1161 lines), flush() at line 943
 - `packages/zero-cache/src/db/transaction-pool.ts` — Worker pool orchestration (863 lines)
 - `packages/zero-cache/src/db/initial-sync-bench.pg.test.ts` — Existing benchmark test
 
 ### Tests
+
 - `packages/zero-cache/src/services/change-source/pg/initial-sync.test.ts` — Unit tests
 - `packages/zero-cache/src/services/change-source/pg/initial-sync.pg.test.ts` — Integration tests (requires PG)
 
 </canonical_refs>
 
 <code_context>
+
 ## Existing Code Insights
 
 ### Hot Path (flush function, line 943-967)
+
 - Buffers rows in `pendingValues[]` array (up to MAX_BUFFERED_ROWS × valuesPerRow)
 - Fires batched INSERT via `insertBatchStmt.run(pendingValues.slice(...))` — batch of 50 rows
 - Remainder rows go through single `insertStmt.run()` calls
 - Already calls Rust Statement.run() from Phase 1
 
 ### Data Flow
+
 1. PG COPY (binary/text) → stream parser → decoded values
 2. Values buffered in TS array (pendingValues)
 3. flush() → N/50 calls to `Statement.run(values_slice)` → Rust SQLite INSERT
 4. Each napi crossing: TS array → Rust param extraction → sqlite3_step
 
 ### Integration Points
+
 - `Database` from `packages/zqlite/src/db.ts` (already Rust-backed)
 - `Statement.run()` from Phase 1 Rust implementation
 - `TransactionPool` manages concurrent BEGIN CONCURRENT transactions
 
 ### INSERT_BATCH_SIZE = 50
+
 - Empirically tuned — batches of 50 rows per INSERT statement
 - Multi-value INSERT: `INSERT INTO t (cols) VALUES (?,...),(?,...),... × 50`
 
@@ -97,5 +109,5 @@ None — discussion stayed within phase scope
 
 ---
 
-*Phase: 06-bulk-loader*
-*Context gathered: 2026-04-20*
+_Phase: 06-bulk-loader_
+_Context gathered: 2026-04-20_

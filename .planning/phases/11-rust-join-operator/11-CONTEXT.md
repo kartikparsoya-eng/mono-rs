@@ -1,17 +1,20 @@
 # Phase 11: Rust Join Operator — Context
 
 ## Goal
+
 Port the Join operator's hot-path computation to Rust for maximum perf gain (3.56x slower than Filter baseline at 44.8ms).
 
 ## Architecture: Hybrid Rust/TS
 
 ### What Rust handles (hot path)
+
 - `isJoinMatch(parent, parentKey, child, childKey)` — per-row key comparison
 - `buildJoinConstraint(sourceRow, sourceKey, targetKey)` — constraint object building
 - `rowEqualsForCompoundKey(a, b, key)` — compound key equality
 - `compareValues(a, b)` — already in Rust from Phase 10
 
 ### What stays in TS
+
 - Generator orchestration (`fetch()`, `pushParent()`, `pushChild()`)
 - Overlay generators (`generateWithOverlay`, `generateWithOverlayUnordered`) — deeply coupled to JS generator protocol
 - Relationship closures — opaque pass-through

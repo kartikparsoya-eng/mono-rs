@@ -156,6 +156,7 @@ impl ConnectionPool {
             conns.push(conn);
         }
         drop(conns);
+
         *self.path.lock().map_err(|_| PoolError::Poisoned)? = new_path.to_owned();
         Ok(())
     }

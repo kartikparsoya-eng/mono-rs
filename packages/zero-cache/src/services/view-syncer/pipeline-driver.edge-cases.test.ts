@@ -366,10 +366,8 @@ describe('pipeline-driver edge cases', () => {
     expect(addResults.length).toBe(500);
   });
 
-  // Regression test: Without initializeTakeState() after Rust hydration,
-  // Take.push() silently drops ALL changes because takeState is uninitialized.
-  // This test runs without ZERO_DUAL_EXEC, so hydration goes through
-  // #rustHydrate (the production path) which bypasses input.fetch().
+  // Regression test: Ensures that LIMIT queries remain reactive after Rust
+  // hydration. The Rust operator tree handles both hydration and advance.
   test('LIMIT query remains reactive after Rust hydration', () => {
     const ISSUES_WITH_LIMIT: AST = {
       table: 'issues',
@@ -425,9 +423,7 @@ describe('pipeline-driver edge cases', () => {
 
   // Regression test: Ensures takeStorage captures only the top-level Take
   // (name === ':take'), not a child Take from .related() (e.g. '.comments:take').
-  // If takeStorage were overwritten by a child's partitioned storage,
-  // initializeTakeState would write to the wrong storage and the top-level
-  // Take would remain non-reactive.
+  // The Rust operator tree handles both hydration and advance for LIMIT queries.
   test('LIMIT with .related() child LIMIT remains reactive', () => {
     // Top-level: LIMIT 2 on issues, child: LIMIT 1 on comments per issue
     const ISSUES_WITH_RELATED_LIMIT: AST = {

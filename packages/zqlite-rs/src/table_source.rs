@@ -120,6 +120,12 @@ impl RustTableSource {
         self.pool.path()
     }
 
+    /// Execute a query using a connection from the pool.
+    fn query_rows(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<crate::source::Row>> {
+        let pooled = self.pool.get()?;
+        Ok(execute_query(&pooled, sql, params)?)
+    }
+
     /// Returns a clone of the internal connection pool (cheap — shares the
     /// underlying `Arc<Mutex<…>>`).
     pub fn shared_pool(&self) -> ConnectionPool {
@@ -182,8 +188,7 @@ impl RustTableSource {
             start.as_ref(),
         );
 
-        let pooled = self.pool.get()?;
-        let rows = execute_query(&pooled, &sql, &params)?;
+        let rows = self.query_rows(&sql, &params)?;
 
         let sort = conn_info.sort.as_deref().unwrap_or(&[]);
         let start_row = req.start.as_ref().map(|s| &s.row);
@@ -225,17 +230,19 @@ impl RustTableSource {
                 *wc = Some(rusqlite::Connection::open(new_path)?);
             }
         }
-        // Always reset overlay and epoch — the snapshot data has changed.
+        self.reset_state();
+        Ok(())
+    }
+
+    /// Reset overlay, epoch, and connection metadata without touching the pool.
+    /// Used when the shared pool has already been swapped externally.
+    pub fn reset_state(&self) {
         *self.overlay.lock().unwrap() = None;
         *self.push_epoch.lock().unwrap() = 0;
         for conn in &self.connections {
-            // last_pushed_epoch is only read during fetch overlay computation;
-            // swap_db resets it. Since swap_db and push are never concurrent
-            // (both on NAPI thread), this is safe via unsafe impl Sync.
             let conn_ptr = conn as *const Connection as *mut Connection;
             unsafe { (*conn_ptr).last_pushed_epoch = 0; }
         }
-        Ok(())
     }
 
     pub fn table_name(&self) -> &str {
@@ -298,8 +305,7 @@ impl RustTableSource {
             sql.push_str(&format!(" ORDER BY {}", order_items.join(", ")));
         }
 
-        let pooled = self.pool.get()?;
-        let rows = execute_query(&pooled, &sql, &params)?;
+        let rows = self.query_rows(&sql, &params)?;
 
         let mut grouped: HashMap<String, Vec<Node>> = HashMap::new();
         for row in rows {

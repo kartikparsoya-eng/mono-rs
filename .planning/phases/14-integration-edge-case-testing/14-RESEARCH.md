@@ -19,6 +19,7 @@ The codebase has strong foundations for this phase: an existing benchmark script
 ## 2. rust_advance() Interface
 
 **napi signature** (advance.rs:359-367):
+
 ```rust
 #[napi]
 pub fn rust_advance(
@@ -43,6 +44,7 @@ pub fn rust_advance(
 ## 3. Database Schema for Benchmarks
 
 **`_zero.changeLog2` schema** (from diff.rs:80-84):
+
 ```sql
 CREATE TABLE "_zero.changeLog2" (
     stateVersion TEXT,
@@ -62,12 +64,14 @@ CREATE TABLE "_zero.changeLog2" (
 ## 4. Correctness Validation Pattern
 
 **pipeline-driver.test.ts pattern** (2332 lines, 30+ tests):
+
 - Setup: `PipelineDriver` + `DbFile` + `fakeReplicator` in `beforeEach`
 - Hydrate: `pipelines.addQuery(hash, queryID, ast, timer)` -> collect `RowChange[]`
 - Advance: `replicator.processTransaction(version, ...messages)` then `[...pipelines.advance(timer).changes]`
 - Assert: `toMatchInlineSnapshot()` on full RowChange arrays (type, queryID, table, rowKey, row)
 
 **Byte-identical comparison (D-69):** Run same workload through both paths:
+
 1. Set `ZERO_DISABLE_RUST_IVM=1` -> collect TS output
 2. Unset -> collect Rust output
 3. Deep-compare serialized RowChange arrays
@@ -77,6 +81,7 @@ CREATE TABLE "_zero.changeLog2" (
 ## 5. Fallback/Error Paths
 
 **What triggers TS fallback:**
+
 - `ZERO_DISABLE_RUST_IVM=1` env var -> all Rust paths disabled (line 69)
 - `rustAdvanceFn` undefined (native module not built) -> `USE_RUST_ADVANCE = false` (line 72)
 - Pipeline not eligible: has `related` (joins), `limit`, companions, or correlated subqueries -> `#extractPipelineConfig` returns null (lines 810-813)
@@ -84,6 +89,7 @@ CREATE TABLE "_zero.changeLog2" (
 - Rust advance throws non-ResetPipelinesSignal error -> catches, logs warning, sets `#useRustAdvance = false` (lines 687-691)
 
 **Error types from Rust:**
+
 - `version_mismatch` -> retry once with fresh snapshot (lines 885-913)
 - `reset` / `truncate` -> throw `ResetPipelinesSignal` (lines 915-920)
 - Generic error -> throw `Error` (lines 922-924), caught by fallback handler
@@ -106,10 +112,12 @@ CREATE TABLE "_zero.changeLog2" (
 | Blob | string (base64) |
 
 **Type conversions** (diff.rs:232-255, `from_sqlite_types`):
+
 - `boolean` columns: integer 0/1 -> JSON bool
 - `json` columns: string -> parsed JSON object
 
 **Edge cases to test (D-75):**
+
 - NULL values across all column types
 - Empty string vs NULL
 - Unicode strings (emoji, CJK, combining characters)
@@ -125,6 +133,7 @@ CREATE TABLE "_zero.changeLog2" (
 **Rust vs TS isolation:** Toggle `ZERO_DISABLE_RUST_IVM=1` env var for A/B comparison. Both paths go through `PipelineDriver.advance()` so setup is identical.
 
 **Pipeline count sweep (D-67):** [1, 2, 4, 8, 16, 32, 64] pipelines. For each count:
+
 1. Create PipelineDriver, add N queries (cycling through templates)
 2. `processTransaction` with fixed diff
 3. Time `advance()` with Rust enabled and disabled
@@ -160,11 +169,13 @@ CREATE TABLE "_zero.changeLog2" (
    - Tag `mono-rs/v2.0` after gates pass
 
 **Key dependencies:**
+
 - Benchmarks need a built `zqlite-rs` native module -- ensure `cargo build` in CI
 - Edge case tests for Rust unit tests need `cargo test` in zqlite-rs
 - TS integration tests run via `vitest` with existing infrastructure
 
 **Risk areas:**
+
 - Rust advance currently only supports filter-only pipelines (no joins/limit/exists in `#extractPipelineConfig`). The 4x bar may be hard to hit if benchmark workloads include joins. Recommend testing filter-only pipelines for the throughput gate, and mixed pipelines for correctness.
 - The predicate AST in advance.rs reimplements filter logic separately from zero-ivm-rs (`cdylib can't cross-link` comment at line 62). Predicate format mismatch between TS AST `Condition` and Rust `Predicate::from_json` is a correctness risk -- the TS `#extractPipelineConfig` passes `ast.where` (which uses `{type: 'simple', left: {type: 'column', name}, op: '=', right: {type: 'literal', value}}`) but Rust expects `{op: 'eq', field, value}`. This format mismatch means **filter predicates may not actually evaluate correctly in Rust advance**. Edge case tests must verify this.
 

@@ -1889,52 +1889,47 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       let totalProcessTime = 0;
       const timer = new TimeSliceTimer(lc);
       const pipelines = this.#pipelines;
-      const hydrations = this.#hydrations;
-      const hydrationTime = this.#hydrationTime;
-      // oxlint-disable-next-line @typescript-eslint/no-this-alias
-      const self = this;
 
       // yield at the very beginning so that the first time slice
       // is properly processed by the time-slice queue.
       await yieldProcess(lc);
 
-      function* generateRowChanges(slowHydrateThreshold: number) {
-        const batchTimer = timer.startWithoutYielding();
-        yield* pipelines.addQueries(
-          addQueries.map(q => ({
-            transformationHash: q.transformationHash,
-            queryID: q.id,
-            ast: q.ast,
-          })),
-          batchTimer,
-        );
-        const elapsed = timer.stop();
-        totalProcessTime += elapsed;
+      const batchTimer = timer.startWithoutYielding();
+      const rowChanges = await pipelines.addQueriesAsync(
+        addQueries.map(q => ({
+          transformationHash: q.transformationHash,
+          queryID: q.id,
+          ast: q.ast,
+        })),
+        batchTimer,
+      );
+      const elapsed = timer.stop();
+      totalProcessTime += elapsed;
 
-        for (const q of addQueries) {
-          self.#addQueryMaterializationServerMetric(q.id, elapsed);
-        }
-
-        if (elapsed > slowHydrateThreshold) {
-          lc.warn?.(
-            'Slow batch hydration',
-            elapsed,
-            addQueries.length,
-            'queries',
-          );
-        }
-        manualSpan(tracer, 'vs.addQueries.batch', elapsed, {
-          queryCount: addQueries.length,
-        });
-        hydrations.add(1);
-        hydrationTime.record(totalProcessTime / 1000);
+      for (const q of addQueries) {
+        this.#addQueryMaterializationServerMetric(q.id, elapsed);
       }
+
+      if (elapsed > this.#slowHydrateThreshold) {
+        lc.warn?.(
+          'Slow batch hydration',
+          elapsed,
+          addQueries.length,
+          'queries',
+        );
+      }
+      manualSpan(tracer, 'vs.addQueries.batch', elapsed, {
+        queryCount: addQueries.length,
+      });
+      this.#hydrations.add(1);
+      this.#hydrationTime.record(totalProcessTime / 1000);
+
       // #processChanges does batched de-duping of rows. Wrap all pipelines in
-      // a single generator in order to maximize de-duping.
+      // a single iterable in order to maximize de-duping.
       await this.#processChanges(
         lc,
         timer,
-        generateRowChanges(this.#slowHydrateThreshold),
+        rowChanges,
         updater,
         pokers,
       );
@@ -2183,7 +2178,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const start = performance.now();
 
       const timer = new TimeSliceTimer(lc);
-      const {version, numChanges, changes} = this.#pipelines.advance(
+      const {version, numChanges, changes} = await this.#pipelines.advanceAsync(
         timer,
         this.id,
       );

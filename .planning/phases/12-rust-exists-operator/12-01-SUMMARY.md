@@ -20,11 +20,11 @@ key-files:
   modified: [packages/zero-ivm-rs/src/lib.rs]
 
 key-decisions:
-  - "Serde JSON for exists batch (same pattern as join.rs)"
-  - "Single napi call per push batch (D-59)"
+  - 'Serde JSON for exists batch (same pattern as join.rs)'
+  - 'Single napi call per push batch (D-59)'
 
 patterns-established:
-  - "ExistsChangeInput/ExistsActionOutput serde types for cross-boundary batch"
+  - 'ExistsChangeInput/ExistsActionOutput serde types for cross-boundary batch'
 
 requirements-completed: []
 
@@ -43,6 +43,7 @@ completed: 2026-04-20
 - **Files modified:** 2
 
 ## Accomplishments
+
 - `exists.rs` with complete push decision logic matching TS `exists.ts`
 - 15 unit tests covering all branches (ADD/REMOVE/EDIT/CHILD, size thresholds, NOT EXISTS)
 - napi build succeeds, function exported as `rustExistsPushBatch`
@@ -52,10 +53,12 @@ completed: 2026-04-20
 1. **Task 1+2: Create exists.rs + register in lib.rs** - `198d2458f` (feat)
 
 ## Files Created/Modified
+
 - `packages/zero-ivm-rs/src/exists.rs` - Batch push decision function + 15 tests
 - `packages/zero-ivm-rs/src/lib.rs` - Added `pub mod exists;`
 
 ## Decisions Made
+
 None - followed plan as specified
 
 ## Deviations from Plan
@@ -63,6 +66,7 @@ None - followed plan as specified
 ### Auto-fixed Issues
 
 **1. [Rule 1 - Bug] Missing Deserialize derive on ExistsActionOutput**
+
 - **Found during:** Task 1 (cargo test)
 - **Issue:** Tests deserialize JSON output back to ExistsActionOutput but struct only had Serialize
 - **Fix:** Added `Deserialize` to derive macro
@@ -72,11 +76,14 @@ None - followed plan as specified
 **Impact on plan:** Trivial fix, no scope change.
 
 ## Issues Encountered
+
 None
 
 ## Next Phase Readiness
+
 - Ready for Plan 12-02: TS integration wrapper + pipeline-driver wiring
 
 ---
-*Phase: 12-rust-exists-operator*
-*Completed: 2026-04-20*
+
+_Phase: 12-rust-exists-operator_
+_Completed: 2026-04-20_

@@ -5,6 +5,7 @@
 ## What was done
 
 Implemented three optimized Rust read methods for the Snapshotter hot path:
+
 - `getRow` — single-row typed lookup via napi direct object construction
 - `getRowsBuf` — multi-row buffer protocol for bulk reads
 - `changesSinceBuf` — change log batch reads as binary buffer

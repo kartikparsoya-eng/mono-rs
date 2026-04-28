@@ -8,12 +8,14 @@ Created `rust-exists.ts` wrapper module and wired Rust exists acceleration into
 ## Key files
 
 ### Created
+
 - `packages/zero-cache/src/services/view-syncer/rust-exists.ts` — TS wrapper with
   `isRustExistsAvailable()` and `createRustExistsWrapper()`. Follows `rust-join.ts`
   pattern: conditional require, graceful fallback, FilterOperator wrapper that
   intercepts CHILD add/remove push() for Rust-accelerated decisions.
 
 ### Modified
+
 - `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts` — Added
   `USE_RUST_EXISTS` constant, `RUST_EXISTS_NAME_RE` regex, and Rust exists wrapping
   in the `decorateFilterInput` callback. Logs availability on init.

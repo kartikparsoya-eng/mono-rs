@@ -15,20 +15,21 @@ affects: [12-rust-exists, pipeline-driver]
 
 tech-stack:
   added: []
-  patterns: [conditional require for napi bindings, delegate-based Rust acceleration]
+  patterns:
+    [conditional require for napi bindings, delegate-based Rust acceleration]
 
 key-files:
   created: [packages/zero-cache/src/services/view-syncer/rust-join.ts]
   modified: [packages/zero-cache/src/services/view-syncer/pipeline-driver.ts]
 
 key-decisions:
-  - "Placed rust-join.ts in view-syncer/ alongside pipeline-driver.ts (plan specified dispatcher/ which does not exist)"
-  - "Full hot-path interception deferred: Join private methods use module-level imports that cannot be intercepted without modifying packages/zql/"
-  - "Used typed RustBindings interface instead of typeof import for cross-package type resolution"
+  - 'Placed rust-join.ts in view-syncer/ alongside pipeline-driver.ts (plan specified dispatcher/ which does not exist)'
+  - 'Full hot-path interception deferred: Join private methods use module-level imports that cannot be intercepted without modifying packages/zql/'
+  - 'Used typed RustBindings interface instead of typeof import for cross-package type resolution'
 
 patterns-established:
-  - "Conditional require with typed interface for napi bindings"
-  - "Availability flag pattern: module-level USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable()"
+  - 'Conditional require with typed interface for napi bindings'
+  - 'Availability flag pattern: module-level USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable()'
 
 requirements-completed: []
 
@@ -49,6 +50,7 @@ completed: 2026-04-20
 - **Files modified:** 2
 
 ## Accomplishments
+
 - Created rust-join.ts wrapper exporting 5 Rust-accelerated join functions with graceful fallback
 - Wired Rust join availability into pipeline-driver.ts with ZERO_DISABLE_RUST_IVM=1 support
 - All 210 join tests pass unchanged, 29/30 pipeline-driver tests pass (1 pre-existing failure)
@@ -63,10 +65,12 @@ Each task was committed atomically:
 3. **Task 3: Verify all existing tests pass unchanged** - verification only, no commit needed
 
 ## Files Created/Modified
+
 - `packages/zero-cache/src/services/view-syncer/rust-join.ts` - Rust join napi wrapper with 5 exported functions
 - `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts` - Added Rust join availability detection
 
 ## Decisions Made
+
 - Placed rust-join.ts in view-syncer/ (plan referenced nonexistent dispatcher/ path)
 - Used typed RustBindings interface for cross-package type resolution (typeof import('zero-ivm-rs') failed)
 - Full hot-path interception deferred: Join class uses private methods (#pushChildChange, #processParentNode) that call module-level imports (buildJoinConstraint, isJoinMatch) which cannot be intercepted without modifying packages/zql/
@@ -76,6 +80,7 @@ Each task was committed atomically:
 ### Auto-fixed Issues
 
 **1. [Rule 3 - Blocking] File path correction**
+
 - **Found during:** Task 1 (Create rust-join.ts)
 - **Issue:** Plan specified `packages/zero-cache/src/services/dispatcher/` which does not exist
 - **Fix:** Created file in `packages/zero-cache/src/services/view-syncer/` alongside pipeline-driver.ts
@@ -84,6 +89,7 @@ Each task was committed atomically:
 - **Committed in:** 861c2d76c
 
 **2. [Rule 3 - Blocking] Type import resolution**
+
 - **Found during:** Task 2 (Wire into pipeline-driver)
 - **Issue:** `typeof import('zero-ivm-rs')` failed type checking (TS2307: Cannot find module)
 - **Fix:** Created explicit RustBindings type interface importing function types from relative path
@@ -97,16 +103,20 @@ Each task was committed atomically:
 **Impact on plan:** Both fixes necessary for correct compilation. No scope creep.
 
 ## Issues Encountered
+
 - Join hot-path interception not achievable without modifying packages/zql/: Join's private methods use module-level imports from join-utils.ts. The decorateInput hook in BuilderDelegate wraps the operator from downstream's perspective but cannot intercept internal push/fetch logic. A future BuilderDelegate.createJoin extension will be needed to fully delegate join computation to Rust.
 
 ## User Setup Required
+
 None - no external service configuration required.
 
 ## Next Phase Readiness
+
 - Phase 11 complete: Rust join functions built (Plan 01) and TS integration wired (Plan 02)
 - Rust join napi functions available for use when BuilderDelegate is extended
 - Ready for Phase 12: Rust Exists Operator
 
 ---
-*Phase: 11-rust-join-operator*
-*Completed: 2026-04-20*
+
+_Phase: 11-rust-join-operator_
+_Completed: 2026-04-20_

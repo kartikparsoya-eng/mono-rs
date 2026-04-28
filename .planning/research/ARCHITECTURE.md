@@ -3,7 +3,9 @@
 ## Component Boundaries
 
 ### Rust Layer (napi-rs module)
+
 All SQLite I/O lives here:
+
 ```
 Rust Module
 ├── Database (wraps rusqlite::Connection)
@@ -16,6 +18,7 @@ Rust Module
 ```
 
 ### TypeScript Layer (unchanged)
+
 ```
 TypeScript
 ├── WebSocket/HTTP (Fastify)
@@ -29,22 +32,26 @@ TypeScript
 ## Data Flow Across FFI Boundary
 
 ### Direction: TS → Rust
+
 - `new Database(path)` — constructor
 - `db.prepare(sql)` — SQL string
 - `stmt.run(...params)` — JS values → Rust SQLite params
 - `tableSource.fetch(req)` — FetchRequest object → Rust
 
 ### Direction: Rust → TS
+
 - `stmt.get()` → JS object (row)
 - `stmt.all()` → JS array of objects
 - `stmt.iterate()` → JS iterator
 - `tableSource.fetch()` → rows as JS objects
 
 ### Key Design Decision: Row Representation
+
 Current TS uses `Object.fromEntries()` per row (bottleneck).
 Rust should return rows as JS objects directly via napi-rs, avoiding intermediate representation.
 
 ## Build Order (Dependency-Driven)
+
 ```
 1. Database + Statement (foundation, 60+ consumers)
 2. StatementRunner (unlocks zero-cache modules)
@@ -55,6 +62,7 @@ Rust should return rows as JS objects directly via napi-rs, avoiding intermediat
 ```
 
 ## Suggested Module Structure
+
 ```
 packages/zero-cache-rs/       # New Rust crate
 ├── Cargo.toml

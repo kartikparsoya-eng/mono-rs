@@ -1,5 +1,5 @@
 ---
-plan_id: "13-02"
+plan_id: '13-02'
 status: complete
 started: 2026-04-20
 completed: 2026-04-20
@@ -10,6 +10,7 @@ completed: 2026-04-20
 ## What Was Built
 
 Created `rust_advance()` napi function that drives the full advance loop from Rust:
+
 1. Opens two read-only SQLite connections (prev/curr snapshots)
 2. Reads diff via Plan 13-01's `read_diff()`
 3. Fans out changes across pipeline operator chains using Rayon `par_iter`
@@ -23,6 +24,7 @@ Created `rust_advance()` napi function that drives the full advance loop from Ru
 ## Test Results
 
 9 unit tests passing:
+
 - Pipeline config deserialization
 - Predicate evaluation (eq, gt, lt, and/or/not)
 - Change processing (add, edit, remove, filtered out, unrelated table, multiple changes)

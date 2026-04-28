@@ -6,27 +6,27 @@
 
 ## Results Summary
 
-| Operation | Rust (ops/sec) | TS/C++ (ops/sec) | Speedup | Notes |
-|-----------|---------------|-----------------|---------|-------|
-| allBuf(100) | 52,219 | 29,361 | **1.78x** | Buffer protocol wins |
-| allBuf(1K) | 6,126 | 3,004 | **2.04x** | Buffer protocol wins |
-| allBuf(5K) | 1,236 | 599 | **2.06x** | Buffer protocol wins |
-| getRowsBuf(10) | 147,660 | 150,444 | 0.98x | Near parity |
-| vsDiff(1K) | 543 | 584 | 0.93x | Composite hot path |
-| changesSince(500) | 3,851 | 5,819 | 0.66x | FFI overhead on medium sets |
-| diff(100)multi | 5,565 | 6,252 | 0.89x | Batched multi-key fetch |
-| getRow(PK) | 379,104 | 697,804 | 0.54x | Per-call FFI overhead |
-| INSERT single | 23,363 | 58,087 | 0.40x | Per-call FFI overhead |
+| Operation         | Rust (ops/sec) | TS/C++ (ops/sec) | Speedup   | Notes                       |
+| ----------------- | -------------- | ---------------- | --------- | --------------------------- |
+| allBuf(100)       | 52,219         | 29,361           | **1.78x** | Buffer protocol wins        |
+| allBuf(1K)        | 6,126          | 3,004            | **2.04x** | Buffer protocol wins        |
+| allBuf(5K)        | 1,236          | 599              | **2.06x** | Buffer protocol wins        |
+| getRowsBuf(10)    | 147,660        | 150,444          | 0.98x     | Near parity                 |
+| vsDiff(1K)        | 543            | 584              | 0.93x     | Composite hot path          |
+| changesSince(500) | 3,851          | 5,819            | 0.66x     | FFI overhead on medium sets |
+| diff(100)multi    | 5,565          | 6,252            | 0.89x     | Batched multi-key fetch     |
+| getRow(PK)        | 379,104        | 697,804          | 0.54x     | Per-call FFI overhead       |
+| INSERT single     | 23,363         | 58,087           | 0.40x     | Per-call FFI overhead       |
 
 ## View-Syncer Diff Simulation (D-22)
 
 The composite benchmark simulates the real snapshotter diff cycle:
 `changesSinceBuf(1000 changes, 5 tables) → group by table → getRowsMultiBuf per table → decode`
 
-| Path | ops/sec | Median (μs) | p99 (μs) |
-|------|---------|-------------|----------|
-| TS (per-row getRow) | 584 | 1,666 | 2,782 |
-| Rust (batched getRowsMultiBuf) | 543 | 1,830 | 2,037 |
+| Path                           | ops/sec | Median (μs) | p99 (μs) |
+| ------------------------------ | ------- | ----------- | -------- |
+| TS (per-row getRow)            | 584     | 1,666       | 2,782    |
+| Rust (batched getRowsMultiBuf) | 543     | 1,830       | 2,037    |
 
 **Result:** 0.93x — near parity. The Rust path trades slightly higher median latency for significantly tighter p99 (2,037 vs 2,782 μs), indicating more predictable performance under load.
 
@@ -58,6 +58,7 @@ The buffer protocol (`allBuf`, `getRowsBuf`, `changesSinceBuf`, `getRowsMultiBuf
 The 1.78–2.06x speedup observed in buffer operations partially reflects reduced GC overhead, though the majority comes from avoiding V8 object construction and property interning costs. Under sustained load with large result sets (1K+ rows), this translates to fewer and shorter GC pauses.
 
 **Theoretical model:** For a 5K-row result set with 5 columns:
+
 - TS path: 5,000 object allocations + 25,000 property assignments + 5,000 type coercions
 - Rust buffer path: 1 Buffer allocation + JS-side decode (no V8 object construction in native layer)
 

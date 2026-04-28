@@ -563,7 +563,116 @@ describe('advance: single insert (1000-row DB)', () => {
 
 // ========== MULTI-PIPELINE ADVANCE (Rayon parallelism) ==========
 
-for (const queryCount of [10, 50]) {
+// ========== PROFILING: Where is time spent in Rust advance? ==========
+
+if (RustPipelineClass) {
+  for (const queryCount of [1, 10, 50]) {
+    describe(`PROFILE advance breakdown: ${queryCount} pipelines`, () => {
+      const {dbFile, db} = makeBulkDB(`prof_${queryCount}`, 500);
+      const lc = createSilentLogContext();
+      const tsReplicator = fakeReplicator(lc, db);
+
+      const RPC = RustPipelineClass!;
+      const {queriesJson} = buildMultiQueries(
+        queryCount,
+        ISSUES_AND_COMMENTS,
+      );
+      const rustPipeline = new RPC(dbFile.path, queriesJson);
+      rustPipeline.hydrate();
+      let profVersion = 80000 + queryCount * 1000;
+
+      // Accumulators for timing (in ms)
+      const timings = {
+        processTransaction: 0,
+        swapSnapshot: 0,
+        jsonStringify: 0,
+        rustAdvance: 0,
+        decodeBuf: 0,
+        iterations: 0,
+      };
+
+      bench(
+        `${queryCount} pipelines (profiled)`,
+        () => {
+          const v = ver(profVersion++);
+          const id = `prof-${v}`;
+
+          let t0 = performance.now();
+          tsReplicator.processTransaction(
+            v,
+            messages.insert('issues', {id}),
+          );
+          let t1 = performance.now();
+          timings.processTransaction += t1 - t0;
+
+          t0 = performance.now();
+          rustPipeline.swapSnapshot(dbFile.path);
+          t1 = performance.now();
+          timings.swapSnapshot += t1 - t0;
+
+          t0 = performance.now();
+          const changesJson = JSON.stringify([
+            makeInsertChange('issues', {id}, {id, closed: false}),
+          ]);
+          t1 = performance.now();
+          timings.jsonStringify += t1 - t0;
+
+          t0 = performance.now();
+          const buf = rustPipeline.advance(changesJson);
+          t1 = performance.now();
+          timings.rustAdvance += t1 - t0;
+
+          t0 = performance.now();
+          const d = decodeAdvanceResultBuf(buf);
+          t1 = performance.now();
+          timings.decodeBuf += t1 - t0;
+
+          timings.iterations++;
+          if (d.changes.length === 0) throw new Error('no advance results');
+        },
+        {
+          teardown: () => {
+            if (timings.iterations > 0) {
+              const n = timings.iterations;
+              console.log(
+                `\n--- PROFILE: ${queryCount} pipelines (${n} iterations) ---`,
+              );
+              console.log(
+                `  processTransaction: ${(timings.processTransaction / n).toFixed(3)} ms/iter`,
+              );
+              console.log(
+                `  swapSnapshot:       ${(timings.swapSnapshot / n).toFixed(3)} ms/iter`,
+              );
+              console.log(
+                `  JSON.stringify:     ${(timings.jsonStringify / n).toFixed(3)} ms/iter`,
+              );
+              console.log(
+                `  rustAdvance (NAPI): ${(timings.rustAdvance / n).toFixed(3)} ms/iter`,
+              );
+              console.log(
+                `  decodeBuf:          ${(timings.decodeBuf / n).toFixed(3)} ms/iter`,
+              );
+              console.log(
+                `  TOTAL:              ${((timings.processTransaction + timings.swapSnapshot + timings.jsonStringify + timings.rustAdvance + timings.decodeBuf) / n).toFixed(3)} ms/iter`,
+              );
+              // Reset for next warmup/measurement cycle
+              timings.processTransaction = 0;
+              timings.swapSnapshot = 0;
+              timings.jsonStringify = 0;
+              timings.rustAdvance = 0;
+              timings.decodeBuf = 0;
+              timings.iterations = 0;
+            }
+          },
+        },
+      );
+    });
+  }
+}
+
+// ========== MULTI-PIPELINE ADVANCE (Rayon parallelism) ==========
+
+for (const queryCount of [2, 10, 50]) {
   describe(`advance: ${queryCount} pipelines, single insert (Rayon par_iter)`, () => {
     const {dbFile, db} = makeBulkDB(`a_multi_${queryCount}`, 500);
     const lc = createSilentLogContext();

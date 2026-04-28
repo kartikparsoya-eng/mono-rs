@@ -31,6 +31,7 @@ Generator that wraps `rowIterator.next()` in `timeSampled()` (OTel timing), then
 ### `fromSQLiteTypes` (table-source.ts:588-605)
 
 Per-row function: iterates `Object.keys(row)`, maps each value through `fromSQLiteType()`:
+
 - `boolean`: `!!v` (SQLite stores as 0/1 INTEGER)
 - `number`/`string`/`null`: pass through, but convert bigint→number (throws if out of safe range)
 - `json`: `JSON.parse(v as string)` (throws UnsupportedValueError on invalid JSON)
@@ -43,15 +44,15 @@ Single-row fetch using `statement.get()` + `fromSQLiteTypes`. Can use `queryAll`
 
 ### SQLite → JS Type Map (with `safeIntegers(true)`)
 
-| SQLite Type | JS Raw Type | Column Schema | Converted JS Type |
-|-------------|-------------|---------------|-------------------|
-| NULL | null | any | null |
-| INTEGER | bigint (safeIntegers) | boolean | `!!v` → boolean |
-| INTEGER | bigint (safeIntegers) | number | `Number(v)` (throws if > MAX_SAFE_INTEGER) |
-| INTEGER | bigint (safeIntegers) | string | bigint (pass through) |
-| REAL | number | number | number (pass through) |
-| TEXT | string | string | string (pass through) |
-| TEXT | string | json | `JSON.parse(v)` |
+| SQLite Type | JS Raw Type           | Column Schema | Converted JS Type                          |
+| ----------- | --------------------- | ------------- | ------------------------------------------ |
+| NULL        | null                  | any           | null                                       |
+| INTEGER     | bigint (safeIntegers) | boolean       | `!!v` → boolean                            |
+| INTEGER     | bigint (safeIntegers) | number        | `Number(v)` (throws if > MAX_SAFE_INTEGER) |
+| INTEGER     | bigint (safeIntegers) | string        | bigint (pass through)                      |
+| REAL        | number                | number        | number (pass through)                      |
+| TEXT        | string                | string        | string (pass through)                      |
+| TEXT        | string                | json          | `JSON.parse(v)`                            |
 
 ### Rust Implementation Notes
 
@@ -116,16 +117,25 @@ Actually, **even simpler**: Just implement `queryAll`. If we need batching for y
 ### Minimal Change to `#fetch()`
 
 Current (table-source.ts:289-293):
+
 ```ts
 const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
 cachedStatement.statement.safeIntegers(true);
-const rowIterator = cachedStatement.statement.iterate<Row>(...sqlAndBindings.values);
+const rowIterator = cachedStatement.statement.iterate<Row>(
+  ...sqlAndBindings.values,
+);
 ```
 
 Replace `#mapFromSQLiteTypes` usage with:
+
 ```ts
 // Instead of iterate() + #mapFromSQLiteTypes(), use Rust queryAll
-const rows = this.#db.queryAll(sqlAndBindings.text, sqlAndBindings.values, this.#columnTypesMap, this.#table);
+const rows = this.#db.queryAll(
+  sqlAndBindings.text,
+  sqlAndBindings.values,
+  this.#columnTypesMap,
+  this.#table,
+);
 ```
 
 Then feed `rows` (an array) as an iterable into `generateWithOverlay` / `generateWithOverlayUnordered` (they accept `Iterable<Row>`).
@@ -135,6 +145,7 @@ Then feed `rows` (an array) as an iterable into `generateWithOverlay` / `generat
 The current code uses `this.#stmts.cache.get(sql)` to get a cached statement, then calls `.iterate()` on it. With `queryAll`, we bypass the statement cache entirely — Rust manages its own prepared statement internally.
 
 This is fine because:
+
 1. `queryAll` creates a new prepared statement per call (Rust side) — but SQLite has its own internal statement cache
 2. The TS StatementCache was only needed because `better-sqlite3`'s `prepare()` was expensive. With rusqlite, `prepare()` is fast.
 3. Per D-08, statement cache stays TS for the write-path statements (insert/delete/update/checkExists/getExisting).
@@ -158,12 +169,13 @@ Resolution: Remove `rowIterator.return()` call. For debug scanStatus, skip it in
 ```ts
 // db.ts — the TS wrapper
 export class Database {
-  #db: RustDatabase;  // the napi class
+  #db: RustDatabase; // the napi class
   // ...
 }
 ```
 
 Need to expose the inner Rust Database for `queryAll` calls. Options:
+
 1. Add `queryAll` as a method on the TS `Database` wrapper (delegates to Rust)
 2. Store the Rust `Database` reference directly in TableSource
 3. Add `queryAll`/`queryBatched` to the TS Database class which delegates
@@ -175,6 +187,7 @@ Need to expose the inner Rust Database for `queryAll` calls. Options:
 ### table-source.test.ts (1030 lines)
 
 **Test groups:**
+
 1. **"fetching from a table source"** (line 41-209): 14 parameterized test cases. Creates a foo table with 27 rows (3x3x3), tests various sort orders, constraints, start positions (at/after). Tests the full pipeline: `source.connect() → out.fetch() → rows`.
 2. **"fetched value types"** (line 212-313): 8 cases testing type conversion: null, number, float, boolean, bigint, json string/null/object/array, safe integer boundaries, bigint overflow.
 3. **"pushing values"** (line 315-569): Tests write path (add/remove/edit). Write path stays TS (D-13), so this should be unaffected.
@@ -190,10 +203,12 @@ This test monkey-patches `Statement.prototype.iterate` and checks that `.return(
 **But wait**: looking more carefully, the test specifically tests that the iterator is closed when `debug.initQuery()` throws. With `queryAll`, there's no iterator at all — the query would fail differently. The test asserts `iteratorReturnCalled === true` after catching the error.
 
 **This test WILL FAIL if we change `#fetch` to use `queryAll`** because:
+
 1. It patches `Statement.prototype.iterate` — which won't be called
 2. It expects `iteratorReturnCalled` to be true — which won't happen
 
 **Resolution options:**
+
 1. Keep `statement.iterate()` for the debug code path and only use `queryAll` for non-debug
 2. Accept that this specific test needs a small modification (violates "tests pass unchanged")
 3. Make `queryAll` still go through a code path that the test can observe
@@ -207,6 +222,7 @@ This test monkey-patches `Statement.prototype.iterate` and checks that `.return(
 The existing `row_to_js_object` in types.rs already builds a JsObject from a rusqlite Row. For `queryAll`, we need a variant that also applies type conversion (boolean, bigint→number, json parse).
 
 New function needed: `row_to_typed_js_object(env, row, columns, column_types, table_name)`:
+
 - For each column, read the rusqlite value
 - Apply type conversion based on `column_types[col]`:
   - `"boolean"`: NULL→null, INTEGER→boolean
@@ -221,6 +237,7 @@ New function needed: `row_to_typed_js_object(env, row, columns, column_types, ta
 For `json` columns, we need to convert SQLite TEXT → JS value (could be object, array, string, number, boolean, null).
 
 Options:
+
 1. **serde_json → napi conversion**: Parse with serde_json, recursively convert `serde_json::Value` → JS value. Handles all JSON types.
 2. **Call JS `JSON.parse`**: Use `env.get_global()?.get_named_property::<JsFunction>("JSON")?.call_method("parse", &[text_value])`. One FFI roundtrip per JSON cell.
 3. **Return raw string, let TS parse**: Defeats purpose of Rust batch.
@@ -239,14 +256,14 @@ Column types come as a JS object `{colName: typeString}`. Parse once into a `Vec
 
 ## Risks and Mitigations
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Test line 970 fails (iterator close test) | Blocks merge | Fall back to iterate path when debug delegate present |
-| JSON parse differences (serde vs V8) | Subtle data bugs | Test all JSON edge cases from test suite |
-| Error message format mismatch | Test failures | Match exact format: "value {v} (in {table}.{column}) is outside..." |
-| StatementCache bypass | Possible perf regression on repeated queries | SQLite has internal stmt cache; benchmark to verify |
-| Memory pressure from queryAll on large tables | OOM for unbounded queries | Queries always have WHERE clauses or LIMIT in practice; add queryBatched if needed |
-| `fromSQLiteTypes` is imported by other modules | Breaking change if removed | Keep `fromSQLiteTypes` as TS export (D-12), Rust only used internally by queryAll |
+| Risk                                           | Impact                                       | Mitigation                                                                         |
+| ---------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Test line 970 fails (iterator close test)      | Blocks merge                                 | Fall back to iterate path when debug delegate present                              |
+| JSON parse differences (serde vs V8)           | Subtle data bugs                             | Test all JSON edge cases from test suite                                           |
+| Error message format mismatch                  | Test failures                                | Match exact format: "value {v} (in {table}.{column}) is outside..."                |
+| StatementCache bypass                          | Possible perf regression on repeated queries | SQLite has internal stmt cache; benchmark to verify                                |
+| Memory pressure from queryAll on large tables  | OOM for unbounded queries                    | Queries always have WHERE clauses or LIMIT in practice; add queryBatched if needed |
+| `fromSQLiteTypes` is imported by other modules | Breaking change if removed                   | Keep `fromSQLiteTypes` as TS export (D-12), Rust only used internally by queryAll  |
 
 ## Dependency Graph
 
@@ -273,5 +290,5 @@ db.ts changes
 
 ## RESEARCH COMPLETE
 
-*Researched: 2026-04-20*
-*Phase: 03-ivm-data-layer*
+_Researched: 2026-04-20_
+_Phase: 03-ivm-data-layer_

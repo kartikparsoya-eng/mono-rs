@@ -15,6 +15,7 @@ Replaced `packages/zqlite/src/db.ts` internals to use the Rust `zqlite-rs` nativ
 ## Key changes
 
 ### packages/zqlite/src/db.ts
+
 - Imports `Database as RustDatabase`, `Statement as RustStatement`, `RowIterator as RustRowIterator` from `zqlite-rs`
 - `Database` class wraps `RustDatabase` with OTel tracing, slow-query logging, error augmentation
 - `Statement` class wraps `RustStatement`, passes variadic params as array to Rust
@@ -25,13 +26,16 @@ Replaced `packages/zqlite/src/db.ts` internals to use the Rust `zqlite-rs` nativ
 - Error messages cleaned: strips rusqlite's " in ... at offset N" suffix to match better-sqlite3 format
 
 ### packages/zqlite-rs/src/database.rs
+
 - Removed SQL from error messages (TS wrapper handles augmentation)
 - Removed `PRAGMA optimize` from `close()` (TS wrapper handles it with logging)
 
 ### packages/zqlite-rs/src/statement.rs
+
 - `run()` now handles SELECT statements (catches `ExecuteReturnedResults`, falls back to `query()`)
 
 ### packages/zqlite/package.json
+
 - Replaced `@rocicorp/zero-sqlite3` dependency with `zqlite-rs: "0.0.0"`
 
 ## Verification
@@ -44,6 +48,7 @@ Replaced `packages/zqlite/src/db.ts` internals to use the Rust `zqlite-rs` nativ
 ## key-files
 
 ### key-files.modified
+
 - packages/zqlite/src/db.ts
 - packages/zqlite/package.json
 - packages/zqlite-rs/src/database.rs

@@ -977,8 +977,8 @@ pub fn build_push_operator_list(
             }
             OperatorConfig::Exists { .. } | OperatorConfig::OrExists { .. } => {
                 // Exists operators need their child source for count tracking
-                let dummy = Box::new(PassthroughOperator::new());
-                let op = build_push_next_operator(source.clone(), dummy, config)?;
+                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
+                let op = build_push_next_operator(source.clone(), bridge, config)?;
                 operators.push(op);
             }
             OperatorConfig::Filter { .. } => {
@@ -987,9 +987,10 @@ pub fn build_push_operator_list(
                 operators.push(op);
             }
             OperatorConfig::Join { .. } => {
-                // Join just attaches children during push — parent input not used for push
-                let dummy = Box::new(PassthroughOperator::new());
-                let op = build_push_next_operator(source.clone(), dummy, config)?;
+                // Join needs SourceBridge as parent so push_child() can find
+                // matching parent rows via parent.fetch(constraint).
+                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
+                let op = build_push_next_operator(source.clone(), bridge, config)?;
                 operators.push(op);
             }
             OperatorConfig::Source { .. } => {
@@ -1180,11 +1181,16 @@ fn build_push_next_operator(
             parent_key,
             child_key,
             child,
-            ..
+            or_condition,
         } => {
             let child_source = make_child_source(&source, child)
                 .ok_or("failed to create child source for exists")?;
             let child_op = build_operator_with_live_source(Arc::new(child_source), child)?;
+            let or_pred = if let Some(oc) = or_condition {
+                Some(zero_ivm_rs::pipeline::parse_predicate(oc)?)
+            } else {
+                None
+            };
             Ok(Box::new(ExistsOperator::new(
                 input,
                 child_op,
@@ -1192,10 +1198,38 @@ fn build_push_next_operator(
                 *not_exists,
                 parent_key.clone(),
                 child_key.clone(),
-            )))
+            ).with_or_predicate(or_pred)))
         }
-        OperatorConfig::OrExists { .. } => {
-            Err("OrExists not supported in push path".to_string())
+        OperatorConfig::OrExists {
+            branches,
+            or_condition,
+        } => {
+            let or_pred = if let Some(oc) = or_condition {
+                Some(zero_ivm_rs::pipeline::parse_predicate(oc)?)
+            } else {
+                None
+            };
+            let branch_data: Vec<_> = branches
+                .iter()
+                .map(|b| {
+                    let child_source = make_child_source(&source, &b.child)
+                        .ok_or("failed to create child source for or_exists branch")?;
+                    let child_op =
+                        build_operator_with_live_source(Arc::new(child_source), &b.child)?;
+                    Ok((
+                        child_op,
+                        b.relationship_name.clone(),
+                        b.not_exists,
+                        b.parent_key.clone(),
+                        b.child_key.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Box::new(zero_ivm_rs::or_exists_op::OrExistsOperator::new(
+                input,
+                branch_data,
+                or_pred,
+            )))
         }
         OperatorConfig::Skip {
             bound_row,

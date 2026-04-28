@@ -1,5 +1,5 @@
 ---
-plan_id: "13-01"
+plan_id: '13-01'
 status: complete
 started: 2026-04-20
 completed: 2026-04-20
@@ -20,6 +20,7 @@ Ported the snapshot diff logic from `snapshotter.ts` into a pure Rust module (`p
 ## Test Results
 
 11 unit tests passing:
+
 - `test_read_changelog_entries`
 - `test_get_row` / `test_get_row_missing`
 - `test_get_rows_null_filter`

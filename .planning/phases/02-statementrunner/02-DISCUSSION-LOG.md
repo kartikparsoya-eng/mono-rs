@@ -11,11 +11,11 @@
 
 ## Rewrite Scope
 
-| Option | Description | Selected |
-|--------|-------------|----------|
-| Rewrite StatementRunner in Rust | Move 70 lines to Rust, requires Rust→TS callback for StatementCache | |
-| Keep StatementRunner in TS | Already delegates to Rust Database via Phase 1 | ✓ |
-| Move StatementCache + StatementRunner to Rust | Reverses Phase 1 D-08, scope creep | |
+| Option                                        | Description                                                         | Selected |
+| --------------------------------------------- | ------------------------------------------------------------------- | -------- |
+| Rewrite StatementRunner in Rust               | Move 70 lines to Rust, requires Rust→TS callback for StatementCache |          |
+| Keep StatementRunner in TS                    | Already delegates to Rust Database via Phase 1                      | ✓        |
+| Move StatementCache + StatementRunner to Rust | Reverses Phase 1 D-08, scope creep                                  |          |
 
 **User's choice:** Keep StatementRunner in TS
 **Notes:** User explicitly said: "Keep StatementRunner in TS. Do not reverse D-08. Real Rust wins come from Phases 3-6. Consumer imports unchanged via re-export shim if any implementation moves later."

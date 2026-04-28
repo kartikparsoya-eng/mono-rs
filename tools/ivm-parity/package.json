@@ -7,7 +7,7 @@
     "deploy-schema": "npx zero-deploy-permissions -p zero-schema.ts --output-file schema.json",
     "db-create": "PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d postgres -c 'CREATE DATABASE parity' || echo 'already exists'",
     "db-migrate": "PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f schema.sql && PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f seed.sql && PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f seed-extras.sql",
-    "start-ts": "ZERO_DISABLE_RUST_IVM=1 ZERO_ENABLE_QUERY_PLANNER=false ZERO_PORT=4858 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/parity ZERO_REPLICA_FILE=/tmp/ivm-parity-ts.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_ts ZERO_NUM_SYNC_WORKERS=2 ZERO_ADMIN_PASSWORD=devdev ZERO_AUTH_SECRET=devsecret npx zero-cache",
+    "start-ts": "echo 'Use ./run.sh instead — TS reference server now runs from a git worktree of main. See run.sh for details.' && exit 1",
     "start-rs": "ZERO_ENABLE_QUERY_PLANNER=false ZERO_PORT=4868 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/parity ZERO_REPLICA_FILE=/tmp/ivm-parity-rs.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_rs ZERO_NUM_SYNC_WORKERS=2 ZERO_ADMIN_PASSWORD=devdev ZERO_AUTH_SECRET=devsecret npx zero-cache",
     "fuzz": "tsx ast-fuzz.ts",
     "seed-corpus": "tsx seed-extractor.ts",

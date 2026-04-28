@@ -60,6 +60,8 @@ export type DecodedAdvanceResult = {
   error?: string | undefined;
   error_type?: string | undefined;
   timings?: AdvanceTimings | undefined;
+  /** If set, companion scalar subquery value changed — caller must reset pipelines. */
+  reset_signal?: string | undefined;
 };
 
 export function decodeAdvanceResultBuf(buf: Buffer): DecodedAdvanceResult {
@@ -150,7 +152,14 @@ export function decodeAdvanceResultBuf(buf: Buffer): DecodedAdvanceResult {
     timings = {totalUs, pipelineCount, perPipeline};
   }
 
-  return {changes, error, error_type: errorType, timings};
+  // Check for reset_signal (flag bit 2)
+  const hasResetSignal = (flags & 4) !== 0;
+  let reset_signal: string | undefined;
+  if (hasResetSignal && offset < buf.byteLength) {
+    [reset_signal, offset] = readStr(buf, view, offset);
+  }
+
+  return {changes, error, error_type: errorType, timings, reset_signal};
 }
 
 function readStr(
@@ -223,3 +232,5 @@ function readJsonValue(
       throw new Error(`Unknown binary tag: ${tag} at offset ${offset - 1}`);
   }
 }
+
+

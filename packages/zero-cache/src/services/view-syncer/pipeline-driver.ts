@@ -1,7 +1,6 @@
 import {createRequire} from 'node:module';
 import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
-import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
 import {must} from '../../../../shared/src/must.ts';
 import {RustStorage} from '../../../../zero-ivm-rs/index.js';
 import {RustTakeStorage} from '../../../../zero-ivm-rs/ts/rust-take-storage.ts';
@@ -32,11 +31,7 @@ import {
 import type {SourceSchema} from '../../../../zql/src/ivm/schema.ts';
 import {
   type Source,
-  type SourceChange,
   type SourceInput,
-  makeSourceChangeAdd,
-  makeSourceChangeEdit,
-  makeSourceChangeRemove,
 } from '../../../../zql/src/ivm/source.ts';
 import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
 import {MeasurePushOperator} from '../../../../zql/src/query/measure-push-operator.ts';
@@ -52,94 +47,49 @@ import {
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
 import {
-  isDualExecEnabled,
-  dualExecCompare,
   materializeChanges,
 } from './dual-executor.ts';
-import {isRustExistsAvailable, createRustExistsWrapper} from './rust-exists.ts';
-import {isRustJoinAvailable} from './rust-join.ts';
+import {createRustExistsWrapper} from './rust-exists.ts';
 
-type RustHydrateFn = (dbPath: string, queriesJson: string) => Buffer;
-
-type RustAdvanceFromAstBufFn = (
-  dbPath: string,
-  changesJson: string,
-  queriesJson: string,
-) => Buffer;
-
-let rustHydrateFn: RustHydrateFn | undefined;
-let rustAdvanceFromAstBufFn: RustAdvanceFromAstBufFn | undefined;
-let RustPipelineClass:
-  | (new (
-      dbPath: string,
-      queriesJson: string,
-    ) => {
-      hydrate(): Buffer;
-      advance(changesJson: string): Buffer;
-      swapSnapshot(newDbPath: string): void;
-      addQuery(queryJson: string): void;
-      removeQuery(queryId: string): void;
-      pipelineCount(): number;
-    })
+let RustPipelineManagerClass:
+  | {
+      new (): RustPipelineManagerInstance;
+    }
   | undefined;
+
+interface RustPipelineManagerInstance {
+  createInstance(id: string, dbPath: string): void;
+  removeInstance(id: string): void;
+  setTableSpecs(id: string, syncableTablesJson: string, allTableNamesJson: string): void;
+  setPermissionTables(id: string, tablesJson: string): void;
+  setQueryCompanions(id: string, queryId: string, companionsJson: string): void;
+  addQuery(id: string, queryJson: string): void;
+  removeQuery(id: string, queryId: string): void;
+  hydrate(id: string): Buffer;
+  hydrateQuery(id: string, queryId: string): Buffer;
+  advance(id: string, changesJson: string): Buffer;
+  advanceAsync(id: string, changesJson: string): Promise<Buffer>;
+  hydrateAsync(id: string): Promise<Buffer>;
+  hydrateQueryAsync(id: string, queryId: string): Promise<Buffer>;
+  swapSnapshot(id: string, newDbPath: string): void;
+  pipelineCount(id: string): number;
+}
+
 try {
   const esmRequire = createRequire(import.meta.url);
   const bindings = esmRequire('zqlite-rs');
-  rustHydrateFn = bindings?.rustHydrate;
-  rustAdvanceFromAstBufFn = bindings?.rustAdvanceFromAstBuf;
-  RustPipelineClass = bindings?.RustPipeline;
+  RustPipelineManagerClass = bindings?.RustPipelineManager;
 } catch (e) {
   // Log so operators know Rust acceleration is unavailable.
   // eslint-disable-next-line no-console
   console.warn(`Failed to load zqlite-rs native bindings: ${e}`);
-  rustHydrateFn = undefined;
-  rustAdvanceFromAstBufFn = undefined;
-  RustPipelineClass = undefined;
+  RustPipelineManagerClass = undefined;
 }
 
-interface RustPipelineConfig {
-  query_id: string;
-  source_tables: string[];
-  operators: RustOperator[];
-  primary_key: string[];
-  related?:
-    | Array<{
-        relationship: string;
-        parent_field: string[];
-        child_field: string[];
-        child_ast: unknown;
-      }>
-    | undefined;
-  limit?: number | null | undefined;
-  order_by?: [string, string][] | undefined;
-}
-type RustOperator =
-  | {type: 'filter'; predicate: unknown}
-  | {type: 'take'; sort: [string, string][]; limit: number | null}
-  | {
-      type: 'exists';
-      relationship: string;
-      parent_field: string[];
-      not_exists: boolean;
-    }
-  | {
-      type: 'join';
-      relationship: string;
-      parent_field: string[];
-      child_field: string[];
-      child_ast: unknown;
-    };
-
-const USE_RUST_IVM = process.env.ZERO_DISABLE_RUST_IVM !== '1';
-const USE_RUST_JOIN = USE_RUST_IVM && isRustJoinAvailable();
-const USE_RUST_EXISTS = USE_RUST_IVM && isRustExistsAvailable();
-const USE_RUST_ADVANCE =
-  USE_RUST_IVM &&
-  (RustPipelineClass !== undefined || rustAdvanceFromAstBufFn !== undefined);
-const USE_RUST_HYDRATION =
-  USE_RUST_IVM &&
-  process.env.ZERO_DISABLE_RUST_HYDRATION !== '1' &&
-  rustHydrateFn !== undefined;
+// Rust IVM is the sole execution path for hydration and advance.
+// TS IVM pipeline is still built for TableSource (getRow) and companion
+// pipelines, but hydration data and advance changes flow exclusively
+// through the Rust operator tree.
 const RUST_EXISTS_NAME_RE = /:exists\(([^)]+)\)/;
 
 function collectExistsCorrelations(
@@ -199,10 +149,7 @@ import {
 import type {LogConfig, ZeroConfig} from '../../config/zero-config.ts';
 import {computeZqlSpecs, mustGetTableSpec} from '../../db/lite-tables.ts';
 import type {LiteAndZqlSpec, LiteTableSpec} from '../../db/specs.ts';
-import {
-  getOrCreateCounter,
-  getOrCreateHistogram,
-} from '../../observability/metrics.ts';
+
 import type {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {type RowKey} from '../../types/row-key.ts';
 import {type ShardID} from '../../types/shards.ts';
@@ -212,7 +159,7 @@ import {
 } from '../replicator/schema/replication-state.ts';
 import {checkClientSchema} from './client-schema.ts';
 import type {Snapshotter} from './snapshotter.ts';
-import {ResetPipelinesSignal, type SnapshotDiff} from './snapshotter.ts';
+import {ResetPipelinesSignal} from './snapshotter.ts';
 
 type RowOp<Op extends Omit<ChangeType, ChangeType.CHILD>> = {
   readonly type: Op;
@@ -232,6 +179,7 @@ export type RowChange = RowAdd | RowRemove | RowEdit;
 
 type CompanionPipeline = {
   readonly input: Input;
+  readonly ast: AST;
   readonly childField: string;
   readonly resolvedValue: LiteralValue | null | undefined;
 };
@@ -282,8 +230,7 @@ export class PipelineDriver {
   readonly #lc: LogContext;
   readonly #snapshotter: Snapshotter;
   readonly #storage: ClientGroupStorage;
-  readonly #rustStorage: RustStorage | null;
-  readonly #rustJoinAvailable: boolean;
+  readonly #rustStorage: RustStorage;
   #rustOpID = 0;
   readonly #shardID: ShardID;
   readonly #logConfig: LogConfig;
@@ -292,38 +239,19 @@ export class PipelineDriver {
   readonly #allTableNames = new Set<string>();
   readonly #costModels: WeakMap<Database, ConnectionCostModel> | undefined;
   readonly #yieldThresholdMs: () => number;
-  #streamer: Streamer | null = null;
+
   #hydrateContext: HydrateContext | null = null;
   #advanceContext: AdvanceContext | null = null;
   #replicaVersion: string | null = null;
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
 
-  readonly #advanceTime = getOrCreateHistogram('sync', 'ivm.advance-time', {
-    description:
-      'Time to advance all queries for a given client group for in response to a single change.',
-    unit: 's',
-  });
 
-  readonly #conflictRowsDeleted = getOrCreateCounter(
-    'sync',
-    'ivm.conflict-rows-deleted',
-    'Number of rows deleted because they conflicted with added row',
-  );
-
-  readonly #rustAdvanceFailures = getOrCreateCounter(
-    'sync',
-    'ivm.rust-advance-failures',
-    'Number of times Rust advance failed and fell back to TS',
-  );
 
   readonly #inspectorDelegate: InspectorDelegate;
-  readonly #pipelineConfigs = new Map<string, RustPipelineConfig>();
   readonly #permissionTablesByQuery = new Map<string, Set<string>>();
-  #useRustAdvance = false;
-  #rustPipeline: InstanceType<NonNullable<typeof RustPipelineClass>> | null =
-    null;
-  #rustPipelineDirty = true;
+  #manager: RustPipelineManagerInstance | null = null;
+  readonly #instanceId: string;
 
   constructor(
     lc: LogContext,
@@ -340,14 +268,14 @@ export class PipelineDriver {
     this.#lc = lc.withContext('clientGroupID', clientGroupID);
     this.#snapshotter = snapshotter;
     this.#storage = storage;
-    this.#rustStorage = USE_RUST_IVM ? new RustStorage() : null;
-    this.#rustJoinAvailable = USE_RUST_JOIN;
+    this.#rustStorage = new RustStorage();
     this.#shardID = shardID;
     this.#logConfig = logConfig;
     this.#config = config;
     this.#inspectorDelegate = inspectorDelegate;
     this.#costModels = enablePlanner ? new WeakMap() : undefined;
     this.#yieldThresholdMs = yieldThresholdMs;
+    this.#instanceId = clientGroupID;
   }
 
   /**
@@ -360,12 +288,7 @@ export class PipelineDriver {
     assert(!this.#snapshotter.initialized(), 'Already initialized');
     this.#snapshotter.init();
     this.#initAndResetCommon(clientSchema);
-    if (this.#rustJoinAvailable) {
-      this.#lc.debug?.('Rust join acceleration available');
-    }
-    if (USE_RUST_EXISTS) {
-      this.#lc.debug?.('Rust exists acceleration available');
-    }
+
   }
 
   /**
@@ -390,11 +313,8 @@ export class PipelineDriver {
     this.#pipelines.clear();
     this.#tables.clear();
     this.#allTableNames.clear();
-    this.#pipelineConfigs.clear();
     this.#permissionTablesByQuery.clear();
-    this.#useRustAdvance = false;
-    this.#rustPipeline = null;
-    this.#rustPipelineDirty = true;
+    this.#manager = null;
     this.#initAndResetCommon(clientSchema);
   }
 
@@ -427,6 +347,43 @@ export class PipelineDriver {
     buildPrimaryKeys(clientSchema, primaryKeys);
     const {replicaVersion} = getSubscriptionState(db);
     this.#replicaVersion = replicaVersion;
+
+    // Create the persistent Rust pipeline manager instance eagerly so
+    // addQuery/hydrate/advance all share the same operator tree.
+    if (RustPipelineManagerClass) {
+      this.#manager = new RustPipelineManagerClass();
+      this.#manager.createInstance(this.#instanceId, db.db.name);
+      this.#setTableSpecsOnManager();
+    }
+  }
+
+  /**
+   * Serialize table specs and all table names to the Rust manager so it
+   * can perform diffing (changelog → row lookups → type conversion).
+   */
+  #setTableSpecsOnManager() {
+    if (!this.#manager) return;
+    // Convert LiteAndZqlSpec map to the JSON format Rust expects:
+    // { "tableName": { "tableSpec": {...}, "zqlSpec": {...} } }
+    const syncableTablesObj: Record<string, unknown> = {};
+    for (const [name, spec] of this.#tableSpecs.entries()) {
+      syncableTablesObj[name] = {
+        tableSpec: {
+          name: spec.tableSpec.name,
+          columns: spec.tableSpec.columns,
+          primaryKey: spec.tableSpec.primaryKey,
+          uniqueKeys: spec.tableSpec.uniqueKeys,
+          minRowVersion: spec.tableSpec.minRowVersion,
+          allPotentialPrimaryKeys: spec.tableSpec.allPotentialPrimaryKeys ?? [],
+        },
+        zqlSpec: {columns: spec.zqlSpec},
+      };
+    }
+    this.#manager.setTableSpecs(
+      this.#instanceId,
+      JSON.stringify(syncableTablesObj),
+      JSON.stringify([...this.#allTableNames]),
+    );
   }
 
   /** @returns The replica version. The PipelineDriver must have been initialized. */
@@ -471,6 +428,7 @@ export class PipelineDriver {
     for (const table of this.#tables.values()) {
       table.setDB(db.db);
     }
+    this.#manager?.swapSnapshot(this.#instanceId, db.db.name);
     return version;
   }
 
@@ -612,27 +570,13 @@ export class PipelineDriver {
       const existsTypes = collectExistsTypes(resolvedQuery.where);
       const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
 
-      // Capture Take storage reference so we can initialize it after Rust hydration.
-      let takeStorage: Storage | null = null;
-      let hasChildTakes = false;
       const input = buildPipeline(
         resolvedQuery,
         {
           debug: debugDelegate,
           enableNotExists: true, // Server-side can handle NOT EXISTS
           getSource: name => this.#getSource(name),
-          createStorage: (name: string) => {
-            const storage = this.#createStorage();
-            // Capture only the top-level Take storage (name === ':take').
-            // Child Takes in .related() subqueries have names like '.comments:take'
-            // and are partitioned — they don't need this initialization.
-            if (name === ':take') {
-              takeStorage = storage;
-            } else if (name.includes(':take')) {
-              hasChildTakes = true;
-            }
-            return storage;
-          },
+          createStorage: () => this.#createStorage(),
           decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
             new MeasurePushOperator(
               input,
@@ -643,7 +587,7 @@ export class PipelineDriver {
           decorateInput: input => input,
           addEdge() {},
           decorateFilterInput: (input, name) => {
-            if (USE_RUST_EXISTS && name.includes(':exists(')) {
+            if (name.includes(':exists(')) {
               const match = name.match(RUST_EXISTS_NAME_RE);
               if (match) {
                 const relationshipName = match[1];
@@ -664,70 +608,12 @@ export class PipelineDriver {
         queryID,
         costModel,
       );
-      const schema = input.getSchema();
       input.setOutput({
-        push: change => {
-          const streamer = this.#streamer;
-          assert(streamer, 'must #startAccumulating() before pushing changes');
-          streamer.accumulate(queryID, schema, [change]);
-          return [];
-        },
+        push: () => [],
       });
 
-      if (USE_RUST_HYDRATION) {
-        let hydratedRowCount = 0;
-        let lastHydratedRow: Row | undefined;
-        if (isDualExecEnabled()) {
-          for (const item of this.#dualExecHydrate(
-            queryID,
-            resolvedQuery,
-            input,
-          )) {
-            if (item.type === ChangeType.ADD) {
-              hydratedRowCount++;
-              lastHydratedRow = item.row;
-            }
-            yield item;
-          }
-        } else {
-          for (const item of this.#rustHydrate(queryID, resolvedQuery)) {
-            if (item !== 'yield' && item.type === ChangeType.ADD) {
-              hydratedRowCount++;
-              lastHydratedRow = item.row;
-            }
-            yield item;
-          }
-        }
-        // After Rust hydration, initialize Take state so TS advance works.
-        // Rust hydration bypasses input.fetch(), leaving Take's storage empty.
-        // Without this, Take.push() silently drops all changes (non-reactive).
-        if (takeStorage && resolvedQuery.limit !== undefined) {
-          initializeTakeState(takeStorage, hydratedRowCount, lastHydratedRow);
-        }
-        // Warm up the TS pipeline to initialize child Take operators
-        // (e.g., in EXISTS/JOIN subqueries). Rust hydration bypasses
-        // input.fetch(), so child Takes have empty storage and silently
-        // drop all pushes. Running a fetch through the pipeline triggers
-        // each child Take's #initialFetch, populating their partition state.
-        // Skip this expensive SQLite re-query when there are no child Takes
-        // (filter-only queries, simple LIMIT queries without subqueries).
-        if (hasChildTakes) {
-          for (const node of input.fetch({})) {
-            if (node === 'yield') {
-              continue;
-            }
-            // Discard results — we only need the side effect of
-            // initializing Take state in child subquery pipelines.
-          }
-        }
-      } else {
-        yield* hydrateInternal(
-          input,
-          queryID,
-          must(this.#primaryKeys),
-          this.#tableSpecs,
-        );
-      }
+      // Hydration flows exclusively through the Rust operator tree.
+      yield* this.#rustHydrateQuery(queryID, resolvedQuery);
 
       for (const {table, row} of companionRows) {
         const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
@@ -767,41 +653,9 @@ export class PipelineDriver {
       for (let i = 0; i < companionMeta.length; i++) {
         const meta = companionMeta[i];
         const companionInput = companionInputs[i];
-        const companionSchema = companionInput.getSchema();
         const {childField, resolvedValue} = meta;
-        companionInput.setOutput({
-          push: (change: Change) => {
-            let newValue: LiteralValue | null | undefined;
-            switch (change[ChangeIndex.TYPE]) {
-              case ChangeType.ADD:
-              case ChangeType.EDIT:
-                newValue =
-                  (change[ChangeIndex.NODE].row[childField] as LiteralValue) ??
-                  null;
-                break;
-              case ChangeType.REMOVE:
-                newValue = undefined;
-                break;
-              case ChangeType.CHILD:
-                return [];
-            }
-            if (!scalarValuesEqual(newValue, resolvedValue)) {
-              throw new ResetPipelinesSignal(
-                `Scalar subquery value changed for ${meta.ast.table}: ` +
-                  `${String(resolvedValue)} -> ${String(newValue)}`,
-                'scalar-subquery',
-              );
-            }
-            const streamer = this.#streamer;
-            assert(
-              streamer,
-              'must #startAccumulating() before pushing changes',
-            );
-            streamer.accumulate(queryID, companionSchema, [change]);
-            return [];
-          },
-        });
-        liveCompanions.push({input: companionInput, childField, resolvedValue});
+        companionInput.setOutput({push: () => []});
+        liveCompanions.push({input: companionInput, ast: meta.ast, childField, resolvedValue});
       }
 
       // Note: This hydrationTime is a wall-clock overestimate, as it does
@@ -814,54 +668,56 @@ export class PipelineDriver {
         companions: liveCompanions,
       });
 
-      if (USE_RUST_ADVANCE) {
-        const config = this.#extractPipelineConfig(
-          queryID,
-          resolvedQuery,
-          liveCompanions,
-        );
-        if (config) {
-          this.#pipelineConfigs.set(queryID, config);
-          const permTables = collectPermissionTables(resolvedQuery);
-          if (permTables.size > 0) {
-            this.#permissionTablesByQuery.set(queryID, permTables);
-          } else {
-            this.#permissionTablesByQuery.delete(queryID);
-          }
-        } else {
-          this.#pipelineConfigs.delete(queryID);
-          this.#permissionTablesByQuery.delete(queryID);
-        }
-        this.#reevaluateRustAdvance();
+      const permTables = collectPermissionTables(resolvedQuery);
+      if (permTables.size > 0) {
+        this.#permissionTablesByQuery.set(queryID, permTables);
+      } else {
+        this.#permissionTablesByQuery.delete(queryID);
       }
+
+      // Pass companion metadata to Rust for advance-time scalar checks.
+      if (this.#manager && liveCompanions.length > 0) {
+        const companionInfos = liveCompanions.map(c => {
+          const conditions: Array<{column: string; value: LiteralValue}> = [];
+          collectLiteralConditions(c.ast.where, conditions);
+          const pk = this.#primaryKeys?.get(c.ast.table) ?? [];
+          return {
+            queryId: queryID,
+            table: c.ast.table,
+            childField: c.childField,
+            resolvedValue: c.resolvedValue ?? null,
+            whereConditions: conditions,
+            primaryKey: pk,
+          };
+        });
+        this.#manager.setQueryCompanions(
+          this.#instanceId,
+          queryID,
+          JSON.stringify(companionInfos),
+        );
+      }
+
     } finally {
       this.#hydrateContext = null;
     }
   }
 
   /**
-   * Batch-hydrate multiple queries in a single Rust NAPI call, enabling
-   * Rayon parallelism across all pipelines. Falls back to sequential
-   * {@link addQuery} when Rust hydration is unavailable or for queries
-   * with scalar subquery companions.
-   *
-   * @param queries The queries to hydrate.
-   * @param timer   Shared timer for the batch.
-   * @return The rows from the initial hydration of all queries.
+   * Async version of addQueries() — offloads Rust batch hydration to a
+   * libuv worker thread so multiple client groups can hydrate in parallel.
+   * Returns a materialized array (not a generator) since we can't yield
+   * from an async method.
    */
-  *addQueries(
+  async addQueriesAsync(
     queries: ReadonlyArray<{
       readonly transformationHash: string;
       readonly queryID: string;
       readonly ast: AST;
     }>,
     timer: Timer,
-  ): Iterable<RowChange | 'yield'> {
-    if (!USE_RUST_HYDRATION || queries.length === 0) {
-      for (const q of queries) {
-        yield* this.addQuery(q.transformationHash, q.queryID, q.ast, timer);
-      }
-      return;
+  ): Promise<Iterable<RowChange | 'yield'>> {
+    if (queries.length === 0) {
+      return [];
     }
 
     assert(
@@ -883,8 +739,6 @@ export class PipelineDriver {
       companionInputs: Input[];
       existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
       existsCorrelations: Map<string, readonly string[]>;
-      takeStorage: Storage | null;
-      hasChildTakes: boolean;
       input: Input;
       debugDelegate: Debug | undefined;
       rustEligible: boolean;
@@ -919,23 +773,13 @@ export class PipelineDriver {
       const existsTypes = collectExistsTypes(resolvedQuery.where);
       const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
 
-      let takeStorage: Storage | null = null;
-      let hasChildTakes = false;
       const input = buildPipeline(
         resolvedQuery,
         {
           debug: debugDelegate,
           enableNotExists: true,
           getSource: name => this.#getSource(name),
-          createStorage: (name: string) => {
-            const storage = this.#createStorage();
-            if (name === ':take') {
-              takeStorage = storage;
-            } else if (name.includes(':take')) {
-              hasChildTakes = true;
-            }
-            return storage;
-          },
+          createStorage: () => this.#createStorage(),
           decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
             new MeasurePushOperator(
               input,
@@ -946,7 +790,7 @@ export class PipelineDriver {
           decorateInput: input => input,
           addEdge() {},
           decorateFilterInput: (input, name) => {
-            if (USE_RUST_EXISTS && name.includes(':exists(')) {
+            if (name.includes(':exists(')) {
               const match = name.match(RUST_EXISTS_NAME_RE);
               if (match) {
                 const relationshipName = match[1];
@@ -967,27 +811,23 @@ export class PipelineDriver {
         q.queryID,
         costModel,
       );
-      const schema = input.getSchema();
       input.setOutput({
-        push: change => {
-          const streamer = this.#streamer;
-          assert(streamer, 'must #startAccumulating() before pushing changes');
-          streamer.accumulate(q.queryID, schema, [change]);
-          return [];
-        },
+        push: () => [],
       });
 
       const tableName = resolvedQuery.table ?? '';
       const pk = this.#primaryKeys?.get(tableName) ?? [];
       const rustEligible =
-        rustHydrateFn !== undefined && companionMeta.length === 0;
-      rustPayloads.push({
-        query_id: q.queryID,
-        ast: resolvedQuery,
-        primary_key: [...pk],
-        column_types: this.#collectColumnTypes(resolvedQuery),
-        all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
-      });
+        this.#manager !== null && companionMeta.length === 0;
+      if (rustEligible) {
+        rustPayloads.push({
+          query_id: q.queryID,
+          ast: resolvedQuery,
+          primary_key: [...pk],
+          column_types: this.#collectColumnTypes(resolvedQuery),
+          all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
+        });
+      }
 
       prepared.push({
         queryID: q.queryID,
@@ -998,21 +838,271 @@ export class PipelineDriver {
         companionInputs,
         existsTypes,
         existsCorrelations,
-        takeStorage,
-        hasChildTakes,
         input,
         debugDelegate,
         rustEligible,
       });
     }
 
-    // Phase 2: Single batch Rust hydration call.
+    // Phase 2: Add queries and batch hydrate — ASYNC via libuv worker thread.
     let changesByQuery: Map<string, DecodedRowChange[]> | undefined;
     if (rustPayloads.length > 0) {
-      assert(rustHydrateFn, 'Rust hydrate not available');
-      const db = this.#snapshotter.current().db;
-      const queriesJson = JSON.stringify(rustPayloads);
-      const resultBuf = rustHydrateFn(db.db.name, queriesJson);
+      assert(this.#manager, 'RustPipelineManager not available');
+      for (const payload of rustPayloads) {
+        this.#manager.addQuery(this.#instanceId, JSON.stringify(payload));
+      }
+      const resultBuf = await this.#manager.hydrateAsync(this.#instanceId);
+      const decoded = decodeAdvanceResultBuf(resultBuf);
+      if (decoded.error) {
+        throw new Error(`Rust batch hydration failed: ${decoded.error}`);
+      }
+      changesByQuery = new Map();
+      for (const change of decoded.changes) {
+        let arr = changesByQuery.get(change.queryID);
+        if (!arr) {
+          arr = [];
+          changesByQuery.set(change.queryID, arr);
+        }
+        arr.push(change);
+      }
+    }
+
+    // Phase 3: Materialize results and finalize pipelines.
+    const allChanges: (RowChange | 'yield')[] = [];
+    let lastTotalElapsed = 0;
+    for (const p of prepared) {
+      this.#hydrateContext = {timer};
+      try {
+        if (p.rustEligible && changesByQuery) {
+          const changes = changesByQuery.get(p.queryID) ?? [];
+          const permTables = collectPermissionTables(p.resolvedQuery);
+          for (const change of this.#convertDecodedChanges(
+            p.queryID,
+            changes,
+            permTables.size > 0 ? permTables : undefined,
+          )) {
+            allChanges.push(change);
+          }
+        } else {
+          // Companion queries can't go through Rust batch; hydrate via TS.
+          for (const change of hydrateInternal(
+            p.input,
+            p.queryID,
+            must(this.#primaryKeys),
+            this.#tableSpecs,
+          )) {
+            allChanges.push(change);
+          }
+        }
+
+        for (const {table, row} of p.companionRows) {
+          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+          allChanges.push({
+            type: ChangeType.ADD,
+            queryID: p.queryID,
+            table,
+            rowKey: getRowKey(primaryKey, row),
+            row,
+          } as RowChange);
+        }
+
+        const currentTotal = timer.totalElapsed();
+        const hydrationTimeMs = currentTotal - lastTotalElapsed;
+        lastTotalElapsed = currentTotal;
+        p.debugDelegate?.reset();
+
+        // Set up live companion pipelines for reactive scalar subquery monitoring.
+        const liveCompanions: CompanionPipeline[] = [];
+        for (let i = 0; i < p.companionMeta.length; i++) {
+          const meta = p.companionMeta[i];
+          const companionInput = p.companionInputs[i];
+          const {childField, resolvedValue} = meta;
+          companionInput.setOutput({push: () => []});
+          liveCompanions.push({
+            input: companionInput,
+            ast: meta.ast,
+            childField,
+            resolvedValue,
+          });
+        }
+
+        this.#pipelines.set(p.queryID, {
+          input: p.input,
+          hydrationTimeMs,
+          transformedAst: p.resolvedQuery,
+          transformationHash: p.transformationHash,
+          companions: liveCompanions,
+        });
+
+        const permTables = collectPermissionTables(p.resolvedQuery);
+        if (permTables.size > 0) {
+          this.#permissionTablesByQuery.set(p.queryID, permTables);
+        } else {
+          this.#permissionTablesByQuery.delete(p.queryID);
+        }
+    
+      } finally {
+        this.#hydrateContext = null;
+      }
+    }
+
+    return allChanges;
+  }
+
+  /**
+   * Batch-hydrate multiple queries in a single Rust NAPI call, enabling
+   * Rayon parallelism across all pipelines. Falls back to sequential
+   * {@link addQuery} when Rust hydration is unavailable or for queries
+   * with scalar subquery companions.
+   *
+   * @param queries The queries to hydrate.
+   * @param timer   Shared timer for the batch.
+   * @return The rows from the initial hydration of all queries.
+   */
+  *addQueries(
+    queries: ReadonlyArray<{
+      readonly transformationHash: string;
+      readonly queryID: string;
+      readonly ast: AST;
+    }>,
+    timer: Timer,
+  ): Iterable<RowChange | 'yield'> {
+    if (queries.length === 0) {
+      return;
+    }
+
+    assert(
+      this.initialized(),
+      'Pipeline driver must be initialized before adding queries',
+    );
+    assert(
+      this.#advanceContext === null,
+      'Cannot hydrate while advance is in progress',
+    );
+
+    // Phase 1: Build all TS pipelines and collect Rust hydration requests.
+    type PreparedQuery = {
+      queryID: string;
+      transformationHash: string;
+      resolvedQuery: AST;
+      companionRows: {table: string; row: Row}[];
+      companionMeta: CompanionSubquery[];
+      companionInputs: Input[];
+      existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
+      existsCorrelations: Map<string, readonly string[]>;
+      input: Input;
+      debugDelegate: Debug | undefined;
+      rustEligible: boolean;
+    };
+
+    const prepared: PreparedQuery[] = [];
+    const rustPayloads: Array<{
+      query_id: string;
+      ast: AST;
+      primary_key: string[];
+      column_types?: Record<string, Record<string, string>>;
+      all_primary_keys?: Record<string, string[]>;
+    }> = [];
+
+    const costModel = this.#ensureCostModelExistsIfEnabled(
+      this.#snapshotter.current().db.db,
+    );
+
+    for (const q of queries) {
+      this.removeQuery(q.queryID);
+      const debugDelegate = runtimeDebugFlags.trackRowsVended
+        ? new Debug()
+        : undefined;
+
+      const {
+        ast: resolvedQuery,
+        companionRows,
+        companions: companionMeta,
+        companionInputs,
+      } = this.#resolveScalarSubqueries(q.ast);
+
+      const existsTypes = collectExistsTypes(resolvedQuery.where);
+      const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
+
+      const input = buildPipeline(
+        resolvedQuery,
+        {
+          debug: debugDelegate,
+          enableNotExists: true,
+          getSource: name => this.#getSource(name),
+          createStorage: () => this.#createStorage(),
+          decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
+            new MeasurePushOperator(
+              input,
+              q.queryID,
+              this.#inspectorDelegate,
+              'query-update-server',
+            ),
+          decorateInput: input => input,
+          addEdge() {},
+          decorateFilterInput: (input, name) => {
+            if (name.includes(':exists(')) {
+              const match = name.match(RUST_EXISTS_NAME_RE);
+              if (match) {
+                const relationshipName = match[1];
+                const parentField = existsCorrelations.get(relationshipName);
+                if (parentField) {
+                  return createRustExistsWrapper(
+                    input as FilterOperator,
+                    relationshipName,
+                    parentField as CompoundKey,
+                    existsTypes.get(relationshipName) ?? 'EXISTS',
+                  );
+                }
+              }
+            }
+            return input;
+          },
+        },
+        q.queryID,
+        costModel,
+      );
+      input.setOutput({
+        push: () => [],
+      });
+
+      const tableName = resolvedQuery.table ?? '';
+      const pk = this.#primaryKeys?.get(tableName) ?? [];
+      const rustEligible =
+        this.#manager !== null && companionMeta.length === 0;
+      if (rustEligible) {
+        rustPayloads.push({
+          query_id: q.queryID,
+          ast: resolvedQuery,
+          primary_key: [...pk],
+          column_types: this.#collectColumnTypes(resolvedQuery),
+          all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
+        });
+      }
+
+      prepared.push({
+        queryID: q.queryID,
+        transformationHash: q.transformationHash,
+        resolvedQuery,
+        companionRows,
+        companionMeta,
+        companionInputs,
+        existsTypes,
+        existsCorrelations,
+        input,
+        debugDelegate,
+        rustEligible,
+      });
+    }
+
+    // Phase 2: Add queries to persistent pipeline and batch hydrate.
+    let changesByQuery: Map<string, DecodedRowChange[]> | undefined;
+    if (rustPayloads.length > 0) {
+      assert(this.#manager, 'RustPipelineManager not available');
+      for (const payload of rustPayloads) {
+        this.#manager.addQuery(this.#instanceId, JSON.stringify(payload));
+      }
+      const resultBuf = this.#manager.hydrate(this.#instanceId);
       const decoded = decodeAdvanceResultBuf(resultBuf);
       if (decoded.error) {
         throw new Error(`Rust batch hydration failed: ${decoded.error}`);
@@ -1035,78 +1125,14 @@ export class PipelineDriver {
       try {
         if (p.rustEligible && changesByQuery) {
           const changes = changesByQuery.get(p.queryID) ?? [];
-          let hydratedRowCount = 0;
-          let lastHydratedRow: Row | undefined;
-
-          if (isDualExecEnabled()) {
-            // Dual-exec: run both Rust and TS, compare, yield TS (source of truth).
-            const permTables = collectPermissionTables(p.resolvedQuery);
-            const rustChanges = materializeChanges(
-              this.#convertDecodedChanges(
-                p.queryID,
-                changes,
-                permTables.size > 0 ? permTables : undefined,
-              ),
-            );
-            const tsChanges = materializeChanges(
-              hydrateInternal(
-                p.input,
-                p.queryID,
-                must(this.#primaryKeys),
-                this.#tableSpecs,
-              ),
-            );
-            const verified = dualExecCompare(
-              'hydrate-batch',
-              tsChanges,
-              rustChanges,
-              this.#lc,
-            );
-            for (const item of verified) {
-              if (item.type === ChangeType.ADD) {
-                hydratedRowCount++;
-                lastHydratedRow = item.row;
-              }
-              yield item;
-            }
-          } else {
-            const permTables = collectPermissionTables(p.resolvedQuery);
-            for (const item of this.#convertDecodedChanges(
-              p.queryID,
-              changes,
-              permTables.size > 0 ? permTables : undefined,
-            )) {
-              if (item !== 'yield' && item.type === ChangeType.ADD) {
-                hydratedRowCount++;
-                lastHydratedRow = item.row;
-              }
-              yield item;
-            }
-          }
-
-          if (p.takeStorage && p.resolvedQuery.limit !== undefined) {
-            initializeTakeState(
-              p.takeStorage,
-              hydratedRowCount,
-              lastHydratedRow,
-            );
-          }
-          // Warm up the TS pipeline to initialize child Take operators
-          // (e.g., in EXISTS/JOIN subqueries). Rust hydration bypasses
-          // input.fetch(), so child Takes have empty storage and silently
-          // drop all pushes. Running a fetch through the pipeline triggers
-          // each child Take's #initialFetch, populating their partition state.
-          // Skip this expensive SQLite re-query when there are no child Takes.
-          if (p.hasChildTakes) {
-            for (const node of p.input.fetch({})) {
-              if (node === 'yield') {
-                continue;
-              }
-              // Discard results — we only need the side effect of
-              // initializing Take state in child subquery pipelines.
-            }
-          }
+          const permTables = collectPermissionTables(p.resolvedQuery);
+          yield* this.#convertDecodedChanges(
+            p.queryID,
+            changes,
+            permTables.size > 0 ? permTables : undefined,
+          );
         } else {
+          // Companion queries can't go through Rust batch; hydrate via TS.
           yield* hydrateInternal(
             p.input,
             p.queryID,
@@ -1136,43 +1162,11 @@ export class PipelineDriver {
         for (let i = 0; i < p.companionMeta.length; i++) {
           const meta = p.companionMeta[i];
           const companionInput = p.companionInputs[i];
-          const companionSchema = companionInput.getSchema();
           const {childField, resolvedValue} = meta;
-          companionInput.setOutput({
-            push: (change: Change) => {
-              let newValue: LiteralValue | null | undefined;
-              switch (change[ChangeIndex.TYPE]) {
-                case ChangeType.ADD:
-                case ChangeType.EDIT:
-                  newValue =
-                    (change[ChangeIndex.NODE].row[
-                      childField
-                    ] as LiteralValue) ?? null;
-                  break;
-                case ChangeType.REMOVE:
-                  newValue = undefined;
-                  break;
-                case ChangeType.CHILD:
-                  return [];
-              }
-              if (!scalarValuesEqual(newValue, resolvedValue)) {
-                throw new ResetPipelinesSignal(
-                  `Scalar subquery value changed for ${meta.ast.table}: ` +
-                    `${String(resolvedValue)} -> ${String(newValue)}`,
-                  'scalar-subquery',
-                );
-              }
-              const streamer = this.#streamer;
-              assert(
-                streamer,
-                'must #startAccumulating() before pushing changes',
-              );
-              streamer.accumulate(p.queryID, companionSchema, [change]);
-              return [];
-            },
-          });
+          companionInput.setOutput({push: () => []});
           liveCompanions.push({
             input: companionInput,
+            ast: meta.ast,
             childField,
             resolvedValue,
           });
@@ -1186,26 +1180,13 @@ export class PipelineDriver {
           companions: liveCompanions,
         });
 
-        if (USE_RUST_ADVANCE) {
-          const config = this.#extractPipelineConfig(
-            p.queryID,
-            p.resolvedQuery,
-            liveCompanions,
-          );
-          if (config) {
-            this.#pipelineConfigs.set(p.queryID, config);
-            const permTables = collectPermissionTables(p.resolvedQuery);
-            if (permTables.size > 0) {
-              this.#permissionTablesByQuery.set(p.queryID, permTables);
-            } else {
-              this.#permissionTablesByQuery.delete(p.queryID);
-            }
-          } else {
-            this.#pipelineConfigs.delete(p.queryID);
-            this.#permissionTablesByQuery.delete(p.queryID);
-          }
-          this.#reevaluateRustAdvance();
+        const permTables = collectPermissionTables(p.resolvedQuery);
+        if (permTables.size > 0) {
+          this.#permissionTablesByQuery.set(p.queryID, permTables);
+        } else {
+          this.#permissionTablesByQuery.delete(p.queryID);
         }
+    
       } finally {
         this.#hydrateContext = null;
       }
@@ -1225,10 +1206,8 @@ export class PipelineDriver {
         companion.input.destroy();
       }
     }
-    if (this.#pipelineConfigs.delete(queryID)) {
-      this.#permissionTablesByQuery.delete(queryID);
-      this.#reevaluateRustAdvance();
-    }
+    this.#permissionTablesByQuery.delete(queryID);
+    this.#manager?.removeQuery(this.#instanceId, queryID);
   }
 
   /**
@@ -1265,264 +1244,56 @@ export class PipelineDriver {
       this.initialized(),
       'Pipeline driver must be initialized before advancing',
     );
-    if (this.#useRustAdvance && this.#pipelineConfigs.size > 0) {
-      console.error(
-        `[DBG_ADVANCE] useRustAdvance=true, configs=${this.#pipelineConfigs.size}, RustPipelineClass=${!!RustPipelineClass}, rustAdvanceFromAstBufFn=${!!rustAdvanceFromAstBufFn}`,
-      );
-      if (isDualExecEnabled()) {
-        // Dual-exec: run both Rust and TS, compare results
-        return this.#dualExecAdvance(timer);
-      }
-      try {
-        return this.#rustAdvance(timer);
-      } catch (e) {
-        console.error(`[DBG_ADVANCE] Rust advance failed:`, e);
-        if (e instanceof ResetPipelinesSignal) throw e;
-        this.#lc.warn?.(`Rust advance failed, falling back to TS: ${e}`);
-        this.#rustAdvanceFailures.add(1);
-        this.#useRustAdvance = false;
-      }
-    }
-    const diff = this.#snapshotter.advance(
-      this.#tableSpecs,
-      this.#allTableNames,
-    );
-    const {prev, curr, changes} = diff;
-    this.#lc.debug?.(
-      `advance ${prev.version} => ${curr.version}: ${changes} changes`,
-    );
-
-    return {
-      version: curr.version,
-      numChanges: changes,
-      changes: this.#advance(diff, timer, changes),
-    };
-  }
-
-  *#advance(
-    diff: SnapshotDiff,
-    timer: Timer,
-    numChanges: number,
-  ): Iterable<RowChange | 'yield'> {
     assert(
-      this.#hydrateContext === null,
-      'Cannot advance while hydration is in progress',
+      this.#manager,
+      'RustPipelineManager must be available — Rust is the sole advance path',
     );
-    const totalHydrationTimeMs = this.totalHydrationTimeMs();
-    this.#advanceContext = {
-      timer,
-      totalHydrationTimeMs,
-      numChanges,
-      pos: 0,
-    };
-    this.#lc.info?.(
-      `starting pipeline advancement of ${numChanges} changes with an ` +
-        `advancement time limited based on total hydration time of ` +
-        `${totalHydrationTimeMs} ms.`,
+    return this.#rustAdvance(timer);
+  }
+
+  /**
+   * Async version of advance() — offloads IVM fan-out to a libuv worker thread
+   * so multiple client groups can advance in parallel across cores.
+   * Sync diff computation still happens on the JS thread.
+   */
+  async advanceAsync(
+    timer: Timer,
+    _vsId?: string | undefined,
+  ): Promise<{
+    version: string;
+    numChanges: number;
+    changes: Iterable<RowChange | 'yield'>;
+  }> {
+    assert(
+      this.initialized(),
+      'Pipeline driver must be initialized before advancing',
     );
-    try {
-      for (const {table, prevValues, nextValue} of diff) {
-        // Advance progress is checked each time a row is fetched
-        // from a TableSource during push processing, but some pushes
-        // don't read any rows.  Check progress here before processing
-        // the next change.
-        if (this.#shouldAdvanceYieldMaybeAbortAdvance()) {
-          yield 'yield';
-        }
-        const start = timer.totalElapsed();
-
-        try {
-          const tableSource = this.#tables.get(table);
-          if (!tableSource) {
-            // no pipelines read from this table, so no need to process the change
-            continue;
-          }
-          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
-          let editOldRow: Row | undefined = undefined;
-          for (const prevValue of prevValues) {
-            if (
-              nextValue &&
-              deepEqual(
-                getRowKey(primaryKey, prevValue as Row) as JSONValue,
-                getRowKey(primaryKey, nextValue as Row) as JSONValue,
-              )
-            ) {
-              editOldRow = prevValue;
-            } else {
-              if (nextValue) {
-                this.#conflictRowsDeleted.add(1);
-              }
-              yield* this.#push(
-                tableSource,
-                makeSourceChangeRemove(prevValue as Row),
-              );
-            }
-          }
-          if (nextValue) {
-            if (editOldRow) {
-              yield* this.#push(
-                tableSource,
-                makeSourceChangeEdit(nextValue as Row, editOldRow),
-              );
-            } else {
-              yield* this.#push(
-                tableSource,
-                makeSourceChangeAdd(nextValue as Row),
-              );
-            }
-          }
-        } finally {
-          this.#advanceContext.pos++;
-        }
-
-        const elapsed = timer.totalElapsed() - start;
-        this.#advanceTime.record(elapsed / 1000, {
-          table,
-        });
-      }
-
-      // Set the new snapshot on all TableSources.
-      const {curr} = diff;
-      for (const table of this.#tables.values()) {
-        table.setDB(curr.db.db);
-      }
-      this.#ensureCostModelExistsIfEnabled(curr.db.db);
-      this.#lc.debug?.(`Advanced to ${curr.version}`);
-    } finally {
-      this.#advanceContext = null;
-    }
+    assert(
+      this.#manager,
+      'RustPipelineManager must be available — Rust is the sole advance path',
+    );
+    return this.#rustAdvanceAsync(timer);
   }
 
-  #extractPipelineConfig(
-    queryID: string,
-    ast: AST,
-    _companions: readonly CompanionPipeline[],
-  ): RustPipelineConfig | null {
-    if (ast.where && this.#conditionHasCorrelatedSubquery(ast.where)) {
-      return null;
-    }
 
-    const operators: RustOperator[] = [];
-    const existsTypes = collectExistsTypes(ast.where);
 
-    if (ast.where) {
-      operators.push({type: 'filter', predicate: ast.where});
-    }
 
-    if (ast.related) {
-      for (const rel of ast.related) {
-        if ((rel.system as string) === 'exists') {
-          operators.push({
-            type: 'exists',
-            relationship: rel.subquery.table ?? '',
-            parent_field: [...rel.correlation.parentField],
-            not_exists:
-              existsTypes.get(
-                rel.subquery.alias ?? rel.subquery.table ?? '',
-              ) === 'NOT EXISTS',
-          });
-        } else {
-          operators.push({
-            type: 'join',
-            relationship: rel.subquery.table ?? '',
-            parent_field: [...rel.correlation.parentField],
-            child_field: [...rel.correlation.childField],
-            child_ast: rel.subquery as unknown,
-          });
-        }
-      }
-    }
 
-    if (ast.limit !== undefined) {
-      operators.push({
-        type: 'take',
-        sort: (ast.orderBy ?? []).map(([col, dir]) => [col, dir]),
-        limit: ast.limit,
-      });
-    }
-
-    const sourceTables = [ast.table ?? ''];
-    const tableName = ast.table ?? '';
-    const pk = this.#primaryKeys?.get(tableName) ?? [];
-    return {
-      query_id: queryID,
-      source_tables: sourceTables,
-      operators,
-      primary_key: [...pk],
-      related:
-        ast.related?.map(r => ({
-          relationship: r.subquery.table ?? '',
-          parent_field: [...r.correlation.parentField],
-          child_field: [...r.correlation.childField],
-          child_ast: r.subquery as unknown,
-        })) ?? [],
-      limit: ast.limit ?? null,
-      order_by: ast.orderBy?.map(
-        ([col, dir]) => [col, dir] as [string, string],
-      ),
-    };
-  }
-
-  #conditionHasCorrelatedSubquery(cond: Condition): boolean {
-    if (cond.type === 'correlatedSubquery') return true;
-    if (cond.type === 'and' || cond.type === 'or') {
-      return cond.conditions.some(c => this.#conditionHasCorrelatedSubquery(c));
-    }
-    return false;
-  }
-
-  #reevaluateRustAdvance() {
-    this.#rustPipelineDirty = true;
-    this.#useRustAdvance =
-      USE_RUST_ADVANCE &&
-      this.#pipelines.size > 0 &&
-      this.#pipelineConfigs.size === this.#pipelines.size &&
-      // When dual-exec is enabled or the full AST-based advance is available,
-      // allow ALL operator types. Otherwise restrict to filter-only fan-out.
-      (isDualExecEnabled() ||
-        rustAdvanceFromAstBufFn !== undefined ||
-        [...this.#pipelineConfigs.values()].every(c =>
-          c.operators.every(op => op.type === 'filter'),
-        )) &&
-      // Rust advance cannot monitor companion pipelines (scalar subquery
-      // change detection requires pushing through TS IVM).
-      [...this.#pipelines.values()].every(p => p.companions.length === 0) &&
-      // Rust fan-out is stateless per-change and cannot correctly handle
-      // unique key conflicts that span multiple diff entries.
-      [...this.#tableSpecs.values()].every(
-        s => s.tableSpec.uniqueKeys.length <= 1,
-      );
-  }
-
+  /**
+   * Convert decoded Rust advance changes to typed RowChange objects.
+   * Permission filtering and minRowVersion bump are handled by Rust.
+   */
   *#convertDispatchChanges(
     changes: DecodedRowChange[],
-    permissionTables?: Set<string> | undefined,
   ): Iterable<RowChange | 'yield'> {
     for (const change of changes) {
-      // Skip rows from permission-system tables (matching Streamer behavior).
-      if (permissionTables?.has(change.table)) {
-        continue;
-      }
       const type =
         change.type === 'add'
           ? ChangeType.ADD
           : change.type === 'edit'
             ? ChangeType.EDIT
             : ChangeType.REMOVE;
-      let row = change.row ?? (change.row_key as Row);
-      // Apply minRowVersion bump, matching Streamer.#streamNodes behavior.
-      if (type !== ChangeType.REMOVE && row) {
-        const spec = this.#tableSpecs.get(change.table)?.tableSpec;
-        if (spec) {
-          const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
-          if (
-            typeof rowVersion === 'string' &&
-            rowVersion < (spec.minRowVersion ?? '00')
-          ) {
-            row = {...row, [ZERO_VERSION_COLUMN_NAME]: spec.minRowVersion};
-          }
-        }
-      }
+      const row = change.row ?? (change.row_key as Row);
       yield {
         type,
         queryID: change.queryID,
@@ -1533,12 +1304,84 @@ export class PipelineDriver {
     }
   }
 
+  async #rustAdvanceAsync(timer: Timer): Promise<{
+    version: string;
+    numChanges: number;
+    changes: Iterable<RowChange | 'yield'>;
+  }> {
+    assert(this.#manager, 'RustPipelineManager must be available for advance');
+
+    const diff = this.#snapshotter.advance(
+      this.#tableSpecs,
+      this.#allTableNames,
+    );
+    const {prev, curr, changes: numChanges} = diff;
+
+    this.#lc.debug?.(
+      `rust_advance_async ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelines.size} pipelines`,
+    );
+
+    const collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }> = [];
+    for (const change of diff) {
+      collectedChanges.push(change);
+    }
+
+    this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
+
+    const permTables = this.#combinedPermissionTables();
+    if (permTables && permTables.size > 0) {
+      this.#manager.setPermissionTables(
+        this.#instanceId,
+        JSON.stringify([...permTables]),
+      );
+    }
+
+    const changesJson = JSON.stringify(collectedChanges);
+    // Async: offload IVM fan-out to libuv worker thread
+    const resultBuf = await this.#manager.advanceAsync(this.#instanceId, changesJson);
+    const decoded = decodeAdvanceResultBuf(resultBuf);
+    if (decoded.error) {
+      throw new Error(`Rust pipeline advance failed: ${decoded.error}`);
+    }
+
+    if (decoded.reset_signal) {
+      throw new ResetPipelinesSignal(decoded.reset_signal, 'scalar-subquery');
+    }
+
+    const changes = materializeChanges(
+      this.#convertDispatchChanges(decoded.changes),
+    );
+
+    for (const table of this.#tables.values()) {
+      table.setDB(curr.db.db);
+    }
+    this.#ensureCostModelExistsIfEnabled(curr.db.db);
+
+    this.#lc.debug?.(`Rust advance (async) advanced to ${curr.version}`);
+
+    return {
+      version: curr.version,
+      numChanges,
+      changes: this.#wrapWithTimeout(changes, timer, numChanges),
+    };
+  }
+
   #rustAdvance(timer: Timer): {
     version: string;
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
   } {
-    // Use TS diff (correct two-snapshot isolation) then Rust for fan-out
+    assert(this.#manager, 'RustPipelineManager must be available for advance');
+
+    // Use TS diff (correct two-snapshot isolation via BEGIN CONCURRENT)
+    // then Rust for operator tree fan-out.  Rust cannot open its own
+    // connections because both snapshots live on the same WAL2 file and
+    // only the TS connections hold the frozen read marks.
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
@@ -1560,48 +1403,42 @@ export class PipelineDriver {
       collectedChanges.push(change);
     }
 
-    let changes: Iterable<RowChange | 'yield'>;
+    // Swap manager's snapshot to the new DB path
+    this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
 
-    if (RustPipelineClass) {
-      // Persistent pipeline path: build once, reuse across advances
-      if (this.#rustPipelineDirty || !this.#rustPipeline) {
-        // Build with the OLD snapshot so warmup fetch populates Take state
-        // from pre-change data. Then swap to the NEW snapshot so re-fetches
-        // during push see the updated rows.
-        this.#rustPipeline = this.#buildRustPipeline(prev.db.db.name);
-        this.#rustPipeline.swapSnapshot(curr.db.db.name);
-        this.#rustPipelineDirty = false;
-      } else {
-        // Swap to new snapshot DB without rebuilding operator trees
-        this.#rustPipeline.swapSnapshot(curr.db.db.name);
-      }
-      const changesJson = JSON.stringify(collectedChanges);
-      const resultBuf = this.#rustPipeline.advance(changesJson);
-      const decoded = decodeAdvanceResultBuf(resultBuf);
-      if (decoded.error) {
-        throw new Error(
-          `Rust persistent pipeline advance failed: ${decoded.error}`,
-        );
-      }
-      changes = materializeChanges(
-        this.#convertDispatchChanges(
-          decoded.changes,
-          this.#combinedPermissionTables(),
-        ),
+    // Update permission tables on Rust side before advance
+    const permTables = this.#combinedPermissionTables();
+    if (permTables && permTables.size > 0) {
+      this.#manager.setPermissionTables(
+        this.#instanceId,
+        JSON.stringify([...permTables]),
       );
-    } else if (rustAdvanceFromAstBufFn) {
-      // Full AST-based advance: supports all operator types
-      const rustChanges = this.#runRustAdvanceFromAst(
-        curr.db.db.name,
-        collectedChanges,
-      );
-      changes = rustChanges;
     }
+
+    // Push changes through Rust operator trees
+    // Rust handles: IVM fan-out, permission filtering, minRowVersion bump,
+    // companion scalar checks, and companion row change emission.
+    const changesJson = JSON.stringify(collectedChanges);
+    const resultBuf = this.#manager.advance(this.#instanceId, changesJson);
+    const decoded = decodeAdvanceResultBuf(resultBuf);
+    if (decoded.error) {
+      throw new Error(`Rust pipeline advance failed: ${decoded.error}`);
+    }
+
+    // Handle companion scalar value change — Rust detected the change
+    if (decoded.reset_signal) {
+      throw new ResetPipelinesSignal(decoded.reset_signal, 'scalar-subquery');
+    }
+
+    const changes = materializeChanges(
+      this.#convertDispatchChanges(decoded.changes),
+    );
 
     for (const table of this.#tables.values()) {
       table.setDB(curr.db.db);
     }
     this.#ensureCostModelExistsIfEnabled(curr.db.db);
+
     this.#lc.debug?.(`Rust advance advanced to ${curr.version}`);
 
     return {
@@ -1611,45 +1448,22 @@ export class PipelineDriver {
     };
   }
 
-  *#dualExecHydrate(
-    queryID: string,
-    resolvedQuery: AST,
-    input: Input,
-  ): Iterable<RowChange> {
-    // Run both Rust and TS hydration paths and compare results.
-    const rustChanges = materializeChanges(
-      this.#rustHydrate(queryID, resolvedQuery),
-    );
-    const tsChanges = materializeChanges(
-      hydrateInternal(
-        input,
-        queryID,
-        must(this.#primaryKeys),
-        this.#tableSpecs,
-      ),
-    );
-    const result = dualExecCompare('hydrate', tsChanges, rustChanges, this.#lc);
-    yield* result;
-  }
-
-  *#rustHydrate(
+  *#rustHydrateQuery(
     queryID: string,
     resolvedQuery: AST,
   ): Iterable<RowChange | 'yield'> {
-    assert(rustHydrateFn, 'Rust hydrate not available');
-    const db = this.#snapshotter.current().db;
+    assert(this.#manager, 'RustPipelineManager not available');
     const tableName = resolvedQuery.table ?? '';
     const pk = this.#primaryKeys?.get(tableName) ?? [];
-    const queriesJson = JSON.stringify([
-      {
-        query_id: queryID,
-        ast: resolvedQuery,
-        primary_key: [...pk],
-        column_types: this.#collectColumnTypes(resolvedQuery),
-        all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
-      },
-    ]);
-    const resultBuf = rustHydrateFn(db.db.name, queriesJson);
+    const queryJson = JSON.stringify({
+      query_id: queryID,
+      ast: resolvedQuery,
+      primary_key: [...pk],
+      column_types: this.#collectColumnTypes(resolvedQuery),
+      all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
+    });
+    this.#manager.addQuery(this.#instanceId, queryJson);
+    const resultBuf = this.#manager.hydrateQuery(this.#instanceId, queryID);
     const decoded = decodeAdvanceResultBuf(resultBuf);
     if (decoded.error) {
       throw new Error(`Rust hydration failed: ${decoded.error}`);
@@ -1859,189 +1673,6 @@ export class PipelineDriver {
     return combined.size > 0 ? combined : undefined;
   }
 
-  /**
-   * Dual-execution advance: runs both TS and Rust fan-out on the SAME diff,
-   * then compares results. TS is the source of truth.
-   *
-   * Uses one snapshotter.advance() call. The diff is materialized once and
-   * fed to both Rust and TS (via #advance with a
-   * synthetic iterable). The TS #advance path handles db state updates.
-   */
-  #dualExecAdvance(timer: Timer): {
-    version: string;
-    numChanges: number;
-    changes: Iterable<RowChange | 'yield'>;
-  } {
-    // 1. Get diff once, materialize changes
-    const diff = this.#snapshotter.advance(
-      this.#tableSpecs,
-      this.#allTableNames,
-    );
-    const {prev, curr, changes: numChanges} = diff;
-
-    const collectedChanges: Array<{
-      table: string;
-      prevValues: ReadonlyArray<Readonly<Row>>;
-      nextValue: Readonly<Row> | null;
-      rowKey: unknown;
-    }> = [];
-    for (const change of diff) {
-      collectedChanges.push(change);
-    }
-
-    this.#lc.debug?.(
-      `dual-exec: ${this.#pipelineConfigs.size} pipelines (full tree)`,
-    );
-
-    // 2. Run Rust advance on collected changes
-    let rustChanges: RowChange[] = [];
-    try {
-      if (rustAdvanceFromAstBufFn) {
-        rustChanges = this.#runRustAdvanceFromAst(
-          curr.db.db.name,
-          collectedChanges,
-        );
-      }
-    } catch (e) {
-      this.#lc.warn?.(`[dual-exec] Rust advance exception: ${e}`);
-    }
-
-    // 3. Run TS path on the same collected changes via synthetic diff
-    const syntheticDiff = Object.assign(collectedChanges[Symbol.iterator](), {
-      prev,
-      curr,
-      changes: numChanges,
-    }) as unknown as SnapshotDiff;
-
-    return {
-      version: curr.version,
-      numChanges,
-      changes: this.#dualExecYieldAndCompare(
-        this.#advance(syntheticDiff, timer, numChanges),
-        rustChanges,
-      ),
-    };
-  }
-
-  *#dualExecYieldAndCompare(
-    tsGen: Iterable<RowChange | 'yield'>,
-    rustChanges: RowChange[],
-  ): Iterable<RowChange | 'yield'> {
-    const tsChanges: RowChange[] = [];
-    for (const item of tsGen) {
-      if (item !== 'yield') {
-        tsChanges.push(item);
-      }
-      yield item;
-    }
-    // Compare after all TS changes have been yielded.
-    // TS is always the source of truth; this validates Rust correctness.
-    dualExecCompare('advance', tsChanges, rustChanges, this.#lc);
-  }
-
-  /**
-   * Run the full Rust advance path using AST-based operator chain.
-   * Builds HydrateQuery payloads from stored pipeline ASTs and sends
-   * them with the collected changes to rust_advance_from_ast_buf.
-   */
-  #runRustAdvanceFromAst(
-    dbPath: string,
-    collectedChanges: Array<{
-      table: string;
-      prevValues: ReadonlyArray<Readonly<Row>>;
-      nextValue: Readonly<Row> | null;
-      rowKey: unknown;
-    }>,
-  ): RowChange[] {
-    assert(rustAdvanceFromAstBufFn, 'Rust advance from AST not available');
-
-    const queries: Array<{
-      query_id: string;
-      ast: AST;
-      primary_key: string[];
-      column_types: Record<string, Record<string, string>>;
-      all_primary_keys: Record<string, string[]>;
-    }> = [];
-
-    for (const [queryID, pipeline] of this.#pipelines) {
-      const ast = pipeline.transformedAst;
-      const tableName = ast.table ?? '';
-      const pk = this.#primaryKeys?.get(tableName) ?? [];
-      queries.push({
-        query_id: queryID,
-        ast,
-        primary_key: [...pk],
-        column_types: this.#collectColumnTypes(ast),
-        all_primary_keys: this.#collectAllPrimaryKeys(ast),
-      });
-    }
-
-    if (queries.length === 0) {
-      return [];
-    }
-
-    const changesJson = JSON.stringify(collectedChanges);
-    const queriesJson = JSON.stringify(queries);
-    const resultBuf = rustAdvanceFromAstBufFn(dbPath, changesJson, queriesJson);
-    const decoded = decodeAdvanceResultBuf(resultBuf);
-
-    if (decoded.timings) {
-      const t = decoded.timings;
-      console.error(
-        `[rust-advance-profile] total=${t.totalUs}us pipelines=${t.pipelineCount}`,
-      );
-      for (const p of t.perPipeline) {
-        console.error(
-          `  [pipeline ${p.queryID}] total=${p.totalUs}us build=${p.buildUs}us warmup=${p.warmupUs}us rewind=${p.rewindUs}us push=${p.pushUs}us dedup=${p.dedupFilterUs}us`,
-        );
-      }
-    }
-
-    if (decoded.error) {
-      this.#lc.warn?.(
-        `[dual-exec] Rust advance-from-ast error: ${decoded.error}`,
-      );
-      return [];
-    }
-
-    return materializeChanges(
-      this.#convertDispatchChanges(
-        decoded.changes,
-        this.#combinedPermissionTables(),
-      ),
-    );
-  }
-
-  #buildRustPipeline(
-    dbPath: string,
-  ): InstanceType<NonNullable<typeof RustPipelineClass>> {
-    assert(RustPipelineClass, 'RustPipeline class not available');
-
-    const queries: Array<{
-      query_id: string;
-      ast: AST;
-      primary_key: string[];
-      column_types: Record<string, Record<string, string>>;
-      all_primary_keys: Record<string, string[]>;
-    }> = [];
-
-    for (const [queryID, pipeline] of this.#pipelines) {
-      const ast = pipeline.transformedAst;
-      const tableName = ast.table ?? '';
-      const pk = this.#primaryKeys?.get(tableName) ?? [];
-      queries.push({
-        query_id: queryID,
-        ast,
-        primary_key: [...pk],
-        column_types: this.#collectColumnTypes(ast),
-        all_primary_keys: this.#collectAllPrimaryKeys(ast),
-      });
-    }
-
-    const queriesJson = JSON.stringify(queries);
-    return new RustPipelineClass(dbPath, queriesJson);
-  }
-
   /** Implements `BuilderDelegate.getSource()` */
   #getSource(tableName: string): Source {
     let source = this.#tables.get(tableName);
@@ -2146,44 +1777,7 @@ export class PipelineDriver {
 
   /** Implements `BuilderDelegate.createStorage()` */
   #createStorage(): Storage {
-    if (this.#rustStorage) {
-      return new RustTakeStorage(this.#rustStorage, ++this.#rustOpID);
-    }
-    return this.#storage.createStorage();
-  }
-
-  *#push(
-    source: TableSource,
-    change: SourceChange,
-  ): Iterable<RowChange | 'yield'> {
-    this.#startAccumulating();
-    try {
-      for (const val of source.genPush(change)) {
-        if (val === 'yield') {
-          yield 'yield';
-        }
-        for (const changeOrYield of this.#stopAccumulating().stream()) {
-          yield changeOrYield;
-        }
-        this.#startAccumulating();
-      }
-    } finally {
-      if (this.#streamer !== null) {
-        this.#stopAccumulating();
-      }
-    }
-  }
-
-  #startAccumulating() {
-    assert(this.#streamer === null, 'Streamer already started');
-    this.#streamer = new Streamer(must(this.#primaryKeys), this.#tableSpecs);
-  }
-
-  #stopAccumulating(): Streamer {
-    const streamer = this.#streamer;
-    assert(streamer, 'Streamer not started');
-    this.#streamer = null;
-    return streamer;
+    return new RustTakeStorage(this.#rustStorage, ++this.#rustOpID);
   }
 }
 
@@ -2365,34 +1959,7 @@ export function* hydrateInternal(
   yield* streamer.stream();
 }
 
-/**
- * Initializes Take operator storage after Rust hydration.
- *
- * Rust hydration bypasses the TS operator pipeline (specifically input.fetch()),
- * which means Take's #initialFetch never runs and its storage stays empty.
- * When Take.push() sees empty storage, it silently drops all changes — making
- * the query non-reactive after initial hydration.
- *
- * This function writes the same state that Take.#initialFetch would have written:
- * - TakeState {size, bound} under the take state key
- * - MAX_BOUND_KEY with the bound row (for partitioned takes / nested fetches)
- *
- * For non-partitioned queries (the common case with Rust hydration),
- * the take state key is simply '["take"]'.
- */
-function initializeTakeState(
-  storage: Storage,
-  size: number,
-  bound: Row | undefined,
-): void {
-  // The take state key for non-partitioned queries.
-  // See getTakeStateKey() in take.ts — with no partition key, it's JSON.stringify(['take']).
-  const takeStateKey = JSON.stringify(['take']);
-  storage.set(takeStateKey, {size, bound} as unknown as JSONValue);
-  if (bound !== undefined) {
-    storage.set('maxBound', bound as unknown as JSONValue);
-  }
-}
+
 
 function buildPrimaryKeys(
   clientSchema: ClientSchema,
@@ -2419,19 +1986,6 @@ function mustGetPrimaryKey(
       `Check the spelling and ensure that the table has a primary key.`,
   );
   return rv;
-}
-
-/**
- * Compares two scalar subquery resolved values for equality.
- * Unlike `valuesEqual` in data.ts (which treats null != null for join
- * semantics), this uses identity semantics: undefined === undefined
- * (no row matched), null === null (row matched but field was NULL).
- */
-function scalarValuesEqual(
-  a: LiteralValue | null | undefined,
-  b: LiteralValue | null | undefined,
-): boolean {
-  return a === b;
 }
 
 /**
@@ -2495,5 +2049,23 @@ function collectAllTablesFromCondition(
     }
   } else if (cond.type === 'correlatedSubquery') {
     collectAllTables(cond.related.subquery, out);
+  }
+}
+
+function collectLiteralConditions(
+  cond: Condition | undefined,
+  out: Array<{column: string; value: LiteralValue}>,
+): void {
+  if (!cond) {
+    return;
+  }
+  if (cond.type === 'simple') {
+    if (cond.left.type === 'column' && cond.right.type === 'literal') {
+      out.push({column: cond.left.name, value: cond.right.value});
+    }
+  } else if (cond.type === 'and') {
+    for (const sub of cond.conditions) {
+      collectLiteralConditions(sub, out);
+    }
   }
 }

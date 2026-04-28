@@ -11,11 +11,11 @@
 
 ## Implementation Strategy
 
-| Option | Description | Selected |
-|--------|-------------|----------|
-| Rust bulk INSERT method | New Rust method: accepts flat values buffer + schema, does all batch INSERTs internally (one napi crossing per flush). Contradicts D-13 spirit but maximizes perf. | |
-| Skip Phase 6 entirely | Phase 1 already provides Rust Statement.run(). The per-batch napi overhead is small relative to PG COPY network time. | |
-| Benchmark first, then decide | Add initial-sync to the benchmark suite. If napi crossing overhead is <5% of total sync time, skip. If significant, implement Rust bulk insert. | ✓ |
+| Option                       | Description                                                                                                                                                        | Selected |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- |
+| Rust bulk INSERT method      | New Rust method: accepts flat values buffer + schema, does all batch INSERTs internally (one napi crossing per flush). Contradicts D-13 spirit but maximizes perf. |          |
+| Skip Phase 6 entirely        | Phase 1 already provides Rust Statement.run(). The per-batch napi overhead is small relative to PG COPY network time.                                              |          |
+| Benchmark first, then decide | Add initial-sync to the benchmark suite. If napi crossing overhead is <5% of total sync time, skip. If significant, implement Rust bulk insert.                    | ✓        |
 
 **User's choice:** Benchmark first with clear decision thresholds: <5% skip, 5-15% flush-only Rust, >15% full Rust bulk INSERT. TransactionPool stays TS regardless.
 

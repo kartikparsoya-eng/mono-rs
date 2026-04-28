@@ -314,6 +314,19 @@ impl Operator for TakeOperator {
                 }
                 return result;
             }
+        } else if let Some(c) = &req.constraint {
+            // No explicit partition_key, but a constraint is present (e.g. child
+            // Take inside a Join — each parent passes a different constraint).
+            // Derive a per-constraint state key so each parent gets its own
+            // take state instead of sharing a single global bound.
+            let mut vals: Vec<serde_json::Value> = vec![serde_json::Value::String("take".to_string())];
+            let mut keys: Vec<&String> = c.columns.keys().collect();
+            keys.sort();
+            for k in keys {
+                vals.push(serde_json::Value::String(k.clone()));
+                vals.push(c.columns[k].clone());
+            }
+            serde_json::to_string(&vals).unwrap_or_default()
         } else {
             self.take_state_key(&Row::new())
         };
