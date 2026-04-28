@@ -62,7 +62,7 @@ impl ExistsOperator {
         serde_json::to_string(&vals).unwrap_or_default()
     }
 
-    fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
+    fn fetch_children(&mut self, parent_row: &Row) -> Vec<Node> {
         let constraint = if !self.parent_key.is_empty() && !self.child_key.is_empty() {
             Some(crate::types::Constraint::from_pairs(
                 self.parent_key.iter().zip(self.child_key.iter()).map(|(pk, ck)| {
@@ -79,10 +79,14 @@ impl ExistsOperator {
         });
         // For compound keys, post-filter on all key columns (not just the first).
         if self.parent_key.len() > 1 {
-            children.iter().filter(|cn| self.is_join_match(parent_row, &cn.row)).count()
+            children.into_iter().filter(|cn| self.is_join_match(parent_row, &cn.row)).collect()
         } else {
-            children.len()
+            children
         }
+    }
+
+    fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
+        self.fetch_children(parent_row).len()
     }
 
     /// Check if a child row matches a parent row on all key columns.
@@ -131,17 +135,29 @@ impl Operator for ExistsOperator {
         let parent_nodes = self.input.fetch(req);
         let mut result = Vec::new();
 
-        for node in parent_nodes {
+        for mut node in parent_nodes {
             if self.or_condition_matches(&node.row) {
                 let pk = self.parent_key_str(&node.row);
-                self.parent_sizes.insert(pk, 1);
+                // Still fetch children to populate the relationship
+                // (TS Join always populates relationships regardless of filter)
+                let children = self.fetch_children(&node.row);
+                self.parent_sizes.insert(pk, children.len().max(1));
+                node.relationships.insert(
+                    self.relationship_name.clone(),
+                    children,
+                );
                 result.push(node);
                 continue;
             }
-            let count = self.fetch_child_count(&node.row);
+            let children = self.fetch_children(&node.row);
+            let count = children.len();
             let pk = self.parent_key_str(&node.row);
             self.parent_sizes.insert(pk, count);
             if self.passes_filter(count) {
+                node.relationships.insert(
+                    self.relationship_name.clone(),
+                    children,
+                );
                 result.push(node);
             }
         }

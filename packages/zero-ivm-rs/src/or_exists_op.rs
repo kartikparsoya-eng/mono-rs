@@ -24,7 +24,7 @@ impl Branch {
         serde_json::to_string(&vals).unwrap_or_default()
     }
 
-    fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
+    fn fetch_children(&mut self, parent_row: &Row) -> Vec<Node> {
         let constraint = if !self.parent_key.is_empty() && !self.child_key.is_empty() {
             Some(Constraint::from_pairs(
                 self.parent_key
@@ -50,12 +50,16 @@ impl Branch {
         });
         if self.parent_key.len() > 1 {
             children
-                .iter()
+                .into_iter()
                 .filter(|cn| self.is_join_match(parent_row, &cn.row))
-                .count()
+                .collect()
         } else {
-            children.len()
+            children
         }
+    }
+
+    fn fetch_child_count(&mut self, parent_row: &Row) -> usize {
+        self.fetch_children(parent_row).len()
     }
 
     fn is_join_match(&self, parent_row: &Row, child_row: &Row) -> bool {
@@ -177,26 +181,41 @@ impl Operator for OrExistsOperator {
         let parent_nodes = self.input.fetch(req);
         parent_nodes
             .into_iter()
-            .filter(|node| {
+            .filter_map(|mut node| {
                 if self.or_condition_matches(&node.row) {
-                    // Cache count=1 for all branches so push knows this row was included
+                    // Cache count=1 for all branches and populate relationships
                     for branch in &mut self.branches {
                         let pk = branch.parent_key_str(&node.row);
-                        branch.parent_sizes.insert(pk, 1);
+                        let children = branch.fetch_children(&node.row);
+                        branch.parent_sizes.insert(pk, children.len().max(1));
+                        node.relationships.insert(
+                            branch.relationship_name.clone(),
+                            children,
+                        );
                     }
-                    return true;
+                    return Some(node);
                 }
-                // Check each branch, caching counts
+                // Check each branch, caching counts and collecting children
                 let mut any_pass = false;
+                let mut branch_children: Vec<(String, Vec<Node>)> = Vec::new();
                 for branch in &mut self.branches {
-                    let count = branch.fetch_child_count(&node.row);
+                    let children = branch.fetch_children(&node.row);
+                    let count = children.len();
                     let pk = branch.parent_key_str(&node.row);
                     branch.parent_sizes.insert(pk, count);
                     if branch.passes_filter(count) {
                         any_pass = true;
                     }
+                    branch_children.push((branch.relationship_name.clone(), children));
                 }
-                any_pass
+                if any_pass {
+                    for (rel_name, children) in branch_children {
+                        node.relationships.insert(rel_name, children);
+                    }
+                    Some(node)
+                } else {
+                    None
+                }
             })
             .collect()
     }

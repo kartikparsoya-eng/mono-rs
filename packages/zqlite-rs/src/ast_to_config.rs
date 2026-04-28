@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use zero_ivm_rs::pipeline::{ExistsBranch, OperatorConfig};
 
+/// Match TS `EXISTS_LIMIT` from packages/zql/src/builder/builder.ts.
+/// Limits the number of child rows fetched per parent in EXISTS subqueries.
+const EXISTS_LIMIT: usize = 3;
+const PERMISSIONS_EXISTS_LIMIT: usize = 1;
+
 // --- AST serde types (mirrors zero-protocol/src/ast.ts) ---
 
 #[derive(Debug, Deserialize)]
@@ -26,7 +31,7 @@ pub struct HydrateQuery {
     pub all_primary_keys: Option<HashMap<String, Vec<String>>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Ast {
     pub table: String,
     #[serde(default)]
@@ -43,13 +48,13 @@ pub struct Ast {
     pub start: Option<StartBound>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StartBound {
     pub row: serde_json::Value,
     pub exclusive: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CorrelatedSubquery {
     pub correlation: Correlation,
     pub subquery: Box<Ast>,
@@ -59,7 +64,7 @@ pub struct CorrelatedSubquery {
     pub system: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Correlation {
     #[serde(rename = "parentField")]
     pub parent_field: Vec<String>,
@@ -67,7 +72,7 @@ pub struct Correlation {
     pub child_field: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Condition {
     #[serde(rename = "simple")]
@@ -95,7 +100,7 @@ pub enum Condition {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ConditionValue {
     #[serde(rename = "literal")]
@@ -166,7 +171,21 @@ impl SchemaCache {
         Ok(self.columns.get(table_name).unwrap().clone())
     }
 
+    /// Pre-seed primary key info from the Zero schema (TS `#primaryKeys`).
+    /// This avoids relying on SQLite PRAGMA table_info, which may not have
+    /// PRIMARY KEY constraints on replica tables.
+    pub fn seed_primary_keys(&mut self, pks: &HashMap<String, Vec<String>>) {
+        for (table, pk) in pks {
+            self.primary_keys.insert(table.clone(), pk.clone());
+        }
+    }
+
     pub fn get_primary_key(&mut self, table_name: &str) -> Result<Vec<String>, String> {
+        // If already seeded (from all_primary_keys), return directly
+        if let Some(pk) = self.primary_keys.get(table_name) {
+            return Ok(pk.clone());
+        }
+        // Fall back to SQLite PRAGMA
         self.ensure_table_info(table_name)?;
         Ok(self.primary_keys.get(table_name).unwrap().clone())
     }
@@ -205,7 +224,7 @@ pub fn ast_to_operator_configs(
     });
 
     // 2. Where conditions -> Filter + Exists
-    if let Some(cond) = &ast.where_cond {
+    if let Some(cond) = ast.where_cond.as_deref() {
         append_condition_configs(schema, &mut configs, cond, primary_key)?;
     }
 
@@ -349,14 +368,19 @@ fn append_condition_configs(
                 }
             }
         }
-        Condition::CorrelatedSubquery { related, op, .. } => {
+        Condition::CorrelatedSubquery { related, op, flip, .. } => {
             let not_exists = op == "NOT EXISTS";
+            let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
-            let child_configs = ast_to_operator_configs(
+            let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
             )?;
+            // TS FlippedJoin does not apply EXISTS_LIMIT
+            if !is_flipped {
+                apply_exists_limit(&mut child_configs, related.system.as_deref());
+            }
             configs.push(OperatorConfig::Exists {
                 relationship_name: relationship_name(related),
                 not_exists,
@@ -388,14 +412,18 @@ fn append_csq_as_exists(
     or_condition: Option<serde_json::Value>,
 ) -> Result<(), String> {
     match cond {
-        Condition::CorrelatedSubquery { related, op, .. } => {
+        Condition::CorrelatedSubquery { related, op, flip, .. } => {
             let not_exists = op == "NOT EXISTS";
+            let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
-            let child_configs = ast_to_operator_configs(
+            let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
             )?;
+            if !is_flipped {
+                apply_exists_limit(&mut child_configs, related.system.as_deref());
+            }
             configs.push(OperatorConfig::Exists {
                 relationship_name: relationship_name(related),
                 not_exists,
@@ -508,14 +536,18 @@ fn collect_exists_branches(
     primary_key: &[String],
 ) -> Result<(), String> {
     match cond {
-        Condition::CorrelatedSubquery { related, op, .. } => {
+        Condition::CorrelatedSubquery { related, op, flip, .. } => {
             let not_exists = op == "NOT EXISTS";
+            let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
-            let child_configs = ast_to_operator_configs(
+            let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
             )?;
+            if !is_flipped {
+                apply_exists_limit(&mut child_configs, related.system.as_deref());
+            }
             branches.push(ExistsBranch {
                 relationship_name: relationship_name(related),
                 not_exists,
@@ -560,6 +592,38 @@ fn collect_exists_branches(
             Ok(())
         }
         _ => Err(format!("Expected CorrelatedSubquery or And in OrExists branch, got {:?}", cond)),
+    }
+}
+
+// NOTE: Alias uniquification (matching TS `uniquifyCorrelatedSubqueryConditionAliases`)
+// is NOT done in Rust. In production, the TS builder already uniquifies CSQ aliases
+// before sending ASTs to Rust. For the parity test, 1 divergence exists for ASTs
+// with duplicate CSQ aliases (e.g., seed_18) — this is a known limitation.
+
+/// Apply EXISTS_LIMIT to child configs if no Take is already present.
+/// Matches TS behavior where EXISTS subqueries always have a limit applied.
+/// The Take inherits the sort order from the child Source config so that
+/// the bound-based fetch path (after warm-up) correctly limits rows.
+fn apply_exists_limit(child_configs: &mut Vec<OperatorConfig>, system: Option<&str>) {
+    // Check if there's already a Take in the child configs
+    let has_take = child_configs.iter().any(|c| matches!(c, OperatorConfig::Take { .. }));
+    if !has_take {
+        let limit = if system == Some("permissions") {
+            PERMISSIONS_EXISTS_LIMIT
+        } else {
+            EXISTS_LIMIT
+        };
+        // Extract sort from the child Source config so TakeOperator can compare
+        // rows correctly when using the bound-based path on subsequent fetches.
+        let sort = child_configs.first().and_then(|c| match c {
+            OperatorConfig::Source { sort, .. } => Some(sort.clone()),
+            _ => None,
+        }).unwrap_or_default();
+        child_configs.push(OperatorConfig::Take {
+            limit,
+            sort,
+            partition_key: None,
+        });
     }
 }
 

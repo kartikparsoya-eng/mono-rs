@@ -29,7 +29,7 @@ pub struct AdvanceResult {
     pub reset_signal: Option<String>,
 }
 
-use crate::hydrate::build_push_operator_list;
+use crate::hydrate::build_operator_chain;
 use crate::source::SourceChange;
 use crate::table_source::RustTableSource;
 use zero_ivm_rs::operator::Operator as IvmOperator;
@@ -177,7 +177,7 @@ pub(crate) struct ChildTableInfo {
     pub(crate) child_pk: Vec<String>,
 }
 
-/// Mapping from child table name → Vec<(op_index in op_list, child_pk)>.
+/// Mapping from child table name → Vec<(op_index in push_ptrs, child_pk)>.
 /// Used to route child table changes through the correct Join/Exists operator
 /// via push_child().
 fn build_child_table_to_op_index(
@@ -187,7 +187,7 @@ fn build_child_table_to_op_index(
     if configs.is_empty() {
         return map;
     }
-    // configs[0] is Source, configs[1..] correspond to op_list[0..]
+    // configs[0] is Source, configs[1..] correspond to push_ptrs[0..]
     let rest = match &configs[0] {
         OperatorConfig::Source { .. } => &configs[1..],
         _ => return map,
@@ -992,12 +992,11 @@ use std::sync::{Mutex, RwLock};
 
 pub(crate) struct PipelineState {
     pub(crate) source: Arc<RustTableSource>,
-    pub(crate) op_list: Vec<Box<dyn IvmOperator>>,
-    /// Properly chained operator tree for pull-based fetch (hydration).
-    /// Unlike op_list (flat list with PassthroughOperator parents for push),
-    /// this chains operators with SourceBridgeOperator at root so fetch()
-    /// pulls data through the entire tree.
-    pub(crate) fetch_chain: Option<Box<dyn IvmOperator>>,
+    /// Unified operator chain: nested tree for both fetch (hydration) and push (advance).
+    /// `chain` is the outermost operator. `push_ptrs` are raw pointers to each operator
+    /// in inner→outer order for external push routing.
+    pub(crate) chain: Option<Box<dyn IvmOperator>>,
+    pub(crate) push_ptrs: Vec<*mut dyn IvmOperator>,
     pub(crate) query_id: String,
     pub(crate) source_table: String,
     pub(crate) primary_key: Vec<String>,
@@ -1012,6 +1011,11 @@ pub(crate) struct PipelineState {
     /// child changes through push_child() on the correct operator.
     pub(crate) child_table_to_op_index: HashMap<String, Vec<(usize, Vec<String>)>>,
 }
+
+// SAFETY: PipelineState's raw pointers in push_ptrs point into heap-allocated
+// Box<dyn Operator> within the nested chain. They are never shared across threads
+// — each PipelineState is behind a Mutex. The pointers are stable (Box heap alloc).
+unsafe impl Send for PipelineState {}
 
 /// Persistent pipeline that keeps operator trees and HashMap state alive across
 /// hydrate/advance calls. Eliminates per-call pipeline rebuild overhead (~44%)
@@ -1040,8 +1044,20 @@ pub(crate) fn build_pipeline_state(
     shared_pool: &ConnectionPool,
 ) -> Result<PipelineState, String> {
     use crate::ast_to_config::{ast_to_operator_configs, collect_child_tables};
-    use crate::hydrate::{build_push_operator_list, build_push_operator_chain};
     use crate::query_builder::ColumnType;
+
+    // Seed SchemaCache with all_primary_keys from TS (Zero schema PKs) BEFORE
+    // building operator configs, so that get_primary_key() for child tables
+    // returns correct PKs instead of relying on SQLite PRAGMA table_info
+    // (which may not have PRIMARY KEY constraints on replica tables).
+    if let Some(ref ts_pks) = query.all_primary_keys {
+        schema_cache.seed_primary_keys(ts_pks);
+    }
+    // Also seed the root table's PK
+    schema_cache.seed_primary_keys(&HashMap::from([(
+        query.ast.table.clone(),
+        query.primary_key.clone(),
+    )]));
 
     let operator_config = ast_to_operator_configs(
         schema_cache,
@@ -1101,40 +1117,21 @@ pub(crate) fn build_pipeline_state(
     let connection_id = source.connect(Some(sort), None, split_keys);
     let source_arc = Arc::new(source);
 
-    let op_list_result = build_push_operator_list(
+    // Build unified operator chain for both fetch and push.
+    let (chain, push_ptrs, has_operators) = match build_operator_chain(
         source_arc.clone(), &operator_config, connection_id,
-    );
-
-    let has_operators;
-    let mut op_list = match op_list_result {
-        Ok(list) if list.is_empty() => {
-            has_operators = false;
-            vec![]
+    ) {
+        Ok(Some(oc)) => {
+            let push_ptrs = oc.push_ptrs;
+            let mut chain = oc.chain;
+            // Warm up: initial fetch populates stateful operators (TakeState, etc.)
+            // through the nested chain — matches TS IVM's initialFetch behavior.
+            let _ = chain.fetch(&FetchRequest::default());
+            (Some(chain), push_ptrs, true)
         }
-        Ok(list) => {
-            has_operators = true;
-            list
-        }
-        Err(e) => return Err(format!("failed to build push list: {e}")),
+        Ok(None) => (None, vec![], false),
+        Err(e) => return Err(format!("failed to build operator chain: {e}")),
     };
-
-    // Build chained operator tree for pull-based fetch (hydration).
-    let fetch_chain = if has_operators {
-        build_push_operator_chain(source_arc.clone(), &operator_config, connection_id)
-            .map_err(|e| format!("failed to build fetch chain: {e}"))?
-    } else {
-        None
-    };
-
-    // Warm-up fetch: populate stateful operators (TakeState, etc.)
-    if has_operators {
-        for op in op_list.iter_mut() {
-            let op_type = op.op_type();
-            if op_type == "take" || op_type == "exists" || op_type == "skip" || op_type == "cap" {
-                let _ = op.fetch(&FetchRequest::default());
-            }
-        }
-    }
 
     let child_table_map = collect_child_table_map(&operator_config);
     let children_of_map = collect_children_of_map(&operator_config);
@@ -1142,8 +1139,8 @@ pub(crate) fn build_pipeline_state(
 
     Ok(PipelineState {
         source: source_arc,
-        op_list,
-        fetch_chain,
+        chain,
+        push_ptrs,
         query_id: query.query_id.clone(),
         source_table: query.ast.table.clone(),
         primary_key: query.primary_key.clone(),
@@ -1181,12 +1178,16 @@ pub(crate) fn advance_persistent_pipeline(
         );
     }
 
-    fn push_through_all(change: IvmChange, ops: &mut [Box<dyn IvmOperator>]) -> Vec<IvmChange> {
+    /// Push a change through operators via raw pointers (inner→outer).
+    /// SAFETY: `ptrs` and `len` describe a valid slice of raw pointers into
+    /// heap-allocated operators in the nested chain. Sequential — no aliasing.
+    unsafe fn push_through_ptrs(change: IvmChange, ptrs: *const *mut dyn IvmOperator, len: usize) -> Vec<IvmChange> {
         let mut current = vec![change];
-        for op in ops.iter_mut() {
+        for i in 0..len {
+            let ptr = *ptrs.add(i);
             let mut next = Vec::new();
             for c in current {
-                next.extend(op.push(c));
+                next.extend((*ptr).push(c));
             }
             current = next;
         }
@@ -1218,7 +1219,7 @@ pub(crate) fn advance_persistent_pipeline(
             for sc in source_changes {
                 let ivm_change = source_change_to_ivm_change(&sc);
                 let tp0 = std::time::Instant::now();
-                let output_changes = push_through_all(ivm_change, &mut pipeline.op_list);
+                let output_changes = unsafe { push_through_ptrs(ivm_change, pipeline.push_ptrs.as_ptr(), pipeline.push_ptrs.len()) };
                 t_push += tp0.elapsed();
                 let tf0 = std::time::Instant::now();
                 for oc in &output_changes {
@@ -1252,18 +1253,29 @@ pub(crate) fn advance_persistent_pipeline(
                 let child_source_changes = diff_change_to_source_changes(change, child_pk);
                 for sc in child_source_changes {
                     let ivm_change = source_change_to_ivm_change(&sc);
-                    // Call push_child on the target operator (Join/Exists)
+                    // Call push_child on the target operator (Join/Exists) via raw pointer
                     let tp0 = std::time::Instant::now();
-                    let child_outputs = pipeline.op_list[*op_idx].push_child(ivm_change);
+                    let child_outputs = unsafe { (*pipeline.push_ptrs[*op_idx]).push_child(ivm_change) };
                     // Push through remaining operators after this one
-                    let mut current = child_outputs;
-                    for op in pipeline.op_list[op_idx + 1..].iter_mut() {
-                        let mut next = Vec::new();
-                        for c in current {
-                            next.extend(op.push(c));
+                    let remaining_start = op_idx + 1;
+                    let remaining_len = pipeline.push_ptrs.len() - remaining_start;
+                    let current = if remaining_len > 0 {
+                        unsafe {
+                            let mut current = child_outputs;
+                            let ptrs = pipeline.push_ptrs.as_ptr().add(remaining_start);
+                            for i in 0..remaining_len {
+                                let ptr = *ptrs.add(i);
+                                let mut next = Vec::new();
+                                for c in current {
+                                    next.extend((*ptr).push(c));
+                                }
+                                current = next;
+                            }
+                            current
                         }
-                        current = next;
-                    }
+                    } else {
+                        child_outputs
+                    };
                     t_push += tp0.elapsed();
                     let tf0 = std::time::Instant::now();
                     for oc in &current {
@@ -1418,7 +1430,7 @@ impl RustPipeline {
             let mut pipeline = pipeline_mutex.lock().unwrap();
             let mut row_changes = Vec::new();
 
-            if let Some(ref mut chain) = pipeline.fetch_chain {
+            if let Some(ref mut chain) = pipeline.chain {
                 let nodes = chain.fetch(&FetchRequest::default());
                 flatten_nodes_to_row_changes(
                     &mut row_changes,
@@ -1481,7 +1493,7 @@ impl RustPipeline {
         let mut pipeline = pipeline_mutex.lock().unwrap();
         let mut row_changes = Vec::new();
 
-        if let Some(ref mut chain) = pipeline.fetch_chain {
+        if let Some(ref mut chain) = pipeline.chain {
             let nodes = chain.fetch(&FetchRequest::default());
             flatten_nodes_to_row_changes(
                 &mut row_changes,

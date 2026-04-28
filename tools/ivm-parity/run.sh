@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # IVM Parity Test — end-to-end script
 #
-# Compares the REFERENCE TS IVM (from main branch via git worktree) against
+# Compares the REFERENCE TS IVM (from ~/Documents/xy-repo/mono/) against
 # the current branch's Rust-only IVM. This is the definitive correctness
 # check: if both produce identical hydration/advance results for 1084 ASTs,
 # the Rust IVM is a faithful replacement.
@@ -13,7 +13,7 @@
 #
 # Prerequisites:
 #   - PostgreSQL running on port 6434 (docker: npm run db-up from apps/zbugs)
-#   - 'main' branch exists locally (for TS reference server)
+#   - ~/Documents/xy-repo/mono/ has deps installed (npm install && npm run build)
 #
 # The script automatically creates the parity DB and seeds it if needed.
 #
@@ -21,8 +21,7 @@
 #   PARITY_PG_URL       PostgreSQL connection string
 #   TS_PORT             TS server port (default: 4858)
 #   RS_PORT             RS server port (default: 4868)
-#   TS_REF_BRANCH       Branch for TS reference server (default: main)
-#   SKIP_TS_BUILD       Set to 1 to skip rebuilding the TS worktree (reuse previous)
+#   TS_MONO_DIR         Path to TS reference mono repo (default: ~/Documents/xy-repo/mono)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -39,11 +38,9 @@ TS_PORT="${TS_PORT:-4858}"
 RS_PORT="${RS_PORT:-4868}"
 TS_ADMIN_PORT=$((TS_PORT + 1))
 RS_ADMIN_PORT=$((RS_PORT + 1))
-TS_REF_COMMIT="${TS_REF_COMMIT:-HEAD}"
-SKIP_TS_BUILD="${SKIP_TS_BUILD:-0}"
+TS_MONO_DIR="${TS_MONO_DIR:-$HOME/Documents/xy-repo/mono}"
 
 MONO_ROOT="../.."
-WORKTREE_DIR="/tmp/ivm-parity-ts-ref"
 
 cleanup() {
   echo ""
@@ -65,36 +62,12 @@ for DB in parity_cvr_ts parity_cdb_ts parity_cvr_rs parity_cdb_rs; do
   psql "${PG_URL_POSTGRES}" -c "CREATE DATABASE ${DB}" > /dev/null 2>&1 || true
 done
 
-# ── 1. Prepare TS reference server from a committed snapshot ─────────
-# We use a detached git worktree so the TS server runs the committed code
-# (with TS IVM still intact) while the RS server runs the working tree
-# (with Rust-only IVM and uncommitted changes).
-RESOLVED_COMMIT=$(cd "${MONO_ROOT}" && git rev-parse "${TS_REF_COMMIT}")
-if [ "${SKIP_TS_BUILD}" != "1" ]; then
-  echo "[parity] preparing TS reference server from commit ${RESOLVED_COMMIT:0:10}..."
-
-  # Remove stale worktree if it exists
-  if [ -d "${WORKTREE_DIR}" ]; then
-    echo "[parity]   removing stale worktree..."
-    (cd "${MONO_ROOT}" && git worktree remove --force "${WORKTREE_DIR}" 2>/dev/null || true)
-    rm -rf "${WORKTREE_DIR}"
-  fi
-
-  # Create detached worktree from the reference commit
-  echo "[parity]   creating detached worktree at ${WORKTREE_DIR}..."
-  (cd "${MONO_ROOT}" && git worktree add --detach "${WORKTREE_DIR}" "${RESOLVED_COMMIT}")
-
-  # Install deps and build only what's needed (skip full dts which may have pre-existing type errors)
-  echo "[parity]   installing deps + building native modules (this may take a minute)..."
-  (cd "${WORKTREE_DIR}" && npm install && npx turbo run build --filter=zqlite-rs --filter=zero-ivm-rs)
-
-  echo "[parity]   TS reference build ready."
-else
-  echo "[parity] SKIP_TS_BUILD=1 — reusing existing worktree at ${WORKTREE_DIR}"
-  if [ ! -d "${WORKTREE_DIR}" ]; then
-    echo "[parity] ERROR: ${WORKTREE_DIR} does not exist. Run without SKIP_TS_BUILD first."
-    exit 1
-  fi
+# ── 1. Verify TS reference server repo exists ───────────────────────
+echo "[parity] using TS reference server from ${TS_MONO_DIR}"
+if [ ! -d "${TS_MONO_DIR}/packages/zero-cache" ]; then
+  echo "[parity] ERROR: ${TS_MONO_DIR} does not contain packages/zero-cache"
+  echo "         set TS_MONO_DIR to the path of the TS mono repo"
+  exit 1
 fi
 
 # ── 2. Fix zero-ivm-rs symlink for RS server (current branch) ───────
@@ -136,17 +109,11 @@ if [ ! -f schema.json ] || [ zero-schema.ts -nt schema.json ]; then
     --output-file tools/ivm-parity/schema.json)
 fi
 
-# Deploy permissions to the database
-echo "[parity] deploying permissions to PG..."
-psql "${PG_URL}" -v ON_ERROR_STOP=1 -f schema.json > /dev/null
-
-# ── 6. Start TS reference server (from main branch worktree) ─────────
-# This runs the OLD code with TS IVM as the reference implementation.
+# ── 6. Start TS reference server (from external mono repo) ──────────
 SCHEMA_ABS="$(pwd)/schema.json"
-echo "[parity] starting TS zero-cache on :${TS_PORT} (from commit ${RESOLVED_COMMIT:0:10}, TS IVM)..."
+echo "[parity] starting TS zero-cache on :${TS_PORT} (from ${TS_MONO_DIR}, TS IVM)..."
 (
-  cd "${WORKTREE_DIR}"
-  export ZERO_DISABLE_RUST_IVM=1
+  cd "${TS_MONO_DIR}"
   export ZERO_ENABLE_QUERY_PLANNER=false
   export ZERO_PORT=${TS_PORT}
   export ZERO_UPSTREAM_DB="${PG_URL}"
@@ -193,6 +160,17 @@ for port in ${TS_PORT} ${RS_PORT}; do
   done
 done
 
+# ── 8b. Deploy permissions (after servers created zero schema) ───────
+# The schema.json targets "zero.permissions" but the actual table uses the
+# app-id as schema name (parity_ts.permissions / parity_rs.permissions).
+echo "[parity] deploying permissions to PG..."
+PERMS_JSON=$(sed -n "s/.*SET permissions = '\\(.*\\)';/\\1/p" schema.json)
+for APP_SCHEMA in parity_ts parity_rs; do
+  psql "${PG_URL}" -c "UPDATE \"${APP_SCHEMA}\".permissions SET permissions = '${PERMS_JSON}'" > /dev/null 2>&1 || {
+    echo "[parity]   permissions deploy to ${APP_SCHEMA} skipped (table may not exist yet)"
+  }
+done
+
 # ── 9. Run parity sweep ──────────────────────────────────────────────
 echo ""
 echo "[parity] running hydration sweep: ${CORPUS_LIMIT} ASTs, parallelism=${MAX_PARALLEL}"
@@ -200,12 +178,13 @@ echo "────────────────────────�
 CORPUS_LIMIT=${CORPUS_LIMIT} \
 MAX_PARALLEL=${MAX_PARALLEL} \
 RS_PORT=${RS_PORT} \
+PARITY_TS_URL="ws://localhost:${TS_PORT}/sync/v49/connect" \
   npx tsx harness-coverage.ts
 echo "───────────────────────────────────────────────────────────────────"
 
 # ── 10. Summary ───────────────────────────────────────────────────────
 echo ""
-echo "[parity] TS reference: commit ${RESOLVED_COMMIT:0:10} (TS IVM) on :${TS_PORT}"
+echo "[parity] TS reference: ${TS_MONO_DIR} (TS IVM) on :${TS_PORT}"
 echo "[parity] RS under test: current branch (Rust IVM) on :${RS_PORT}"
 echo ""
 echo "[parity] results written to:"
@@ -216,5 +195,5 @@ echo "[parity] logs:"
 echo "         tail -f /tmp/ivm-parity-ts.log"
 echo "         tail -f /tmp/ivm-parity-rs.log"
 echo ""
-echo "[parity] To rerun without rebuilding TS reference:"
-echo "         SKIP_TS_BUILD=1 ./run.sh ${CORPUS_LIMIT}"
+echo "[parity] To rerun:"
+echo "         ./run.sh ${CORPUS_LIMIT}"

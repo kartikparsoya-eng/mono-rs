@@ -939,75 +939,33 @@ fn build_next_operator(
     }
 }
 
-/// Build an operator chain suitable for push propagation (advance path).
+/// Build a unified operator chain for both fetch (hydration) and push (advance).
 /// Uses sequential JoinOperator/ExistsOperator which have proper push() implementations.
-/// The chain starts AFTER the root Source — the caller pushes changes directly into it.
-/// Build a flat list of push operators (inner to outer) for sequential push.
-/// Each operator can be pushed through independently. TakeOperator keeps
-/// the SourceBridge as input for replacement fetches during push.
-/// For warm-up, call fetch() on the first operator that has state (e.g. TakeOperator).
-pub fn build_push_operator_list(
-    source: Arc<RustTableSource>,
-    configs: &[OperatorConfig],
-    connection_id: usize,
-) -> Result<Vec<Box<dyn Operator>>, String> {
-    if configs.is_empty() {
-        return Err("empty operator config".to_string());
-    }
-
-    // Skip the root Source config
-    let rest = match &configs[0] {
-        OperatorConfig::Source { .. } => &configs[1..],
-        _ => return Err("first config must be a Source".to_string()),
-    };
-
-    if rest.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut operators: Vec<Box<dyn Operator>> = Vec::new();
-
-    for config in rest {
-        match config {
-            OperatorConfig::Take { .. } | OperatorConfig::Skip { .. } | OperatorConfig::Cap { .. } => {
-                // These operators need SourceBridge for fetch-based state management
-                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
-                let op = build_push_next_operator(source.clone(), bridge, config)?;
-                operators.push(op);
-            }
-            OperatorConfig::Exists { .. } | OperatorConfig::OrExists { .. } => {
-                // Exists operators need their child source for count tracking
-                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
-                let op = build_push_next_operator(source.clone(), bridge, config)?;
-                operators.push(op);
-            }
-            OperatorConfig::Filter { .. } => {
-                let dummy = Box::new(PassthroughOperator::new());
-                let op = build_push_next_operator(source.clone(), dummy, config)?;
-                operators.push(op);
-            }
-            OperatorConfig::Join { .. } => {
-                // Join needs SourceBridge as parent so push_child() can find
-                // matching parent rows via parent.fetch(constraint).
-                let bridge = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
-                let op = build_push_next_operator(source.clone(), bridge, config)?;
-                operators.push(op);
-            }
-            OperatorConfig::Source { .. } => {
-                return Err("unexpected Source in non-root position".to_string());
-            }
-        }
-    }
-
-    Ok(operators)
+/// The chain starts with a SourceBridgeOperator at root for DB access.
+/// Result of building a unified operator chain.
+/// `chain` is the outermost operator (fetch recurses inward).
+/// `push_ptrs` are raw pointers to each non-Source operator in inner→outer order,
+/// matching the indices used by `child_table_to_op_index`.
+pub struct OperatorChain {
+    pub chain: Box<dyn Operator>,
+    pub push_ptrs: Vec<*mut dyn Operator>,
 }
 
-/// Build a nested chain for fetch (warm-up). Returns the outermost operator.
-pub fn build_push_operator_chain(
+// SAFETY: The raw pointers in push_ptrs point into heap-allocated Box<dyn Operator>
+// within the nested chain. They are valid as long as `chain` exists and is not moved
+// (Box heap alloc is stable). Push is sequential — no aliasing.
+unsafe impl Send for OperatorChain {}
+
+/// Build a single nested operator chain for both fetch (hydration) and push (advance).
+/// Returns None if there are no operators beyond the root Source.
+///
+/// The chain is: SourceBridge → Op0 → Op1 → ... → OpN (outermost)
+/// push_ptrs = [&mut Op0, &mut Op1, ..., &mut OpN] for external push routing.
+pub fn build_operator_chain(
     source: Arc<RustTableSource>,
     configs: &[OperatorConfig],
     connection_id: usize,
-) -> Result<Option<Box<dyn Operator>>, String> {
+) -> Result<Option<OperatorChain>, String> {
     if configs.is_empty() {
         return Err("empty operator config".to_string());
     }
@@ -1022,13 +980,20 @@ pub fn build_push_operator_chain(
         return Ok(None);
     }
 
-    // Build a source-backed root so TakeOperator/SkipOperator can fetch from DB
+    // Build a source-backed root so operators can fetch from DB
     let root: Box<dyn Operator> = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
     let mut current = root;
+    let mut push_ptrs: Vec<*mut dyn Operator> = Vec::with_capacity(rest.len());
+
     for config in rest {
         current = build_push_next_operator(source.clone(), current, config)?;
+        // Collect a raw pointer to this operator for push routing.
+        // The pointer is into the Box's heap allocation — stable address.
+        let ptr: *mut dyn Operator = &mut *current;
+        push_ptrs.push(ptr);
     }
-    Ok(Some(current))
+
+    Ok(Some(OperatorChain { chain: current, push_ptrs }))
 }
 
 /// A bridge operator that connects the RustTableSource to the push chain.
@@ -1079,32 +1044,6 @@ impl Operator for SourceBridgeOperator {
 
     fn op_type(&self) -> &'static str {
         "source_bridge"
-    }
-}
-
-/// A no-op operator used as the root of push chains.
-/// It holds changes that are pushed into it, which the next operator can pull.
-struct PassthroughOperator {
-    pending: Vec<Node>,
-}
-
-impl PassthroughOperator {
-    fn new() -> Self {
-        Self { pending: vec![] }
-    }
-}
-
-impl Operator for PassthroughOperator {
-    fn fetch(&mut self, _req: &FetchRequest) -> Vec<Node> {
-        std::mem::take(&mut self.pending)
-    }
-
-    fn push(&mut self, change: Change) -> Vec<Change> {
-        vec![change]
-    }
-
-    fn op_type(&self) -> &'static str {
-        "passthrough"
     }
 }
 

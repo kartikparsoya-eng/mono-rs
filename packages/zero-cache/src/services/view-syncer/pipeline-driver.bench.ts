@@ -573,10 +573,7 @@ if (RustPipelineClass) {
       const tsReplicator = fakeReplicator(lc, db);
 
       const RPC = RustPipelineClass!;
-      const {queriesJson} = buildMultiQueries(
-        queryCount,
-        ISSUES_AND_COMMENTS,
-      );
+      const {queriesJson} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
       const rustPipeline = new RPC(dbFile.path, queriesJson);
       rustPipeline.hydrate();
       let profVersion = 80000 + queryCount * 1000;
@@ -598,10 +595,7 @@ if (RustPipelineClass) {
           const id = `prof-${v}`;
 
           let t0 = performance.now();
-          tsReplicator.processTransaction(
-            v,
-            messages.insert('issues', {id}),
-          );
+          tsReplicator.processTransaction(v, messages.insert('issues', {id}));
           let t1 = performance.now();
           timings.processTransaction += t1 - t0;
 

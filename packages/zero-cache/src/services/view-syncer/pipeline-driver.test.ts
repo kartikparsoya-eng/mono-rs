@@ -1352,6 +1352,30 @@ describe('view-syncer/pipeline-driver', () => {
           "table": "issues",
           "type": 0,
         },
+        {
+          "queryID": "querySubsetSchemaExists",
+          "row": {
+            "_0_version": "123",
+            "id": null,
+            "name": null,
+          },
+          "rowKey": {},
+          "table": "labels",
+          "type": 0,
+        },
+        {
+          "queryID": "querySubsetSchemaExists",
+          "row": {
+            "_0_version": "123",
+            "id": "1",
+            "name": "bug",
+          },
+          "rowKey": {
+            "id": "1",
+          },
+          "table": "labels",
+          "type": 0,
+        },
       ]
     `);
   });

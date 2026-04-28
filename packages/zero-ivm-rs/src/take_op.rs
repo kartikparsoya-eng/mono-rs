@@ -340,7 +340,8 @@ impl Operator for TakeOperator {
             let all_nodes = self.input.fetch(req);
             let mut result = Vec::new();
             for node in all_nodes {
-                if self.compare_rows(&bound, &node.row) == std::cmp::Ordering::Less {
+                let cmp = self.compare_rows(&bound, &node.row);
+                if cmp == std::cmp::Ordering::Less {
                     break;
                 }
                 if let Some(ref hidden) = self.row_hidden_from_fetch {

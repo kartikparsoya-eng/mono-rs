@@ -1926,13 +1926,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
 
       // #processChanges does batched de-duping of rows. Wrap all pipelines in
       // a single iterable in order to maximize de-duping.
-      await this.#processChanges(
-        lc,
-        timer,
-        rowChanges,
-        updater,
-        pokers,
-      );
+      await this.#processChanges(lc, timer, rowChanges, updater, pokers);
 
       await startAsyncSpan(
         tracer,

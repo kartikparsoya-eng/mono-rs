@@ -538,7 +538,7 @@ impl Task for HydrateQueryTask {
 fn hydrate_single_pipeline(pipeline: &mut PipelineState) -> Vec<RowChange> {
     let mut row_changes = Vec::new();
 
-    if let Some(ref mut chain) = pipeline.fetch_chain {
+    if let Some(ref mut chain) = pipeline.chain {
         let nodes = chain.fetch(&FetchRequest::default());
         flatten_nodes_to_row_changes(
             &mut row_changes,

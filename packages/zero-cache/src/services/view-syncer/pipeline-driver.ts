@@ -29,10 +29,7 @@ import {
   type Storage,
 } from '../../../../zql/src/ivm/operator.ts';
 import type {SourceSchema} from '../../../../zql/src/ivm/schema.ts';
-import {
-  type Source,
-  type SourceInput,
-} from '../../../../zql/src/ivm/source.ts';
+import {type Source, type SourceInput} from '../../../../zql/src/ivm/source.ts';
 import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
 import {MeasurePushOperator} from '../../../../zql/src/query/measure-push-operator.ts';
 import type {ClientGroupStorage} from '../../../../zqlite/src/database-storage.ts';
@@ -46,9 +43,7 @@ import {
   decodeAdvanceResultBuf,
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
-import {
-  materializeChanges,
-} from './dual-executor.ts';
+import {materializeChanges} from './dual-executor.ts';
 import {createRustExistsWrapper} from './rust-exists.ts';
 
 let RustPipelineManagerClass:
@@ -60,7 +55,11 @@ let RustPipelineManagerClass:
 interface RustPipelineManagerInstance {
   createInstance(id: string, dbPath: string): void;
   removeInstance(id: string): void;
-  setTableSpecs(id: string, syncableTablesJson: string, allTableNamesJson: string): void;
+  setTableSpecs(
+    id: string,
+    syncableTablesJson: string,
+    allTableNamesJson: string,
+  ): void;
   setPermissionTables(id: string, tablesJson: string): void;
   setQueryCompanions(id: string, queryId: string, companionsJson: string): void;
   addQuery(id: string, queryJson: string): void;
@@ -246,8 +245,6 @@ export class PipelineDriver {
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
 
-
-
   readonly #inspectorDelegate: InspectorDelegate;
   readonly #permissionTablesByQuery = new Map<string, Set<string>>();
   #manager: RustPipelineManagerInstance | null = null;
@@ -288,7 +285,6 @@ export class PipelineDriver {
     assert(!this.#snapshotter.initialized(), 'Already initialized');
     this.#snapshotter.init();
     this.#initAndResetCommon(clientSchema);
-
   }
 
   /**
@@ -655,7 +651,12 @@ export class PipelineDriver {
         const companionInput = companionInputs[i];
         const {childField, resolvedValue} = meta;
         companionInput.setOutput({push: () => []});
-        liveCompanions.push({input: companionInput, ast: meta.ast, childField, resolvedValue});
+        liveCompanions.push({
+          input: companionInput,
+          ast: meta.ast,
+          childField,
+          resolvedValue,
+        });
       }
 
       // Note: This hydrationTime is a wall-clock overestimate, as it does
@@ -696,7 +697,6 @@ export class PipelineDriver {
           JSON.stringify(companionInfos),
         );
       }
-
     } finally {
       this.#hydrateContext = null;
     }
@@ -817,8 +817,7 @@ export class PipelineDriver {
 
       const tableName = resolvedQuery.table ?? '';
       const pk = this.#primaryKeys?.get(tableName) ?? [];
-      const rustEligible =
-        this.#manager !== null && companionMeta.length === 0;
+      const rustEligible = this.#manager !== null && companionMeta.length === 0;
       if (rustEligible) {
         rustPayloads.push({
           query_id: q.queryID,
@@ -940,7 +939,6 @@ export class PipelineDriver {
         } else {
           this.#permissionTablesByQuery.delete(p.queryID);
         }
-    
       } finally {
         this.#hydrateContext = null;
       }
@@ -1068,8 +1066,7 @@ export class PipelineDriver {
 
       const tableName = resolvedQuery.table ?? '';
       const pk = this.#primaryKeys?.get(tableName) ?? [];
-      const rustEligible =
-        this.#manager !== null && companionMeta.length === 0;
+      const rustEligible = this.#manager !== null && companionMeta.length === 0;
       if (rustEligible) {
         rustPayloads.push({
           query_id: q.queryID,
@@ -1186,7 +1183,6 @@ export class PipelineDriver {
         } else {
           this.#permissionTablesByQuery.delete(p.queryID);
         }
-    
       } finally {
         this.#hydrateContext = null;
       }
@@ -1275,10 +1271,6 @@ export class PipelineDriver {
     return this.#rustAdvanceAsync(timer);
   }
 
-
-
-
-
   /**
    * Convert decoded Rust advance changes to typed RowChange objects.
    * Permission filtering and minRowVersion bump are handled by Rust.
@@ -1343,7 +1335,10 @@ export class PipelineDriver {
 
     const changesJson = JSON.stringify(collectedChanges);
     // Async: offload IVM fan-out to libuv worker thread
-    const resultBuf = await this.#manager.advanceAsync(this.#instanceId, changesJson);
+    const resultBuf = await this.#manager.advanceAsync(
+      this.#instanceId,
+      changesJson,
+    );
     const decoded = decodeAdvanceResultBuf(resultBuf);
     if (decoded.error) {
       throw new Error(`Rust pipeline advance failed: ${decoded.error}`);
@@ -1958,8 +1953,6 @@ export function* hydrateInternal(
   );
   yield* streamer.stream();
 }
-
-
 
 function buildPrimaryKeys(
   clientSchema: ClientSchema,

@@ -232,5 +232,3 @@ function readJsonValue(
       throw new Error(`Unknown binary tag: ${tag} at offset ${offset - 1}`);
   }
 }
-
-
