@@ -1,5 +1,8 @@
 import {describe, expect, test} from 'vitest';
-import {decodeAdvanceResultBuf} from './decode-advance-buf.ts';
+import {
+  decodeAdvanceChunkBuf,
+  decodeAdvanceResultBuf,
+} from './decode-advance-buf.ts';
 
 describe('decodeAdvanceResultBuf', () => {
   test('decodes empty result with no changes, no error, no reset', () => {
@@ -143,5 +146,103 @@ describe('decodeAdvanceResultBuf', () => {
       type: 'add',
     });
     expect(result.reset_signal).toBeUndefined();
+  });
+});
+
+// Phase 31-02: per-chunk decoder tests. Mirrors the chunk byte-format
+// emitted by `crate::chunk_encoder::encode_chunk_buf` (Rust 31-01):
+//
+//   [u32 count LE][u8 flags=0]
+//   Per RowChange: [u8 ct][u16 qid_len][qid][u16 tbl_len][tbl]
+//                  [json_value row_key]
+//                  [u8 has_row][optional u16 col_count + per-col [name, value]]
+//
+// json_value tags (see decode-advance-buf.ts:23-25 + chunk_encoder.rs comment):
+//   0=null, 1=i64(8B LE), 2=f64(8B LE), 3=text(u32 len + bytes),
+//   4=blob(u32 len + bytes), 5=bool(u8), 6=json fallback(u32 len + JSON bytes)
+//
+// We hand-roll the bytes to keep the test independent of the napi binary
+// (the parity fuzz test in `streaming-vs-buffered-parity.fuzz.test.ts`
+// covers end-to-end Rust→TS roundtrip).
+describe('decodeAdvanceChunkBuf', () => {
+  test('decodes empty chunk', () => {
+    // Header only: [u32 count=0][u8 flags=0]
+    const buf = Buffer.from([0, 0, 0, 0, 0]);
+    expect(decodeAdvanceChunkBuf(buf)).toEqual([]);
+  });
+
+  test('decodes single-row chunk with byte-format identical to buffered per-row encoding', () => {
+    // Build {queryID:"q1", table:"t1", row_key:{id:"1"}, row:{id:"1"}, type:"add"}
+    // using json-fallback (tag=6) for row_key and text (tag=3) for the column
+    // value — exactly the shape `decodeAdvanceResultBuf`'s "single row change"
+    // test exercises so the per-row layout is verified by mirror.
+    const parts: Buffer[] = [];
+
+    // Header: count=1, flags=0
+    const header = Buffer.alloc(5);
+    header.writeUInt32LE(1, 0);
+    header[4] = 0;
+    parts.push(header);
+
+    // change_type = 0 (add)
+    parts.push(Buffer.from([0]));
+
+    // query_id = "q1" (u16 LE len + bytes)
+    const qid = Buffer.from('q1', 'utf-8');
+    const qidLen = Buffer.alloc(2);
+    qidLen.writeUInt16LE(qid.length, 0);
+    parts.push(qidLen, qid);
+
+    // table = "t1"
+    const tbl = Buffer.from('t1', 'utf-8');
+    const tblLen = Buffer.alloc(2);
+    tblLen.writeUInt16LE(tbl.length, 0);
+    parts.push(tblLen, tbl);
+
+    // row_key json fallback (tag=6) {"id":"1"}
+    const rowKeyJson = Buffer.from('{"id":"1"}', 'utf-8');
+    const rowKeyHeader = Buffer.alloc(5);
+    rowKeyHeader[0] = 6;
+    rowKeyHeader.writeUInt32LE(rowKeyJson.length, 1);
+    parts.push(rowKeyHeader, rowKeyJson);
+
+    // has_row = 1, col_count = 1
+    parts.push(Buffer.from([1]));
+    const colCount = Buffer.alloc(2);
+    colCount.writeUInt16LE(1, 0);
+    parts.push(colCount);
+
+    // col "id" = "1" (text tag=3)
+    const colName = Buffer.from('id', 'utf-8');
+    const colNameLen = Buffer.alloc(2);
+    colNameLen.writeUInt16LE(colName.length, 0);
+    parts.push(colNameLen, colName);
+
+    const colVal = Buffer.from('1', 'utf-8');
+    const colValHeader = Buffer.alloc(5);
+    colValHeader[0] = 3;
+    colValHeader.writeUInt32LE(colVal.length, 1);
+    parts.push(colValHeader, colVal);
+
+    const buf = Buffer.concat(parts);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      queryID: 'q1',
+      table: 't1',
+      type: 'add',
+    });
+    expect(result[0].row_key).toEqual({id: '1'});
+    expect(result[0].row).toEqual({id: '1'});
+  });
+
+  test('throws on non-zero flags byte (D-04 forward-compat guard)', () => {
+    // Header with flags=0x01 — any non-zero value triggers the throw.
+    // Phase 33 telemetry bits will repurpose this byte; v1 decoders must
+    // fail loudly rather than silently misinterpret subsequent bytes.
+    const buf = Buffer.from([0, 0, 0, 0, 0x01]);
+    expect(() => decodeAdvanceChunkBuf(buf)).toThrow(
+      /decodeAdvanceChunkBuf: unexpected non-zero flags byte/,
+    );
   });
 });
