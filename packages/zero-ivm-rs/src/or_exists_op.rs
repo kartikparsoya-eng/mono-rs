@@ -171,6 +171,14 @@ impl OrExistsOperator {
             .iter()
             .position(|b| b.relationship_name == relationship_name)
     }
+
+    /// Test-only helper that forces `in_push = true` so the re-entrancy
+    /// assertion at the top of `push()` can be exercised by a unit test.
+    /// Gated on `#[cfg(test)]` so it does not appear in release artifacts.
+    #[cfg(test)]
+    pub(crate) fn force_in_push_for_test(&mut self) {
+        self.in_push = true;
+    }
 }
 
 impl Operator for OrExistsOperator {
@@ -413,5 +421,55 @@ impl OrExistsOperator {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockInput {
+        nodes: Vec<Node>,
+    }
+
+    impl Operator for MockInput {
+        fn fetch(&mut self, _req: &FetchRequest) -> Vec<Node> {
+            self.nodes.clone()
+        }
+        fn push(&mut self, _change: Change) -> Vec<Change> {
+            vec![]
+        }
+        fn op_type(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn make_node(id: i64) -> Node {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        Node {
+            row,
+            relationships: HashMap::new(),
+        }
+    }
+
+    // ===== AUDIT-03: Promoted assertion regression test =====
+    // Confirms the in_push re-entrancy guard fires in release builds.
+
+    #[test]
+    #[should_panic(expected = "Unexpected re-entrancy")]
+    fn test_or_exists_reentrancy_panics() {
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let child_source: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let branches = vec![(
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )];
+        let mut op = OrExistsOperator::new(parent_source, branches, None);
+        op.force_in_push_for_test();
+        let _ = op.push(Change::Add(make_node(1)));
     }
 }

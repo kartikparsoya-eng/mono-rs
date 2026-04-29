@@ -814,4 +814,49 @@ mod tests {
         let result = op.push_child(Change::Add(child));
         assert!(result.is_empty());
     }
+
+    // ===== AUDIT-03: Promoted assertion regression tests =====
+    // These tests confirm framework-invariant violations panic in release builds.
+    // If anyone reverts `assert!` back to `debug_assert!`, these tests will fail
+    // under `cargo test --release` (debug_assert! is stripped).
+
+    #[test]
+    #[should_panic(expected = "Parent edit must not change relationship.")]
+    fn test_join_parent_edit_changing_relationship_panics() {
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: vec![] }),
+            Box::new(MockSource { nodes: vec![] }),
+            vec!["id".into()],
+            vec!["parentId".into()],
+            "children".into(),
+        );
+
+        // Edit changes the parent join key (id) — must panic.
+        let old_node = make_node(&[("id", serde_json::json!(1))]);
+        let new_node = make_node(&[("id", serde_json::json!(2))]);
+        let _ = op.push(Change::Edit {
+            node: new_node,
+            old_node,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Child edit must not change relationship.")]
+    fn test_join_child_edit_changing_relationship_panics() {
+        let mut op = JoinOperator::new(
+            Box::new(MockSource { nodes: vec![] }),
+            Box::new(MockSource { nodes: vec![] }),
+            vec!["id".into()],
+            vec!["parentId".into()],
+            "children".into(),
+        );
+
+        // Child edit changes the child key (parentId) — must panic.
+        let old_node = make_node(&[("parentId", serde_json::json!(1))]);
+        let new_node = make_node(&[("parentId", serde_json::json!(2))]);
+        let _ = op.push_child(Change::Edit {
+            node: new_node,
+            old_node,
+        });
+    }
 }

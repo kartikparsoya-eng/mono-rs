@@ -1018,4 +1018,49 @@ mod tests {
         let result = op.push(Change::Add(make_node(1)));
         assert_eq!(result.len(), 0);
     }
+
+    // ===== AUDIT-03: Promoted assertion regression tests =====
+    // Confirms duplicate-primary-key invariants panic in release builds.
+    // If anyone reverts `assert!` back to `debug_assert!`, these tests
+    // will fail under `cargo test --release`.
+    //
+    // The Take operator uses the sort-key (id) as its compare-key in these
+    // tests, so `new_cmp == Equal` against the bound row means a duplicate
+    // primary key — which the framework guarantees never happens for an Edit.
+
+    #[test]
+    #[should_panic(expected = "Invalid state. Row has duplicate primary key")]
+    fn test_take_duplicate_pk_in_inside_outside_branch_panics() {
+        // Hits the line-246 site: old_cmp == Less (old inside non-bound),
+        // new_cmp == Equal (new has same compare-key as bound) — must panic.
+        // Setup: rows [1, 2, 3] with limit=2 → bound = id=2.
+        let (mut op, _data) = make_take(
+            vec![make_node(1), make_node(2), make_node(3)],
+            2,
+        );
+        let _ = op.fetch(&FetchRequest::default());
+        // Edit id=1 → id=2: old_cmp(1 vs 2) = Less, new_cmp(2 vs 2) = Equal.
+        let _ = op.push(Change::Edit {
+            node: make_node(2),
+            old_node: make_node(1),
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid state. Row has duplicate primary key")]
+    fn test_take_duplicate_pk_in_outside_outside_branch_panics() {
+        // Hits the line-200 site: old_cmp == Greater (old outside),
+        // new_cmp == Equal (new equals bound) — must panic.
+        // Setup: rows [1, 2, 5] with limit=2 → bound = id=2.
+        let (mut op, _data) = make_take(
+            vec![make_node(1), make_node(2), make_node(5)],
+            2,
+        );
+        let _ = op.fetch(&FetchRequest::default());
+        // Edit id=5 → id=2: old_cmp(5 vs 2) = Greater, new_cmp(2 vs 2) = Equal.
+        let _ = op.push(Change::Edit {
+            node: make_node(2),
+            old_node: make_node(5),
+        });
+    }
 }

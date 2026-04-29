@@ -458,4 +458,41 @@ mod tests {
         let key2 = cap_state_key(Some(&pk), &row2);
         assert_ne!(key, key2);
     }
+
+    // ===== AUDIT-03: Promoted assertion regression test =====
+    // Confirms the partition-key invariant fires in release builds.
+    // If anyone reverts `assert_eq!` back to `debug_assert_eq!`, this test
+    // will fail under `cargo test --release`.
+
+    fn make_node_with_region(id: i64, region: &str) -> Node {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        row.insert("region".to_string(), serde_json::json!(region));
+        Node {
+            row,
+            relationships: HashMap::new(),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Cap: partition key must not change on edit")]
+    fn test_cap_partition_key_change_on_edit_panics() {
+        let nodes = vec![make_node_with_region(1, "us")];
+        let input = Box::new(MockInput { nodes });
+        let mut op = CapOperator::new(
+            input,
+            2,
+            vec!["id".to_string()],
+            Some(vec!["region".to_string()]),
+        );
+        // Prime state for region=us partition.
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Edit moves the row from region=us to region=eu — partition key
+        // changed → must panic.
+        let _ = op.push(Change::Edit {
+            node: make_node_with_region(1, "eu"),
+            old_node: make_node_with_region(1, "us"),
+        });
+    }
 }
