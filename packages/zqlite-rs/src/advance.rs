@@ -151,6 +151,33 @@ fn ivm_change_to_row_changes(
     }
 }
 
+/// AUDIT-02: split a `SourceChange::Edit` into `Remove(old)+Add(new)` when
+/// any column in `split_edit_keys` differs between old_row and new_row.
+/// Mirrors `RustTableSource::maybe_split_edit` for the persistent advance
+/// path which builds SourceChange directly without going through
+/// `source.push()`. Other variants pass through unchanged.
+fn maybe_split_edit_for_advance(
+    sc: SourceChange,
+    split_edit_keys: &[String],
+) -> Vec<SourceChange> {
+    if split_edit_keys.is_empty() {
+        return vec![sc];
+    }
+    if let SourceChange::Edit { ref row, ref old_row } = sc {
+        for key in split_edit_keys {
+            let old_val = old_row.get(key);
+            let new_val = row.get(key);
+            if old_val != new_val {
+                return vec![
+                    SourceChange::Remove(old_row.clone()),
+                    SourceChange::Add(row.clone()),
+                ];
+            }
+        }
+    }
+    vec![sc]
+}
+
 fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
     let make_node = |row: &crate::source::Row| zero_ivm_rs::types::Node {
         row: row.clone(),
@@ -866,6 +893,21 @@ fn collect_split_edit_keys(ast: &crate::ast_to_config::Ast) -> Vec<String> {
                     collect_from_cond(c, keys);
                 }
             }
+            // AUDIT-02 / D-04: EXISTS (and NOT EXISTS) inside the where
+            // clause must contribute its parent_field columns to
+            // split_edit_keys so an edit that flips the membership is
+            // emitted as Remove+Add (not Edit). Recurse into the
+            // subquery's own where so nested EXISTS are caught too.
+            // TS parity: packages/zql/src/builder/builder.ts:273-290 via
+            // gatherCorrelatedSubqueryQueryConditions.
+            crate::ast_to_config::Condition::CorrelatedSubquery { related, .. } => {
+                for f in &related.correlation.parent_field {
+                    keys.insert(f.clone());
+                }
+                if let Some(inner) = &related.subquery.where_cond {
+                    collect_from_cond(inner, keys);
+                }
+            }
             _ => {}
         }
     }
@@ -1010,6 +1052,10 @@ pub(crate) struct PipelineState {
     /// Maps child table name → Vec<(op_index, child_pk)> for routing
     /// child changes through push_child() on the correct operator.
     pub(crate) child_table_to_op_index: HashMap<String, Vec<(usize, Vec<String>)>>,
+    /// Columns whose change must split a source Edit into Remove+Add so
+    /// downstream Join/Exists operators see the membership transition.
+    /// Populated from `collect_split_edit_keys(&query.ast)` (AUDIT-02).
+    pub(crate) split_edit_keys: Vec<String>,
 }
 
 // SAFETY: PipelineState's raw pointers in push_ptrs point into heap-allocated
@@ -1152,6 +1198,7 @@ pub(crate) fn build_pipeline_state(
         has_operators,
         rel_to_table,
         child_table_to_op_index,
+        split_edit_keys,
     })
 }
 
@@ -1214,7 +1261,15 @@ pub(crate) fn advance_persistent_pipeline(
     for change in changes.iter() {
         if change.table == pipeline.source_table {
             let td0 = std::time::Instant::now();
-            let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            let raw_source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            // AUDIT-02: split source Edits when an EXISTS parent_field
+            // (or any other column in split_edit_keys) changes, so the
+            // downstream Join/Exists operator sees Remove+Add rather
+            // than a silent in-place Edit.
+            let source_changes: Vec<SourceChange> = raw_source_changes
+                .into_iter()
+                .flat_map(|sc| maybe_split_edit_for_advance(sc, &pipeline.split_edit_keys))
+                .collect();
             t_diff += td0.elapsed();
             for sc in source_changes {
                 let ivm_change = source_change_to_ivm_change(&sc);
@@ -1712,6 +1767,206 @@ mod tests {
         assert_eq!(err_len, 15); // "something broke"
         let err_msg = std::str::from_utf8(&buf[7..7 + err_len]).unwrap();
         assert_eq!(err_msg, "something broke");
+    }
+
+    // ─── collect_split_edit_keys: AUDIT-02 (EXISTS parent_field) ──────────
+    //
+    // TS parity reference: packages/zql/src/builder/builder.ts lines 273-290.
+    // The collector must include parent_field columns from EVERY
+    // CorrelatedSubquery condition reachable through the where tree (and
+    // through nested EXISTS subqueries' own where), in addition to the
+    // top-level `ast.related[*]` parent_fields.
+
+    use crate::ast_to_config::{Ast, Condition, ConditionValue, CorrelatedSubquery, Correlation};
+
+    fn make_csq(parent_field: Vec<&str>, child_field: Vec<&str>, child_table: &str) -> Box<CorrelatedSubquery> {
+        Box::new(CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: parent_field.into_iter().map(String::from).collect(),
+                child_field: child_field.into_iter().map(String::from).collect(),
+            },
+            subquery: Box::new(Ast {
+                table: child_table.to_string(),
+                alias: None,
+                where_cond: None,
+                related: None,
+                limit: None,
+                order_by: None,
+                start: None,
+            }),
+            hidden: None,
+            system: None,
+        })
+    }
+
+    fn make_csq_with_where(
+        parent_field: Vec<&str>,
+        child_field: Vec<&str>,
+        child_table: &str,
+        inner_where: Condition,
+    ) -> Box<CorrelatedSubquery> {
+        Box::new(CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: parent_field.into_iter().map(String::from).collect(),
+                child_field: child_field.into_iter().map(String::from).collect(),
+            },
+            subquery: Box::new(Ast {
+                table: child_table.to_string(),
+                alias: None,
+                where_cond: Some(Box::new(inner_where)),
+                related: None,
+                limit: None,
+                order_by: None,
+                start: None,
+            }),
+            hidden: None,
+            system: None,
+        })
+    }
+
+    fn empty_parent_ast() -> Ast {
+        Ast {
+            table: "parent".to_string(),
+            alias: None,
+            where_cond: None,
+            related: None,
+            limit: None,
+            order_by: None,
+            start: None,
+        }
+    }
+
+    fn simple_eq_cond() -> Condition {
+        Condition::Simple {
+            op: "=".to_string(),
+            left: ConditionValue::Column { name: "name".to_string() },
+            right: ConditionValue::Literal { value: serde_json::json!("Alice") },
+        }
+    }
+
+    /// Bug #2 regression: top-level EXISTS in where must contribute its
+    /// parent_field to split_edit_keys. Without the fix, edits to that
+    /// column would be emitted as Edit (not Remove+Add) and downstream
+    /// ExistsOperator silently drops the membership transition.
+    #[test]
+    fn test_collect_split_edit_keys_csq_in_where() {
+        let csq = make_csq(vec!["owner_id"], vec!["parent_id"], "children");
+        let mut ast = empty_parent_ast();
+        ast.where_cond = Some(Box::new(Condition::CorrelatedSubquery {
+            related: csq,
+            op: "EXISTS".to_string(),
+            flip: None,
+            scalar: None,
+        }));
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert!(
+            keys.contains(&"owner_id".to_string()),
+            "expected 'owner_id' in keys, got {keys:?}"
+        );
+    }
+
+    /// EXISTS nested inside an AND condition must still contribute its
+    /// parent_field. This guards the AND/OR recursion path that already
+    /// existed before the fix (we recurse INTO the And/Or conditions and
+    /// must hit the new CorrelatedSubquery arm at the leaves).
+    #[test]
+    fn test_collect_split_edit_keys_csq_nested_in_and() {
+        let csq = make_csq(vec!["status"], vec!["status"], "children");
+        let mut ast = empty_parent_ast();
+        ast.where_cond = Some(Box::new(Condition::And {
+            conditions: vec![
+                simple_eq_cond(),
+                Condition::CorrelatedSubquery {
+                    related: csq,
+                    op: "EXISTS".to_string(),
+                    flip: None,
+                    scalar: None,
+                },
+            ],
+        }));
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert!(
+            keys.contains(&"status".to_string()),
+            "expected 'status' in keys, got {keys:?}"
+        );
+    }
+
+    /// EXISTS subquery that itself contains a CorrelatedSubquery in ITS
+    /// where clause: the outer collector must recurse into
+    /// `related.subquery.where_cond` (per D-04). Without this recursion,
+    /// nested EXISTS parent_fields are missed.
+    #[test]
+    fn test_collect_split_edit_keys_csq_recurses_into_subquery_where() {
+        // Inner CSQ that lives inside the outer EXISTS subquery's where.
+        let inner_csq = make_csq(vec!["nested_field"], vec!["nf_id"], "grandchildren");
+        let inner_where = Condition::CorrelatedSubquery {
+            related: inner_csq,
+            op: "EXISTS".to_string(),
+            flip: None,
+            scalar: None,
+        };
+        // Outer CSQ whose subquery has an EXISTS in its where.
+        let outer_csq = make_csq_with_where(
+            vec!["owner_id"],
+            vec!["parent_id"],
+            "children",
+            inner_where,
+        );
+        let mut ast = empty_parent_ast();
+        ast.where_cond = Some(Box::new(Condition::CorrelatedSubquery {
+            related: outer_csq,
+            op: "EXISTS".to_string(),
+            flip: None,
+            scalar: None,
+        }));
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert!(
+            keys.contains(&"nested_field".to_string()),
+            "expected 'nested_field' (from nested EXISTS in subquery where) in keys, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"owner_id".to_string()),
+            "expected 'owner_id' (outer EXISTS parent_field) in keys, got {keys:?}"
+        );
+    }
+
+    /// D-07 regression guard: ASTs without any CorrelatedSubquery (only
+    /// Simple/And/Or) must still produce an empty key set when there is
+    /// no top-level `related`. Verifies the fix doesn't over-trigger.
+    #[test]
+    fn test_collect_split_edit_keys_no_csq_unchanged() {
+        let mut ast = empty_parent_ast();
+        ast.where_cond = Some(Box::new(Condition::And {
+            conditions: vec![
+                simple_eq_cond(),
+                Condition::Or {
+                    conditions: vec![simple_eq_cond(), simple_eq_cond()],
+                },
+            ],
+        }));
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert!(
+            keys.is_empty(),
+            "expected no split_edit_keys for non-EXISTS where, got {keys:?}"
+        );
+    }
+
+    /// Pre-existing behavior must be preserved: top-level `ast.related`
+    /// parent_fields continue to be collected.
+    #[test]
+    fn test_collect_split_edit_keys_includes_top_level_related() {
+        let mut ast = empty_parent_ast();
+        ast.related = Some(vec![*make_csq(vec!["a"], vec!["a_id"], "children")]);
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert!(
+            keys.contains(&"a".to_string()),
+            "expected top-level related parent_field 'a' in keys, got {keys:?}"
+        );
     }
 
     // ─── Persistent Pipeline Benchmark ──────────────────────────────────────
