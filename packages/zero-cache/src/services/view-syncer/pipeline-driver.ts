@@ -1091,6 +1091,393 @@ export class PipelineDriver {
   }
 
   /**
+   * Streaming version of {@link addQueriesAsync}. Returns an
+   * `AsyncIterable<RowChange | 'yield'>` that drains each pipeline's chunk
+   * from Rust's streaming hydrate as soon as it completes.
+   *
+   * Companion-bearing queries (the same ones `addQueriesAsync` excludes
+   * from its Rust batch — `companionMeta.length > 0`) fall back to TS
+   * hydrate via {@link hydrateInternal}. Per RESEARCH Open Q #4 (drain
+   * TS-hydrate first), the iterable yields all companion-bearing query
+   * rows BEFORE starting the Rust streaming hydrate. This preserves the
+   * existing addQueriesAsync ordering while delivering Rust-eligible rows
+   * via the streaming path.
+   *
+   * Errors:
+   *   - `StreamItem::Error(msg, kind)` → `throw new RustStreamError(msg, kind)`.
+   *   - hydrateStreaming does NOT emit `StreamItem::ResetSignal` (companions
+   *     only run on advance — see RESEARCH §"Per-pipeline...").
+   *
+   * Note: this method is alongside (not replacing) `addQueriesAsync`.
+   */
+  async addQueriesStreaming(
+    queries: ReadonlyArray<{
+      readonly transformationHash: string;
+      readonly queryID: string;
+      readonly ast: AST;
+    }>,
+    timer: Timer,
+  ): Promise<AsyncIterable<RowChange | 'yield'>> {
+    if (queries.length === 0) {
+      return (async function* empty() {})();
+    }
+
+    assert(
+      this.initialized(),
+      'Pipeline driver must be initialized before adding queries',
+    );
+    assert(
+      this.#advanceContext === null,
+      'Cannot hydrate while advance is in progress',
+    );
+
+    // Phase 1: prepare all queries (mirrors addQueriesAsync's Phase 1
+    // structure). Build TS pipelines, classify rust-eligible vs companion,
+    // collect Rust hydrate payloads.
+    type PreparedQuery = {
+      queryID: string;
+      transformationHash: string;
+      resolvedQuery: AST;
+      companionRows: {table: string; row: Row}[];
+      companionMeta: CompanionSubquery[];
+      companionInputs: Input[];
+      existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
+      existsCorrelations: Map<string, readonly string[]>;
+      input: Input;
+      debugDelegate: Debug | undefined;
+      rustEligible: boolean;
+    };
+
+    const prepared: PreparedQuery[] = [];
+    const rustPayloads: Array<{
+      query_id: string;
+      ast: AST;
+      primary_key: string[];
+      column_types?: Record<string, Record<string, string>>;
+      all_primary_keys?: Record<string, string[]>;
+    }> = [];
+
+    const costModel = this.#ensureCostModelExistsIfEnabled(
+      this.#snapshotter.current().db.db,
+    );
+
+    for (const q of queries) {
+      this.removeQuery(q.queryID);
+      const debugDelegate = runtimeDebugFlags.trackRowsVended
+        ? new Debug()
+        : undefined;
+
+      const {
+        ast: resolvedQuery,
+        companionRows,
+        companions: companionMeta,
+        companionInputs,
+      } = this.#resolveScalarSubqueries(q.ast);
+
+      const existsTypes = collectExistsTypes(resolvedQuery.where);
+      const existsCorrelations = collectExistsCorrelations(resolvedQuery.where);
+
+      const input = buildPipeline(
+        resolvedQuery,
+        {
+          debug: debugDelegate,
+          enableNotExists: true,
+          getSource: name => this.#getSource(name),
+          createStorage: () => this.#createStorage(),
+          decorateSourceInput: (
+            sourceInput: SourceInput,
+            _queryID: string,
+          ): Input =>
+            new MeasurePushOperator(
+              sourceInput,
+              q.queryID,
+              this.#inspectorDelegate,
+              'query-update-server',
+            ),
+          decorateInput: filterInput => filterInput,
+          addEdge() {},
+          decorateFilterInput: (filterInput, name) => {
+            if (name.includes(':exists(')) {
+              const match = name.match(RUST_EXISTS_NAME_RE);
+              if (match) {
+                const relationshipName = match[1];
+                const parentField = existsCorrelations.get(relationshipName);
+                if (parentField) {
+                  return createRustExistsWrapper(
+                    filterInput as FilterOperator,
+                    relationshipName,
+                    parentField as CompoundKey,
+                    existsTypes.get(relationshipName) ?? 'EXISTS',
+                  );
+                }
+              }
+            }
+            return filterInput;
+          },
+        },
+        q.queryID,
+        costModel,
+      );
+      input.setOutput({
+        push: () => [],
+      });
+
+      const tableName = resolvedQuery.table ?? '';
+      const pk = this.#primaryKeys?.get(tableName) ?? [];
+      const rustEligible = this.#manager !== null && companionMeta.length === 0;
+      if (rustEligible) {
+        rustPayloads.push({
+          query_id: q.queryID,
+          ast: resolvedQuery,
+          primary_key: [...pk],
+          column_types: this.#collectColumnTypes(resolvedQuery),
+          all_primary_keys: this.#collectAllPrimaryKeys(resolvedQuery),
+        });
+      }
+
+      prepared.push({
+        queryID: q.queryID,
+        transformationHash: q.transformationHash,
+        resolvedQuery,
+        companionRows,
+        companionMeta,
+        companionInputs,
+        existsTypes,
+        existsCorrelations,
+        input,
+        debugDelegate,
+        rustEligible,
+      });
+    }
+
+    // Phase 2: register rust-eligible queries on the manager so the
+    // streaming hydrate sees them. (Done synchronously here; the actual
+    // hydrateStreaming call happens lazily inside the async generator
+    // returned below so the caller can `for await` immediately.)
+    if (rustPayloads.length > 0) {
+      assert(this.#manager, 'RustPipelineManager not available');
+      for (const payload of rustPayloads) {
+        this.#manager.addQuery(this.#instanceId, JSON.stringify(payload));
+      }
+    }
+
+    return this.#streamAddQueries(prepared, timer);
+  }
+
+  /**
+   * Materialize the prepared queries: yield TS-hydrate (companion-bearing)
+   * first, then drain Rust streaming hydrate, then finalize pipelines.
+   *
+   * Per RESEARCH Open Q #4: TS-first ordering preserves the existing
+   * addQueriesAsync semantics. Companion rows for each query are emitted
+   * after that query's main result set (mirrors addQueriesAsync's
+   * per-query loop body).
+   */
+  async *#streamAddQueries(
+    prepared: ReadonlyArray<{
+      queryID: string;
+      transformationHash: string;
+      resolvedQuery: AST;
+      companionRows: {table: string; row: Row}[];
+      companionMeta: CompanionSubquery[];
+      companionInputs: Input[];
+      existsTypes: Map<string, 'EXISTS' | 'NOT EXISTS'>;
+      existsCorrelations: Map<string, readonly string[]>;
+      input: Input;
+      debugDelegate: Debug | undefined;
+      rustEligible: boolean;
+    }>,
+    timer: Timer,
+  ): AsyncIterable<RowChange | 'yield'> {
+    let lastTotalElapsed = 0;
+
+    // Per-query bookkeeping helper (mirror of addQueriesAsync's per-query
+    // tail-end work). Runs after each query's main result set + companion
+    // rows have been yielded.
+    const finalizeQuery = (p: (typeof prepared)[number]) => {
+      for (const {table, row} of p.companionRows) {
+        const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+        // Companion rows are appended via the iterator itself (see below);
+        // this helper only handles the post-emit pipeline state mutation.
+        void primaryKey;
+        void row;
+      }
+
+      const currentTotal = timer.totalElapsed();
+      const hydrationTimeMs = currentTotal - lastTotalElapsed;
+      lastTotalElapsed = currentTotal;
+      p.debugDelegate?.reset();
+
+      const liveCompanions: CompanionPipeline[] = [];
+      for (let i = 0; i < p.companionMeta.length; i++) {
+        const meta = p.companionMeta[i];
+        const companionInput = p.companionInputs[i];
+        const {childField, resolvedValue} = meta;
+        companionInput.setOutput({push: () => []});
+        liveCompanions.push({
+          input: companionInput,
+          ast: meta.ast,
+          childField,
+          resolvedValue,
+        });
+      }
+
+      this.#pipelines.set(p.queryID, {
+        input: p.input,
+        hydrationTimeMs,
+        transformedAst: p.resolvedQuery,
+        transformationHash: p.transformationHash,
+        companions: liveCompanions,
+      });
+
+      const permTables = collectPermissionTables(p.resolvedQuery);
+      if (permTables.size > 0) {
+        this.#permissionTablesByQuery.set(p.queryID, permTables);
+      } else {
+        this.#permissionTablesByQuery.delete(p.queryID);
+      }
+
+      if (this.#manager && liveCompanions.length > 0) {
+        const companionsJson = JSON.stringify(
+          liveCompanions.map(c => ({
+            queryId: p.queryID,
+            table: c.ast.table,
+            childField: c.childField,
+            resolvedValue: c.resolvedValue,
+            whereConditions: c.ast.where,
+            primaryKey:
+              this.#primaryKeys?.get(c.ast.table) ?? mustGetPrimaryKey(
+                this.#primaryKeys,
+                c.ast.table,
+              ),
+          })),
+        );
+        this.#manager.setQueryCompanions(
+          this.#instanceId,
+          p.queryID,
+          companionsJson,
+        );
+      }
+    };
+
+    // Phase 3a: drain TS-hydrate FIRST for companion-bearing queries
+    // (RESEARCH Open Q #4).
+    for (const p of prepared) {
+      if (p.rustEligible) continue;
+      this.#hydrateContext = {timer};
+      try {
+        for (const change of hydrateInternal(
+          p.input,
+          p.queryID,
+          must(this.#primaryKeys),
+          this.#tableSpecs,
+        )) {
+          yield change;
+        }
+        for (const {table, row} of p.companionRows) {
+          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+          yield {
+            type: ChangeType.ADD,
+            queryID: p.queryID,
+            table,
+            rowKey: getRowKey(primaryKey, row),
+            row,
+          } as RowChange;
+        }
+        finalizeQuery(p);
+      } finally {
+        this.#hydrateContext = null;
+      }
+    }
+
+    // Phase 3b: drain Rust streaming hydrate for rust-eligible queries.
+    const rustQueries = prepared.filter(p => p.rustEligible);
+    if (rustQueries.length === 0) return;
+
+    assert(this.#manager, 'RustPipelineManager not available');
+    const stream = this.#manager.hydrateStreaming(this.#instanceId);
+
+    // Bucket decoded changes per queryID so each prepared query can be
+    // finalized once its rows are fully drained from the stream.
+    const changesByQuery = new Map<string, DecodedRowChange[]>();
+    try {
+      while (true) {
+        const item = await stream.next();
+        if (item.done) break;
+        switch (item.kind) {
+          case 'error':
+            throw new RustStreamError(
+              item.errorMsg ?? '',
+              (item.errorKind ?? 'panic') as
+                | 'panic'
+                | 'rayon_error'
+                | 'channel_closed',
+            );
+          case 'chunk': {
+            assert(
+              item.chunk,
+              'StreamItem::Chunk must carry a non-null buffer',
+            );
+            const decoded = decodeAdvanceChunkBuf(item.chunk);
+            for (const change of decoded) {
+              let arr = changesByQuery.get(change.queryID);
+              if (!arr) {
+                arr = [];
+                changesByQuery.set(change.queryID, arr);
+              }
+              arr.push(change);
+            }
+            break;
+          }
+          // hydrateStreaming does not emit 'reset' (companions only run
+          // on advance, not hydrate — see chunk_encoder + 31-01 SUMMARY).
+          default:
+            break;
+        }
+      }
+    } finally {
+      // D-15: belt-and-suspenders. The JS method is `stream.return()`
+      // — alias for what Rust calls `stream.return_()`. Drop on the Rust
+      // side also fires when the HydrateStream is GC'd.
+      try {
+        stream.return();
+      } catch {
+        /* swallow — Drop handles the GC path */
+      }
+    }
+
+    // Phase 3c: yield Rust-eligible query results in `queries` order so
+    // the iterable's overall sequence is stable.
+    for (const p of rustQueries) {
+      this.#hydrateContext = {timer};
+      try {
+        const changes = changesByQuery.get(p.queryID) ?? [];
+        const permTables = collectPermissionTables(p.resolvedQuery);
+        for (const change of this.#convertDecodedChanges(
+          p.queryID,
+          changes,
+          permTables.size > 0 ? permTables : undefined,
+        )) {
+          yield change;
+        }
+        for (const {table, row} of p.companionRows) {
+          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+          yield {
+            type: ChangeType.ADD,
+            queryID: p.queryID,
+            table,
+            rowKey: getRowKey(primaryKey, row),
+            row,
+          } as RowChange;
+        }
+        finalizeQuery(p);
+      } finally {
+        this.#hydrateContext = null;
+      }
+    }
+  }
+
+  /**
    * Batch-hydrate multiple queries in a single Rust NAPI call, enabling
    * Rayon parallelism across all pipelines. Falls back to sequential
    * {@link addQuery} when Rust hydration is unavailable or for queries

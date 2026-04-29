@@ -333,3 +333,70 @@ describe('advanceStreaming + RustStreamError', () => {
     }
   });
 });
+
+describe('addQueriesStreaming', () => {
+  let lc: LogContext;
+  let fxA: Fixture | undefined;
+  let fxB: Fixture | undefined;
+
+  beforeEach(() => {
+    lc = createSilentLogContext();
+  });
+
+  afterEach(() => {
+    fxA?.destroy();
+    fxB?.destroy();
+    fxA = undefined;
+    fxB = undefined;
+  });
+
+  test('parity with addQueriesAsync for rust-eligible queries', async () => {
+    fxA = setupFixture('addq_a', lc);
+    fxB = setupFixture('addq_b', lc);
+
+    const queries = [
+      {transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS},
+    ];
+
+    // Buffered (existing): addQueriesAsync returns Iterable.
+    const bufferedIter = await fxA.pipelines.addQueriesAsync(
+      queries,
+      fxA.startTimer(),
+    );
+    const buffered: RowChange[] = [];
+    for (const c of bufferedIter) {
+      if (c !== 'yield') buffered.push(c);
+    }
+
+    // Streaming: addQueriesStreaming returns AsyncIterable.
+    const streamingIter = await fxB.pipelines.addQueriesStreaming(
+      queries,
+      fxB.startTimer(),
+    );
+    const streaming: RowChange[] = [];
+    for await (const c of streamingIter) {
+      if (c !== 'yield') streaming.push(c);
+    }
+
+    expect(streaming.length).toBeGreaterThan(0);
+    expect(sortChanges(streaming)).toEqual(sortChanges(buffered));
+  });
+
+  test('returns empty iterable when no queries are passed', async () => {
+    fxA = setupFixture('addq_empty', lc);
+
+    const iter = await fxA.pipelines.addQueriesStreaming([], fxA.startTimer());
+    const collected: RowChange[] = [];
+    for await (const c of iter) {
+      if (c !== 'yield') collected.push(c);
+    }
+    expect(collected).toEqual([]);
+  });
+
+  // Companion-bearing query parity test deferred to Phase 32 view-syncer
+  // integration suite (mirrors 31-01 TEST-02's #[ignore] for the same
+  // reason: companion test fixtures don't exist for this surface yet).
+  // The TS-hydrate-first ordering contract is structurally enforced by
+  // `#streamAddQueries`'s explicit Phase 3a → 3b ordering — see grep for
+  // "Phase 3a: drain TS-hydrate FIRST" in pipeline-driver.ts.
+});
