@@ -37,6 +37,35 @@ npm run test-rs
 
 See [INDEX.md](INDEX.md) for which doc to read for each goal.
 
+### Golden-snapshot mode (decoupled Rust IVM testing)
+
+Capture TS reference output once, replay against Rust IVM repeatedly without
+needing the TS server up. Useful when iterating on Rust IVM and you don't
+want to spin up the full dual-exec setup every cycle.
+
+```bash
+# 1) Capture: starts TS-only zero-cache, runs every AST in ast_corpus.json,
+#    writes (hydrate, advance) per AST → golden_outputs.json (~5–20MB).
+#    Run once after a TS IVM update or mutation-block change.
+./run-capture-golden.sh           # full corpus
+./run-capture-golden.sh 100       # first 100 ASTs
+
+# 2) Replay: starts RS-only zero-cache, replays the golden through the
+#    Rust IVM, diffs hydrate + advance per AST. Takes ~9s for full corpus.
+#    Run any time you change Rust IVM code.
+./run-replay-golden.sh
+# Exit 0 = match, 1 = divergence/error, 2 = mutation-block drift (regen needed)
+
+# Outputs:
+#   golden_outputs.json          — pinned reference (checked in if desired)
+#   replay_run.json              — machine-readable replay results
+#   replay_divergences.md        — markdown summary of any divergences
+```
+
+The capture's `MUTATIONS_FINGERPRINT` is embedded in `golden_outputs.json`;
+the replay refuses to run if `harness-golden-shared.ts`'s mutation block
+has drifted from the captured one (regenerate via capture first).
+
 ---
 
 ## Test surface — three independent things to run

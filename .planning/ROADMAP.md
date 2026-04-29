@@ -151,11 +151,11 @@ Plans:
 3. Any divergence found by the fuzzer becomes a regression test in the appropriate `*_op.rs` or `pipeline-driver.*.test.ts` before being fixed, so it can never regress silently.
 4. Full vitest + `cargo test` suites continue to pass; new fuzz runs at 1k iterations in <2 minutes (fits CI budget).
 
-**Plans:** 7 plans
+**Plans:** 1/7 plans executed
 
 Plans:
 
-- [ ] 34-01-PLAN.md — Wave 0 scaffolding: fast-check skeleton (arb-ast/harness-fuzz/random-ast-fuzz) + allow-list config + red-state Rust unit-test stubs for B1/B2/B3/B11 (Wave 0)
+- [x] 34-01-PLAN.md — Wave 0 scaffolding: fast-check skeleton (arb-ast/harness-fuzz/random-ast-fuzz) + allow-list config + red-state Rust unit-test stubs for B1/B2/B3/B11 (Wave 0)
 - [ ] 34-02-PLAN.md — Track 2 B1 (Skip ordering) + B2 (parent_sizes max(1)) surgical fixes + B1/B2 differential test (Wave 1)
 - [ ] 34-03-PLAN.md — Track 1 fast-check generator full operator surface + targeted B1/B2/B3 arbs + 100-iter timing probe (Wave 1, parallel)
 - [ ] 34-04-PLAN.md — FUZZ-02 schema extension: events/big_id_records/event_tags + jsonb/timestamptz/numeric/bigint + NULL/i64/DST/jsonb fixtures + MUTATIONS additions (Wave 1, parallel)
@@ -173,7 +173,7 @@ Plans:
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
 | 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
 | 33. Production Hardening + Benchmarks       | 3/3            | Complete    | 2026-04-29 |
-| 34. Differential Fuzz + Schema Extension    | 0/7            | Planned     | —          |
+| 34. Differential Fuzz + Schema Extension    | 1/7            | In Progress |            |
 
 ---
 
