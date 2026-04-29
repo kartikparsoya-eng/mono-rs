@@ -593,4 +593,322 @@ mod tests {
         let result = op.push(edit);
         assert!(result.is_empty(), "expected no emit, got {:?}", result);
     }
+
+    // ===== Phase 33-02 (HARDEN-02): exists_op.rs parity test additions =====
+    // These mirror the categorical structure of exists_op.rs::tests
+    // (fetch / parent push / child push / edit-no-or_predicate / cache /
+    // in-push flag / different-relationship passthrough / OR-branch
+    // combinations / builder-spec parity). All are pure additions inside
+    // `mod tests`; production code (lines 1-446) is unchanged per D-28.
+
+    /// Mirror of exists_op.rs::tests::make_node_with_parent — child rows for
+    /// fetch/push tests.
+    fn make_node_with_parent(id: i64, parent_id: i64) -> Node {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        row.insert("parent_id".to_string(), serde_json::json!(parent_id));
+        Node {
+            row,
+            relationships: HashMap::new(),
+        }
+    }
+
+    /// Build a single-branch OrExistsOperator with parent_key=["id"],
+    /// child_key=["parent_id"], not_exists=false, and no or_predicate.
+    /// Mirrors the most common ExistsOperator fixture in exists_op.rs.
+    fn build_or_exists_simple_branch(
+        parents: Vec<Node>,
+        children: Vec<Node>,
+    ) -> OrExistsOperator {
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: parents });
+        let child_source: Box<dyn Operator> = Box::new(MockInput { nodes: children });
+        let branches = vec![(
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )];
+        OrExistsOperator::new(parent_source, branches, None)
+    }
+
+    /// Build a two-branch OrExistsOperator with two child sets and two
+    /// distinct relationships. Each branch: parent_key=["id"],
+    /// child_key=["parent_id"], not_exists=false. Used for OR-branch
+    /// combination tests (Task 3).
+    fn build_or_exists_two_branches(
+        parents: Vec<Node>,
+        ch_a: Vec<Node>,
+        ch_b: Vec<Node>,
+    ) -> OrExistsOperator {
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: parents });
+        let child_source_a: Box<dyn Operator> = Box::new(MockInput { nodes: ch_a });
+        let child_source_b: Box<dyn Operator> = Box::new(MockInput { nodes: ch_b });
+        let branches = vec![
+            (
+                child_source_a,
+                "children_a".to_string(),
+                false,
+                vec!["id".to_string()],
+                vec!["parent_id".to_string()],
+            ),
+            (
+                child_source_b,
+                "children_b".to_string(),
+                false,
+                vec!["id".to_string()],
+                vec!["parent_id".to_string()],
+            ),
+        ];
+        OrExistsOperator::new(parent_source, branches, None)
+    }
+
+    // ─── Category: Fetch (3 tests) ──────────────────────────────────────────
+
+    #[test]
+    fn test_or_exists_fetch_filters_parents_without_children() {
+        // Mirror of exists_op.rs:441-464. MockInput doesn't filter by
+        // constraint, so all parents will appear to have children — the
+        // assertion is "result is not empty" (caveat documented in
+        // exists_op.rs:460-462).
+        let parents = vec![make_node(1), make_node(2), make_node(3)];
+        let children = vec![make_node_with_parent(10, 1), make_node_with_parent(30, 3)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let result = op.fetch(&FetchRequest::default());
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_or_exists_fetch_or_predicate_short_circuits() {
+        // 1 parent with status=active passes via or_predicate even without
+        // children (mirrors exists_op.rs::test_or_predicate_bypasses_exists_check).
+        let mut active_parent = make_node(1);
+        active_parent.row.insert("status".to_string(), serde_json::json!("active"));
+        let mut inactive_parent = make_node(2);
+        inactive_parent.row.insert("status".to_string(), serde_json::json!("inactive"));
+
+        let parent_source: Box<dyn Operator> = Box::new(MockInput {
+            nodes: vec![active_parent, inactive_parent],
+        });
+        let child_source: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let branches = vec![(
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )];
+        let mut op = OrExistsOperator::new(
+            parent_source,
+            branches,
+            Some(Predicate::Eq(
+                "status".to_string(),
+                Value::String("active".to_string()),
+            )),
+        );
+
+        let result = op.fetch(&FetchRequest::default());
+        // Only parent with status=active should pass (no matching children
+        // for either, but predicate matches the active one).
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+    }
+
+    #[test]
+    fn test_or_exists_fetch_with_parent_constraint() {
+        // Verify the operator forwards the constraint without panicking.
+        // MockInput ignores constraints (same caveat as exists_op.rs).
+        let parents = vec![make_node(1), make_node(2)];
+        let children = vec![make_node_with_parent(10, 1), make_node_with_parent(20, 2)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let req = FetchRequest {
+            constraint: Some(Constraint::from_pairs(vec![(
+                "id".to_string(),
+                serde_json::json!(1),
+            )])),
+            start: None,
+            reverse: false,
+        };
+        let result = op.fetch(&req);
+        // MockInput returns all nodes regardless of constraint; assertion is
+        // smoke-only (call doesn't panic, vec length matches MockInput state).
+        assert_eq!(result.len(), 2);
+    }
+
+    // ─── Category: Parent push add/remove (3 tests) ─────────────────────────
+
+    #[test]
+    fn test_or_exists_push_parent_add_blocked_when_no_branches_pass() {
+        // No matching children, no or_predicate → Add(parent) returns vec![].
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+        let result = op.push(Change::Add(make_node(1)));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_or_exists_push_parent_add_passes_via_or_predicate() {
+        // No children, or_predicate matches status=active → emit Add.
+        let mut active = make_node(1);
+        active.row.insert("status".to_string(), serde_json::json!("active"));
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: vec![active.clone()] });
+        let child_source: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let branches = vec![(
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )];
+        let mut op = OrExistsOperator::new(
+            parent_source,
+            branches,
+            Some(Predicate::Eq(
+                "status".to_string(),
+                Value::String("active".to_string()),
+            )),
+        );
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Add(active));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    #[test]
+    fn test_or_exists_push_parent_remove_emits_when_was_passing() {
+        // Parent has matching child — was passing in fetch — Remove emits.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Remove(make_node(1)));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Remove(_)));
+    }
+
+    // ─── Category: Child push add/remove (5 tests, including
+    //               passthrough cases from exists_op.rs:704-737) ────────────
+
+    #[test]
+    fn test_or_exists_push_child_add_0_to_1_transition() {
+        // Mirror of exists_op.rs:466-500. No children initially, push
+        // child Add → 0→1 transition → emits Add(parent).
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(10, 1))),
+            },
+        };
+        let result = op.push(child_add);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(n) if n.row.get("id").unwrap() == &serde_json::json!(1)));
+    }
+
+    #[test]
+    fn test_or_exists_push_child_remove_1_to_0_transition() {
+        // Mirror of exists_op.rs:536-578. 1 child cached, push child
+        // Remove → 1→0 transition → emits Remove(parent).
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+        // After fetch, branch[0].parent_sizes has the parent at count=1.
+        let child_remove = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Remove(make_node_with_parent(10, 1))),
+            },
+        };
+        let result = op.push(child_remove);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Remove(n) if n.row.get("id").unwrap() == &serde_json::json!(1)));
+    }
+
+    #[test]
+    fn test_or_exists_push_different_relationship_child_passthrough() {
+        // Mirror of exists_op.rs:704-737. Child change for relationship NOT
+        // matching any branch passes through if the exists filter holds.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_change = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "other_rel".to_string(),
+                change: Box::new(Change::Add(make_node(99))),
+            },
+        };
+        let result = op.push(child_change);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_or_exists_push_child_edit_passthrough() {
+        // Mirror of exists_op.rs:737-780. Child Edit (not add/remove) passes
+        // through unchanged if the exists filter holds.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_child_row = Row::new();
+        old_child_row.insert("id".to_string(), serde_json::json!(10));
+        old_child_row.insert("parent_id".to_string(), serde_json::json!(1));
+        let mut new_child_row = Row::new();
+        new_child_row.insert("id".to_string(), serde_json::json!(10));
+        new_child_row.insert("parent_id".to_string(), serde_json::json!(1));
+        new_child_row.insert("name".to_string(), serde_json::json!("updated"));
+
+        let child_edit = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Edit {
+                    node: Node { row: new_child_row, relationships: HashMap::new() },
+                    old_node: Node { row: old_child_row, relationships: HashMap::new() },
+                }),
+            },
+        };
+        let result = op.push(child_edit);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_or_exists_push_child_add_other_branch_already_passing() {
+        // 2 branches: branch A has matching child (passing), branch B has
+        // none. Push child add to B → other_branches_pass already true via
+        // A → Child passthrough (1 emit, no transition).
+        let parents = vec![make_node(1)];
+        let ch_a = vec![make_node_with_parent(10, 1)];
+        let ch_b: Vec<Node> = vec![];
+        let mut op = build_or_exists_two_branches(parents, ch_a, ch_b);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let child_add_b = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children_b".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(20, 1))),
+            },
+        };
+        let result = op.push(child_add_b);
+        // Branch B transitions 0→1, but parent was already passing via A.
+        // The 4-case logic in push_impl emits the inner change as a
+        // passthrough (now_passing && was_passing && not transition).
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Child { .. }));
+    }
 }
