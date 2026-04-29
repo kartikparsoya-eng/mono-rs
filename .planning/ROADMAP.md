@@ -108,20 +108,41 @@ Plans:
 
 ---
 
-### Phase 33: Performance Tuning + Benchmarks
+### Phase 33: Production Hardening + Benchmarks
 
-**Goal:** Confirm the architectural promise of streaming — TTFB drops from `max(pipeline_time)` to `min(pipeline_time)` — and bound the channel so straggler pipelines don't accumulate unbounded chunks. Measure peak Rust heap to confirm streaming reduces it from `O(total_changes)` to `O(max_pipeline_changes)`.
+**Goal:** Layered defense before shipping the Rust IVM port to production. Wire `dualExecCompare` into the pipeline-driver hot path so every existing vitest run becomes a TS↔Rust parity check; close the OrExists test breadth gap (currently 4.4× behind Exists); deliver the streaming PERF benchmarks (TTFB and peak heap) deferred from Phases 31/32. Out of scope for this phase: random-AST differential fuzz and schema-extended fuzz (moved to Phase 34).
 
 **Depends on:** Phase 32
 
-**Requirements:** PERF-01, PERF-02, PERF-03
+**Requirements:** HARDEN-01, HARDEN-02, PERF-01, PERF-02, PERF-03
 
 **Success Criteria** (what must be TRUE):
 
-1. The Rust streaming channel is `mpsc::sync_channel(pipeline_count)` (bounded), so each pipeline can buffer at most one chunk before the receiver pulls; verified by a Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
-2. A microbenchmark (extending `rust-ivm-bench.ts` or new file) configures N pipelines with one slow tail pipeline and asserts that time-to-first-chunk is within ~1.5x of `min(pipeline_time)` (not `max`). Result is recorded in the benchmark output for trend tracking.
-3. Peak Rust heap during a representative advance/hydrate batch is measured (via `jemalloc-stats` or equivalent) and is `O(max_pipeline_changes)` rather than `O(total_changes)` — verified by running the same workload through buffered `advanceAsync` and streaming `advanceStreaming` and showing the streaming peak is at least ~Nx smaller for an N-pipeline workload with balanced output.
-4. Full vitest + `cargo test` suite continues to pass; benchmark numbers are committed to `.planning/milestones/v5.0-bench-results.md` for posterity.
+1. `dualExecCompare` (already exists at `packages/zero-cache/src/services/view-syncer/dual-executor.ts:283`) is invoked from `pipeline-driver.ts` `advanceAsync` / `hydrateAsync` paths under a feature flag (e.g., `ZQLITE_RS_PARITY_CHECK=true`), so any test that exercises pipeline-driver becomes a TS-vs-Rust differential check. Log + count divergences; in strict mode, throw on divergence. Default off in CI; on for the parity-check vitest run added by this phase.
+2. `or_exists_op.rs` test count reaches parity with `exists_op.rs` patterns (target: ≥30 tests in or_exists_op.rs vs the current 10; matched against the test categories in exists_op.rs — fetch, push, hydrate, edit-with/without-or-predicate, transition matrix, in_push re-entrancy, framework-invariant assertions, builder-spec parity).
+3. The Rust streaming channel is bounded (`mpsc::sync_channel(pipeline_count.max(1) + 1)` per Phase 31 `D-16`); verified by a new Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
+4. A microbenchmark (extending `rust-ivm-bench.ts` or new file) configures N pipelines with one slow tail pipeline and asserts that time-to-first-chunk is within ~1.5× of `min(pipeline_time)` (not `max`). Result recorded in `.planning/milestones/v5.0-bench-results.md`.
+5. Peak Rust heap during a representative advance/hydrate batch is measured and shown to be `O(max_pipeline_changes)` rather than `O(total_changes)` — verified by running the same workload through buffered `advanceAsync` and streaming `advanceStreaming` and showing the streaming peak is at least ~Nx smaller for an N-pipeline workload with balanced output.
+6. Full vitest + `cargo test` suites continue to pass; benchmark numbers committed to `.planning/milestones/v5.0-bench-results.md` for posterity.
+
+**Plans:** TBD
+
+---
+
+### Phase 34: Differential Fuzz + Schema Extension
+
+**Goal:** Close the largest remaining correctness gap — bugs the per-operator unit tests and the streaming-vs-buffered fuzz cannot catch because they live at AST shapes nobody wrote tests for, or at type-coercion boundaries the harness's basic-types schema doesn't exercise. Build a property-based differential fuzzer that generates random `(schema, AST, data, change-stream)` tuples and asserts TS↔Rust IVM produce identical results.
+
+**Depends on:** Phase 33
+
+**Requirements:** FUZZ-01, FUZZ-02
+
+**Success Criteria** (what must be TRUE):
+
+1. New file `packages/zero-cache/src/services/view-syncer/random-ast-parity.fuzz.test.ts` (or in `tools/ivm-parity/`) uses `fast-check` to generate random ASTs across the full operator surface (filter, join, exists, or-exists, take, cap) and runs each through the existing TS oracle and the Rust IVM, asserting result-set equality. `FUZZ_NUM_RUNS=1000` default; expandable.
+2. The fuzz harness's schema is extended with rich production-relevant types: `jsonb`, `timestamptz`, `numeric`, nullable variants, and at least one composite/array column. Test fixtures cover NULL semantics (NULL ≠ NULL in equality, NULL propagation in arithmetic, NULL in JOIN keys) and type coercion (string→number, numeric precision boundaries, date/time round-trips).
+3. Any divergence found by the fuzzer becomes a regression test in the appropriate `*_op.rs` or `pipeline-driver.*.test.ts` before being fixed, so it can never regress silently.
+4. Full vitest + `cargo test` suites continue to pass; new fuzz runs at 1k iterations in <2 minutes (fits CI budget).
 
 **Plans:** TBD
 
@@ -134,14 +155,15 @@ Plans:
 | 30. Audit Fixes                             | 5/5            | Complete    | 2026-04-29 |
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
 | 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
-| 33. Performance Tuning + Benchmarks         | 0/0            | Not started | —          |
+| 33. Production Hardening + Benchmarks       | 0/0            | Not started | —          |
+| 34. Differential Fuzz + Schema Extension    | 0/0            | Not started | —          |
 
 ---
 
 ## Coverage
 
-- v5.0 requirements: 29
-- Mapped: 29 (100%)
+- v5.0 requirements: 33
+- Mapped: 33 (100%)
 - Orphans: 0
 
 | Phase    | Requirement count | Requirement IDs                                                                                                                                                                    |
@@ -149,4 +171,5 @@ Plans:
 | Phase 30 | 4                 | AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04                                                                                                                                             |
 | Phase 31 | 18                | STREAM-01, STREAM-02, STREAM-03, STREAM-04, STREAM-05, STREAM-06, WRAP-01, WRAP-02, WRAP-03, WRAP-04, COMPAT-01, COMPAT-02, COMPAT-03, TEST-01, TEST-02, TEST-03, TEST-04, TEST-05 |
 | Phase 32 | 4                 | MIGRATE-01, MIGRATE-02, MIGRATE-03, MIGRATE-04                                                                                                                                     |
-| Phase 33 | 3                 | PERF-01, PERF-02, PERF-03                                                                                                                                                          |
+| Phase 33 | 5                 | HARDEN-01, HARDEN-02, PERF-01, PERF-02, PERF-03                                                                                                                                    |
+| Phase 34 | 2                 | FUZZ-01, FUZZ-02                                                                                                                                                                   |

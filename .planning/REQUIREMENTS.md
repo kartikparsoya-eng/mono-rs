@@ -52,11 +52,21 @@
 - [x] **TEST-04**: TS test — parity with buffered path on a fixed input (same RowChanges modulo cross-pipeline ordering).
 - [x] **TEST-05**: TS test — `iterator.return()` (e.g., `for await { break }`) calls Rust `stream.return_()` and stops work.
 
-### Performance / Tuning
+### Production Hardening (Phase 33)
 
-- [ ] **PERF-01**: Bounded `mpsc::sync_channel(pipeline_count)` so stragglers don't accumulate unbounded.
-- [ ] **PERF-02**: Microbenchmark in `rust-ivm-bench.ts` (or new file) — N pipelines with one slow tail pipeline; assert TTFB ~min(pipeline_time), not max.
+- [ ] **HARDEN-01**: Wire `dualExecCompare` (already exists at `dual-executor.ts:283`) into `pipeline-driver.ts` `advanceAsync` / `hydrateAsync` paths under feature flag `ZQLITE_RS_PARITY_CHECK` (default off in CI; on for the dedicated parity-check vitest run added by this phase). Every existing test that exercises pipeline-driver becomes a TS-vs-Rust differential check. Log + count divergences; in strict mode (`ZQLITE_RS_PARITY_CHECK=strict`), throw on divergence.
+- [ ] **HARDEN-02**: Expand `or_exists_op.rs` test coverage to ≥30 tests, matching the categories in `exists_op.rs` (44 tests today). Cover: fetch, push, hydrate, edit-with/without-or-predicate, all 4 transitions per AUDIT-04, in_push re-entrancy, framework-invariant assertions, builder-spec parity. Closes the 4.4× test-breadth gap.
+
+### Performance / Tuning (Phase 33)
+
+- [ ] **PERF-01**: Bounded `mpsc::sync_channel(pipeline_count.max(1) + 1)` already shipped in Phase 31 per CONTEXT D-16 + research deviation; this requirement adds the Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
+- [ ] **PERF-02**: Microbenchmark in `rust-ivm-bench.ts` (or new file) — N pipelines with one slow tail pipeline; assert TTFB ~min(pipeline_time), not max. Records to `.planning/milestones/v5.0-bench-results.md`.
 - [ ] **PERF-03**: Memory peak measurement — peak Rust heap drops from `O(total_changes)` to `O(max_pipeline_changes)` during advance/hydrate.
+
+### Differential Fuzz + Schema Extension (Phase 34)
+
+- [ ] **FUZZ-01**: Random-AST differential fuzz against TS oracle. New `random-ast-parity.fuzz.test.ts` (or `tools/ivm-parity/` test) uses `fast-check` to generate random ASTs across the full operator surface (filter, join, exists, or-exists, take, cap) and asserts TS↔Rust IVM produce identical result sets. `FUZZ_NUM_RUNS=1000` default. Any divergence becomes a regression test before being fixed.
+- [ ] **FUZZ-02**: Schema-extension — fuzz harness's schema gains rich production-relevant types: `jsonb`, `timestamptz`, `numeric`, nullable variants, at least one composite/array column. Tests cover NULL semantics (NULL ≠ NULL in equality, NULL propagation, NULL in JOIN keys) and type coercion (string→number, numeric precision, date/time round-trips).
 
 ### Audit Bug Fixes (from `.planning/IVM-PORT-AUDIT.md`)
 
@@ -108,9 +118,13 @@
 | TEST-03    | Phase 31 | Not started |
 | TEST-04    | Phase 31 | Not started |
 | TEST-05    | Phase 31 | Not started |
+| HARDEN-01  | Phase 33 | Not started |
+| HARDEN-02  | Phase 33 | Not started |
 | PERF-01    | Phase 33 | Not started |
 | PERF-02    | Phase 33 | Not started |
 | PERF-03    | Phase 33 | Not started |
+| FUZZ-01    | Phase 34 | Not started |
+| FUZZ-02    | Phase 34 | Not started |
 | AUDIT-01   | Phase 30 | Not started |
 | AUDIT-02   | Phase 30 | Not started |
 | AUDIT-03   | Phase 30 | Not started |
