@@ -22,7 +22,8 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 - [x] **Phase 30: Audit Fixes** — Ship the 4 IVM port audit fixes on a known-correct baseline before building streaming on top. (4/5 plans complete; gap-closure plan 30-05 pending — closes AUDIT-02 end-to-end) (completed 2026-04-29)
 - [x] **Phase 31: Rust Streaming Primitives + TS Wrappers** — Additive Rust napi streaming methods + TS PipelineDriver wrappers + decoder; no consumer migrated yet. (completed 2026-04-29)
 - [x] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete. (completed 2026-04-29)
-- [ ] **Phase 33: Performance Tuning + Benchmarks** — Bounded channel, TTFB benchmark, memory peak measurement.
+- [ ] **Phase 33: Production Hardening + Benchmarks** — TS↔Rust parity wiring (dualExecCompare via lifted TS oracle), OrExists test breadth, bounded channel test, TTFB benchmark, memory peak measurement.
+- [ ] **Phase 34: Differential Fuzz + Schema Extension** — Random-AST fuzz vs TS oracle; rich-type schema (jsonb, timestamptz, numeric, NULL semantics) for type-coercion coverage.
 
 ---
 
@@ -125,7 +126,13 @@ Plans:
 5. Peak Rust heap during a representative advance/hydrate batch is measured and shown to be `O(max_pipeline_changes)` rather than `O(total_changes)` — verified by running the same workload through buffered `advanceAsync` and streaming `advanceStreaming` and showing the streaming peak is at least ~Nx smaller for an N-pipeline workload with balanced output.
 6. Full vitest + `cargo test` suites continue to pass; benchmark numbers committed to `.planning/milestones/v5.0-bench-results.md` for posterity.
 
-**Plans:** TBD
+**Plans:** 3 plans
+
+Plans:
+
+- [ ] 33-01-PLAN.md — HARDEN-01: TS oracle lift + dualExecCompare sampling shim wired into pipeline-driver.ts (Wave 1)
+- [ ] 33-02-PLAN.md — HARDEN-02: Expand or_exists_op.rs test coverage from 5 to ≥22 tests (Wave 1, parallel with 33-01)
+- [ ] 33-03-PLAN.md — PERF-01 + PERF-02 + PERF-03: Channel-block test + TTFB bench + memory-peak bench + bench-results.md (Wave 1, parallel with 33-01/02)
 
 ---
 
@@ -155,7 +162,7 @@ Plans:
 | 30. Audit Fixes                             | 5/5            | Complete    | 2026-04-29 |
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
 | 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
-| 33. Production Hardening + Benchmarks       | 0/0            | Not started | —          |
+| 33. Production Hardening + Benchmarks       | 0/3            | Not started | —          |
 | 34. Differential Fuzz + Schema Extension    | 0/0            | Not started | —          |
 
 ---
