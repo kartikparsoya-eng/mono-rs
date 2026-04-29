@@ -223,22 +223,3 @@ Plans:
 4. NOT EXISTS advance test added
 5. `test.todo` for `rust_fan_out vs TS` in fuzz-ivm.test.ts implemented
 6. All 29 existing tests still pass, dual-exec strict mode passes
-
----
-
-## Summary
-
-| Phase | Name                                   | Requirements           | Depends On | Criteria   |
-| ----- | -------------------------------------- | ---------------------- | ---------- | ---------- |
-| 20    | Rust Operator Trait & Pipeline Builder | 4/4                    | Complete   | 2026-04-21 |
-| 21    | Rust TableSource + Connection Pool     | SRC-01, SRC-02, SRC-03 | Complete   | 2026-04-21 |
-| 22    | Parallel Multi-Pipeline Hydration      | HYD-01, HYD-02, HYD-03 | 20, 21     | 8          |
-| 23    | Within-Pipeline Child Parallelism      | JFO-01, JFO-02         | 22         | 5          |
-| 24    | Parallel Advance (Full Operator Tree)  | ADV-01, ADV-02, ADV-03 | 20, 21     | 7          |
-| 25    | Serialization Format & FFI             | SER-01, SER-02         | 22, 24     | 5          |
-| 26    | Pipeline-Driver TS Integration         | INT-01, INT-02, INT-03 | 22, 24, 25 | 7          |
-| 27    | Cross-ViewSyncer Poke Dispatch         | XVS-01, XVS-02         | 24, 26     | 6          |
-| 28    | E2E Validation & Benchmarks            | E2E-01, E2E-02, BEN-01 | 26, 27     | 7          |
-| 29    | Dual-Exec Correctness Hardening        | COR-01..04             | 28         | 6          |
-
-**10 phases** | **22 requirements** | Dependency graph has two parallel tracks (hydration: 20→21→22→23, advance: 20→21→24) converging at Phase 26

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: milestone
-status: complete
-stopped_at: All phases complete
-last_updated: '2026-04-22T11:23:00.000Z'
-last_activity: 2026-04-22 -- Phase 29 complete: Dual-Exec Correctness Hardening
+status: completed
+stopped_at: Phase 29 added
+last_updated: '2026-04-29T06:16:52.013Z'
+last_activity: 2026-04-22 -- Phase 29 verified and complete
 progress:
   total_phases: 11
-  completed_phases: 11
-  total_plans: 22
-  completed_plans: 22
-  percent: 100
+  completed_phases: 5
+  total_plans: 17
+  completed_plans: 12
+  percent: 71
 ---
 
 # Project State
@@ -59,6 +59,7 @@ Last activity: 2026-04-22 -- Phase 29 verified and complete
 
 - Phase 19.5 inserted before Phase 20: Dual-Execution Correctness Harness (retroactively tracked, already complete)
 - Phase 29 added: Dual-Exec Correctness Hardening (close coverage gaps found in Phase 28 audit)
+- Phase 30 added: Rust IVM streaming primitives + TS wrappers (additive) — first of three streaming phases per `.planning/IVM-STREAMING-PLAN.md`
 
 ### Decisions
 
