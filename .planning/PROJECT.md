@@ -22,18 +22,20 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 - ✓ Rayon parallelism for advance fan-out (`rust_fan_out()`) — v2.0
 - ✓ 139 Rust tests + 39 integration tests, all passing — v3.0
 - ✓ E2E validation: Docker image tested against xyne-spaces, zero-cache healthy — v3.0
+- ✓ Rust Operator trait with full fetch() + push() (pipeline builder in Rust) — v4.0
+- ✓ Rust TableSource with SQLite connection pool (parallel reads) — v4.0
+- ✓ Parallel multi-pipeline hydration via Rayon — v4.0
+- ✓ Within-pipeline child parallelism (Join fan-out) — v4.0
+- ✓ Full operator tree advance in Rust (replaces filter-only rust_fan_out) — v4.0
+- ✓ Binary serialization format for Rust → TS row transfer — v4.0
+- ✓ Pipeline-driver TS integration (addQuery → Rust, advance → Rust) — v4.0
+- ✓ Cross-ViewSyncer parallel poke dispatch — v4.0
+- ✓ E2E validation + benchmark suite — v4.0
+- ✓ Dual-Exec Correctness Hardening — v4.0
 
 ### Active
 
-- [ ] Rust Operator trait with full fetch() + push() (pipeline builder in Rust)
-- [ ] Rust TableSource with SQLite connection pool (parallel reads)
-- [ ] Parallel multi-pipeline hydration via Rayon
-- [ ] Within-pipeline child parallelism (Join fan-out)
-- [ ] Full operator tree advance in Rust (replaces filter-only rust_fan_out)
-- [ ] Binary serialization format for Rust → TS row transfer
-- [ ] Pipeline-driver TS integration (addQuery → Rust, advance → Rust)
-- [ ] Cross-ViewSyncer parallel poke dispatch
-- [ ] E2E validation + benchmark suite
+(v5.0 Streaming requirements to be defined via /gsd-new-milestone)
 
 ### Out of Scope
 
@@ -82,21 +84,21 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 - **v1.0** — Rust SQLite Foundation (2026-04-20): Binary buffer protocol 1.78-1.98x faster, hot read path in Rust
 - **v2.0** — IVM Operators in Rust (2026-04-21): Filter, Join, Take, Exists operators, Rayon parallelism
 - **v3.0** — Test Coverage & Correctness Hardening (2026-04-21): 139 Rust tests, E2E Docker validation
+- **v4.0** — Parallel IVM Runtime (2026-04-29): Full operator tree in Rust, parallel hydration + advance, cross-ViewSyncer parallel poke, binary FFI format, dual-exec correctness harness
 
-## Current Milestone: v4.0 Parallel IVM Runtime
+## Next Milestone: v5.0 Streaming (planned)
 
-**Goal:** Move the full IVM operator tree to Rust — hydration and advance both execute entirely in Rust with Rayon parallelism across pipelines and within Join fan-outs. TS becomes pure orchestration/I/O.
+**Goal:** Make the v4.0 rayon parallelism investment visible to clients as reduced time-to-first-byte. Today, parallelism only reduces total server-side wall time — clients still wait for the slowest pipeline because everything is materialized into a single Buffer before returning to JS. Per-pipeline streaming changes that.
 
 **Target features:**
 
-- Full Operator trait (fetch + push) for all IVM operators in Rust
-- SQLite connection pool for parallel reads
-- N-pipeline parallel hydration (wall clock ≈ max(single query) not sum(all))
-- Within-pipeline child query parallelism (M relationships fetched in parallel)
-- Full operator tree advance (replaces filter-only rust_fan_out)
-- Cross-ViewSyncer parallel poke dispatch
-- Binary serialization format for Rust → TS transfer
+- New `advance_streaming` / `hydrate_streaming` napi methods returning AsyncIterator-shaped per-pipeline chunks (existing buffered methods preserved).
+- TS `pipeline-driver.ts::advanceStreaming` / `addQueriesStreaming` returning `AsyncIterable<RowChange | 'yield'>` (existing methods preserved).
+- View-syncer migrated to streaming so `pokers.pokePart` fires as fast pipelines complete, not at the end.
+- Cancellation via `Arc<AtomicBool>` — TS timer can actually stop Rust work on `advancement-timeout`, not just stop iterating.
+
+See `.planning/IVM-STREAMING-PLAN.md` and `.planning/IVM-PORT-AUDIT.md`.
 
 ---
 
-_Last updated: 2026-04-21 after v3.0 milestone completion_
+_Last updated: 2026-04-29 after v4.0 milestone completion_
