@@ -945,4 +945,144 @@ mod tests {
         op.force_in_push_for_test();
         let _ = op.push(Change::Add(make_node(1)));
     }
+
+    // ===== AUDIT-04 (Plan 30-03): Edit-with-or_predicate 4-transition tests =====
+    // These tests verify that ExistsOperator::push_impl evaluates `or_predicate`
+    // on BOTH old_node.row and node.row when handling an Edit, and emits
+    // Edit / Remove / Add / nothing per the 4-case truth table from D-12.
+    // Without the fix, the operator only evaluates the predicate on the new row
+    // and silently keeps stale rows in output.
+
+    /// Build an Edit change with two rows differing in the `status` column.
+    /// `id` stays the same (so parent_key_str is identical for both sides
+    /// — the precondition AUDIT-02 enforces in production).
+    fn make_status_edit(id: i64, old_status: &str, new_status: &str) -> Change {
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(id));
+        old_row.insert("status".to_string(), serde_json::json!(old_status));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(id));
+        new_row.insert("status".to_string(), serde_json::json!(new_status));
+        Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        }
+    }
+
+    /// Build an ExistsOperator with `or_predicate = (status == "active")` and
+    /// no children in the child source, so pass-state is determined entirely
+    /// by the predicate.
+    fn build_exists_with_status_predicate() -> ExistsOperator {
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+        ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )
+        .with_or_predicate(Some(Predicate::Eq(
+            "status".to_string(),
+            Value::String("active".to_string()),
+        )))
+    }
+
+    #[test]
+    fn test_exists_edit_or_predicate_both_pass() {
+        // both old.status == "active" and new.status == "active": pass-through Edit.
+        let mut op = build_exists_with_status_predicate();
+        // Warm parent_sizes to 0 so fetch_child_count fallback isn't needed.
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "active", "active");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1, "expected one Edit emit");
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
+
+    #[test]
+    fn test_exists_edit_or_predicate_old_only() {
+        // old.status == "active" → old_passed = true.
+        // new.status == "inactive", child count = 0 → new_passed = false.
+        // Expected: emit Remove(old_node).
+        let mut op = build_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "active", "inactive");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1, "expected one Remove emit");
+        assert!(
+            matches!(&result[0], Change::Remove(n)
+                if n.row.get("id").unwrap() == &serde_json::json!(1)
+                    && n.row.get("status").unwrap() == &serde_json::json!("active")),
+            "expected Remove of old_node (status=active), got {:?}",
+            &result[0]
+        );
+    }
+
+    #[test]
+    fn test_exists_edit_or_predicate_new_only() {
+        // old.status == "inactive", child count = 0 → old_passed = false.
+        // new.status == "active" → new_passed = true.
+        // Expected: emit Add(node).
+        let mut op = build_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "inactive", "active");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1, "expected one Add emit");
+        assert!(
+            matches!(&result[0], Change::Add(n)
+                if n.row.get("id").unwrap() == &serde_json::json!(1)
+                    && n.row.get("status").unwrap() == &serde_json::json!("active")),
+            "expected Add of new node (status=active), got {:?}",
+            &result[0]
+        );
+    }
+
+    #[test]
+    fn test_exists_edit_or_predicate_neither() {
+        // Both sides "inactive" with child count = 0.
+        // old_passed = false, new_passed = false → emit nothing.
+        let mut op = build_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "inactive", "inactive");
+        let result = op.push(edit);
+        assert!(result.is_empty(), "expected no emit, got {:?}", result);
+    }
+
+    #[test]
+    fn test_exists_edit_no_or_predicate_unchanged() {
+        // D-15 regression guard: ExistsOperator with no or_predicate AND
+        // both old/new have child_count > 0 → must still emit Edit.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        );
+        // No or_predicate set.
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(1));
+        old_row.insert("name".to_string(), serde_json::json!("old"));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(1));
+        new_row.insert("name".to_string(), serde_json::json!("new"));
+        let edit = Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        };
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
 }
