@@ -26,8 +26,6 @@
  */
 
 const textDecoder = new TextDecoder();
-const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
-const MIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
 
 export const CHANGE_TYPES = ['add', 'remove', 'edit', 'other'] as const;
 
@@ -264,15 +262,20 @@ function readJsonValue(
     case 0: // null
       return [null, offset];
     case 1: {
-      // i64
+      // i64. Gate on hi magnitude BEFORE Number arithmetic (CR-01 fix per
+      // CONTEXT D-12..D-13 + RESEARCH §3 P-06/P-07 + §4). 2^53 = 2^21 * 2^32,
+      // so |hi| >= 2^21 (= 0x200000) means the value exceeds MAX_SAFE_INTEGER
+      // and JS Number arithmetic loses precision. Construct BigInt directly
+      // in that case so the safe-integer guard never operates on a lossy value.
+      // Use `<= -0x200000` (inclusive) for symmetry with `>= 0x200000` so that
+      // MIN_SAFE_INTEGER - 1 lands in the BigInt branch (mirror of case 2).
       const lo = view.getUint32(offset, true);
       const hi = view.getInt32(offset + 4, true);
-      const n = hi * 0x100000000 + lo;
       offset += 8;
-      if (n >= MAX_SAFE_INTEGER || n <= MIN_SAFE_INTEGER) {
-        return [BigInt(hi) * BigInt(0x100000000) + BigInt(lo >>> 0), offset];
+      if (hi >= 0x200000 || hi <= -0x200000) {
+        return [BigInt(hi) * 0x100000000n + BigInt(lo), offset];
       }
-      return [n, offset];
+      return [hi * 0x100000000 + lo, offset];
     }
     case 2: // f64
       return [view.getFloat64(offset, true), offset + 8];

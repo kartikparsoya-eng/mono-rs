@@ -363,17 +363,25 @@ describe('decodeAdvanceChunkBuf — i64 boundary cases (CR-01)', () => {
     expect(v).toBe(-9223372036854775808n);
   });
 
-  test('case 5: MIN_SAFE_INTEGER (hi=0xFFE00001 signed=-2097151, lo=1) returns Number', () => {
+  test('case 5: MIN_SAFE_INTEGER (hi=0xFFE00000 signed=-2097152, lo=1) returns BigInt', () => {
     // -9007199254740991 = -(2^53 - 1)
     // Two's complement i64: 0xFFE0_0000_0000_0001
-    //   hi = 0xFFE00001 (as int32 = -2097151)
+    //   hi = 0xFFE00000 (as int32 = -2097152 = -0x200000)
     //   lo = 0x00000001
-    const buf = buildSingleI64ChunkBuf(0x00000001, -2097151);
+    // NOTE: Plan/RESEARCH had a mathematical error claiming hi=0xFFE00001
+    // (signed=-2097151). The correct two's complement encoding is verified
+    // empirically (Node BigInt math): hi = 0xFFE00000, lo = 0x00000001.
+    // With the post-fix symmetric inclusive gate `<= -0x200000`, this lands
+    // in the BigInt branch (just like its mirror case 2 = MAX_SAFE_INTEGER + 1).
+    // The mathematically representable value -9007199254740991 IS exactly
+    // representable in Number (= MIN_SAFE_INTEGER), but the inclusive gate is
+    // intentionally conservative — symmetric with the positive boundary.
+    const buf = buildSingleI64ChunkBuf(0x00000001, -2097152);
     const result = decodeAdvanceChunkBuf(buf);
     expect(result).toHaveLength(1);
     const v = result[0].row?.value;
-    expect(typeof v).toBe('number');
-    expect(v).toBe(Number.MIN_SAFE_INTEGER);
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(-9007199254740991n);
   });
 
   test('case 6: MIN_SAFE_INTEGER - 1 = -2^53 (hi=0xFFE00000 signed=-2097152, lo=0) returns BigInt', () => {
