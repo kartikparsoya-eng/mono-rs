@@ -17,3 +17,21 @@ Pre-existing issues discovered during plan execution that are out of scope for t
 - **File:** `packages/zqlite-rs/src/table_source.rs:923,927,932`
 - **Status:** AUTO-FIXED in 30-01 commit 22cba6141 (Rule 3 — blocking issue) by locking the `Mutex<u64>` for read.
 - **Note:** This was a compile error preventing all tests in zqlite-rs from running. The field `push_epoch` was changed from `u64` to `Mutex<u64>` at HEAD without updating the test assertion sites.
+
+## Discovered during 30-04 (debug_assert! → assert! promotion)
+
+### 3. `pipeline-driver.exists-parent-edit.test.ts` failures (AUDIT-02 regression)
+
+- **File:** `packages/zero-cache/src/services/view-syncer/pipeline-driver.exists-parent-edit.test.ts:197,227`
+- **Symptom:** Two tests added in 30-02 to verify the AUDIT-02 fix are now failing — `expected [] to have a length of 1 but got +0`. The expected REMOVE/ADD changes are not being emitted by the pipeline.
+  - `EXISTS parent_field edit emits Remove when membership lost`
+  - `EXISTS parent_field edit emits Add when membership gained`
+- **Why deferred:** AUDIT-03 (plan 30-04) only modifies Rust source files (`zero-ivm-rs/src/{join,exists,or_exists,take,cap}_op.rs`) — no zero-cache TS files were touched in this plan. The TS test failures cannot be caused by the assert!/debug_assert! promotions. The failure messages contain none of the promoted assertion text (no "Parent edit must not change relationship", no "Unexpected re-entrancy", etc.). This appears to be a pre-existing regression in the merged 30-02 work — possibly the split_edit_keys fix did not propagate correctly through the persistent pipeline path that this test exercises.
+- **Severity:** AUDIT-02 (Bug #2) regression. Tests added by 30-02 to verify its own fix are failing on the post-merge base. Should be triaged as part of AUDIT-02 follow-up, not AUDIT-03.
+- **Suggested owner:** Re-open 30-02 verification or a dedicated 30-02-FOLLOWUP plan. Investigate whether the fix in `advance.rs::collect_split_edit_keys` is being reached by the test fixtures (TS-side persistent pipeline build), or whether the pipeline driver bypasses the split-edit path under certain configurations.
+- **Confirmation that AUDIT-03 is unaffected:** All 7 newly-promoted `assert!` sites pass their `#[should_panic]` regression tests under `cargo test --release`. The pipeline-driver.test.ts main suite (40/40) and fuzz-ivm.test.ts (6/6 with FUZZ_NUM_RUNS=1000) pass — confirming AUDIT-03 introduces no operator-semantics regressions.
+
+### 4. `advance::tests::bench_persistent_pipeline_sequential_vs_parallel` still failing
+
+- **File:** `packages/zqlite-rs/src/advance.rs:2130`
+- **Status:** Same as item 1 — pre-existing, unrelated to AUDIT-03. Re-confirmed during 30-04 verification gate. Counts shifted slightly (32149 vs 40000 → still mismatched) but the underlying issue is unchanged: parallel persistent-pipeline advance does not match sequential output.
