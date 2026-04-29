@@ -13,6 +13,7 @@
     "fuzz-check": "tsx random-ast-fuzz.ts",
     "fuzz-shrink": "tsx random-ast-fuzz.ts --shrink-only",
     "fuzz-record": "tsx random-ast-fuzz.ts --record-only",
+    "diff:track2": "tsx diff-tests-track2.ts",
     "seed-corpus": "tsx seed-extractor.ts",
     "synth-p6": "tsx synth-p6.ts",
     "refresh-stats": "tsx refresh-stats.ts",
