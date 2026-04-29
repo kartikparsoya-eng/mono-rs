@@ -1352,6 +1352,116 @@ mod streaming_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Build a real RustPipelineManager + N pipelines on a temp SQLite DB.
+    /// Returns (manager, instance_id, db_dir).
+    /// The TempDir must outlive the manager — keep it alive in test scope.
+    fn build_test_manager_with_n_pipelines(
+        n: usize,
+        num_rows: usize,
+    ) -> (RustPipelineManager, String, tempfile::TempDir) {
+        use crate::ast_to_config::{HydrateQuery, SchemaCache};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        // Seed DB with `users` table
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    age INTEGER NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    score REAL NOT NULL DEFAULT 0.0
+                );",
+            )
+            .unwrap();
+
+            let mut stmt = conn
+                .prepare("INSERT INTO users (id, name, age, active, score) VALUES (?1, ?2, ?3, ?4, ?5)")
+                .unwrap();
+            for i in 0..num_rows {
+                stmt.execute(rusqlite::params![
+                    format!("u{}", i),
+                    format!("User {}", i),
+                    20 + (i % 60) as i64,
+                    if i % 5 == 0 { 0 } else { 1 },
+                    (i as f64) * 1.5,
+                ])
+                .unwrap();
+            }
+        }
+
+        let manager = RustPipelineManager::new();
+        let id = "test".to_string();
+        manager.create_instance(id.clone(), db_path_str.clone()).unwrap();
+
+        // Build pipelines directly using build_pipeline_state (faster than
+        // going through add_query JSON path; we don't need the AST-driven
+        // codepath for these streaming tests).
+        let mut schema_cache = SchemaCache::new(&db_path_str);
+        {
+            let instances = manager.instances.read().unwrap();
+            let inst_arc = instances.get(&id).unwrap().clone();
+            drop(instances);
+            let mut inst = inst_arc.lock().unwrap();
+            for i in 0..n {
+                let q_json = serde_json::json!({
+                    "query_id": format!("q{}", i),
+                    "ast": {
+                        "table": "users",
+                        "orderBy": [["age", "asc"]],
+                        "limit": 10 + (i % 20),
+                    },
+                    "primary_key": ["id"],
+                })
+                .to_string();
+                let query: HydrateQuery = serde_json::from_str(&q_json).unwrap();
+                let state = crate::advance::build_pipeline_state(
+                    &db_path_str,
+                    &query,
+                    &mut schema_cache,
+                    &inst.shared_pool,
+                )
+                .unwrap();
+                inst.pipelines.push(Mutex::new(state));
+            }
+        }
+        (manager, id, dir)
+    }
+
+    /// Build M synthetic Edit changes against the `users` table for use in
+    /// streaming tests. Each change updates one row's `name`/`age`.
+    fn build_synthetic_changes(count: usize) -> Vec<Change> {
+        (0..count)
+            .map(|i| {
+                let mut next = std::collections::HashMap::new();
+                next.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                next.insert("name".to_string(), serde_json::json!(format!("Updated {}", i)));
+                next.insert("age".to_string(), serde_json::json!(25 + (i % 40) as i64));
+                next.insert("active".to_string(), serde_json::json!(1));
+                next.insert("score".to_string(), serde_json::json!((i as f64) * 2.0));
+
+                let mut prev = std::collections::HashMap::new();
+                prev.insert("id".to_string(), serde_json::json!(format!("u{}", i)));
+                prev.insert("name".to_string(), serde_json::json!(format!("User {}", i)));
+                prev.insert("age".to_string(), serde_json::json!(20 + (i % 60) as i64));
+                prev.insert("active".to_string(), serde_json::json!(1));
+                prev.insert("score".to_string(), serde_json::json!((i as f64) * 1.5));
+
+                Change {
+                    table: "users".to_string(),
+                    prev_values: vec![prev],
+                    next_value: Some(next),
+                    row_key: serde_json::json!(format!("u{}", i)),
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn advance_stream_drop_sets_cancel_flag() {
@@ -1368,6 +1478,127 @@ mod streaming_tests {
         assert!(
             cancel_observer.load(Ordering::SeqCst),
             "AdvanceStream::drop must set cancel flag (D-14)"
+        );
+    }
+
+    /// TEST-01 (STREAM-04): cancel observation bounds the chunk count.
+    /// Drains 5 items, cancels, then drains the rest. Total non-done items
+    /// must be ≤ 6 (cancelled+1 grace) once Task 6 wires the cancel check.
+    /// Until then this test FAILS — N=20 pipelines complete fully.
+    #[test]
+    fn streaming_cancellation_bounded_chunks() {
+        // Reset panic injection (in case a prior test set it).
+        crate::advance::PANIC_ON_PIPELINE_INDEX
+            .store(usize::MAX, Ordering::SeqCst);
+        crate::advance::PIPELINE_INVOCATION_COUNT.store(0, Ordering::SeqCst);
+
+        let n_pipelines = 20;
+        let (manager, id, _dir) = build_test_manager_with_n_pipelines(n_pipelines, 100);
+        // Use many changes so each pipeline does observable work.
+        let changes_json = serde_json::to_string(&build_synthetic_changes(50)).unwrap();
+
+        let stream = manager.advance_streaming(id, changes_json).unwrap();
+        let rx = stream.rx_for_test();
+
+        let cancelled_after = 5;
+        let mut received = 0;
+        while received < cancelled_after {
+            // Use a timeout so a broken impl doesn't hang the test.
+            match rx.lock().unwrap().recv_timeout(Duration::from_secs(10)) {
+                Ok(_) => received += 1,
+                Err(_) => break,
+            }
+        }
+
+        // Cancel the stream.
+        stream.return_();
+
+        // Drain remaining items — bounded timeout per recv.
+        let mut after_cancel = 0;
+        loop {
+            match rx.lock().unwrap().recv_timeout(Duration::from_secs(2)) {
+                Ok(_) => after_cancel += 1,
+                Err(_) => break,
+            }
+        }
+        let total = received + after_cancel;
+
+        // STREAM-04: at most cancelled+1 chunks delivered after Task 6
+        // wires cancel observation. With the placeholder helper this WILL
+        // fail (all 20 pipelines complete).
+        assert!(
+            total <= cancelled_after + 1,
+            "Expected ≤ {} items, got {} (received={}, after_cancel={}). \
+             Cancel observation not propagating to advance_persistent_pipeline.",
+            cancelled_after + 1,
+            total,
+            received,
+            after_cancel
+        );
+    }
+
+    /// TEST-02 (STREAM-05): companion scalar reset closes the channel.
+    ///
+    /// MARKED `#[ignore]` — companion test setup helpers do not exist in
+    /// pipeline_manager_tests. The Task 4 wiring for companion handling is
+    /// covered indirectly by TEST-04 (parity fuzz in 31-02 plan) which
+    /// exercises the buffered + streaming companion paths against each
+    /// other on random inputs. A direct test would require seeding a
+    /// companion table, calling set_query_companions, and triggering a
+    /// scalar change — sketch left as TODO for Phase 33 hardening.
+    #[test]
+    #[ignore]
+    fn streaming_companion_reset_closes_channel() {
+        // TODO(phase-33): build companion table + scalar trigger, then
+        // assert: items.last() is StreamItem::ResetSignal AND no items
+        // arrive within 100ms after the ResetSignal.
+    }
+
+    /// TEST-03: panic in one pipeline does not take down siblings.
+    /// Sibling pipelines must complete; the panicked pipeline's chunk is
+    /// replaced by `StreamItem::Error("test-injected ...", "panic")`.
+    #[test]
+    fn streaming_panic_in_one_pipeline_others_complete() {
+        // Reset state from any prior test, then inject panic at the 2nd
+        // pipeline (index 1). NOTE: the counter is process-wide, so this
+        // test must not race with other streaming tests that call
+        // advance_persistent_pipeline_with_cancel. Cargo test parallelism
+        // may run them concurrently; use --test-threads 1 if flaky.
+        crate::advance::PIPELINE_INVOCATION_COUNT.store(0, Ordering::SeqCst);
+        crate::advance::PANIC_ON_PIPELINE_INDEX.store(1, Ordering::SeqCst);
+
+        let (manager, id, _dir) = build_test_manager_with_n_pipelines(3, 100);
+        let changes_json = serde_json::to_string(&build_synthetic_changes(5)).unwrap();
+        let stream = manager.advance_streaming(id, changes_json).unwrap();
+        let rx = stream.rx_for_test();
+
+        let mut chunks = 0;
+        let mut errors = 0;
+        loop {
+            match rx.lock().unwrap().recv_timeout(Duration::from_secs(10)) {
+                Ok(StreamItem::Chunk(_)) => chunks += 1,
+                Ok(StreamItem::Error(_, kind)) => {
+                    assert_eq!(kind, "panic", "kind must be 'panic', got '{}'", kind);
+                    errors += 1;
+                }
+                Ok(StreamItem::ResetSignal(_)) => {}
+                Err(_) => break,
+            }
+        }
+
+        // Cleanup BEFORE assertions so a failure doesn't leak state.
+        crate::advance::PANIC_ON_PIPELINE_INDEX
+            .store(usize::MAX, Ordering::SeqCst);
+        crate::advance::PIPELINE_INVOCATION_COUNT.store(0, Ordering::SeqCst);
+
+        // Two non-panicking pipelines run; one panics.
+        // (Some pipelines may filter to empty chunk → no Chunk emitted; in
+        // that case we still expect ≤ 2 chunks but ≥ 1.)
+        assert_eq!(errors, 1, "exactly one panic must surface as Error('panic')");
+        assert!(
+            chunks <= 2,
+            "at most 2 non-panicking pipelines emit chunks, got {}",
+            chunks
         );
     }
 }

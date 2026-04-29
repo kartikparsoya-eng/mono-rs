@@ -1202,6 +1202,18 @@ pub(crate) fn build_pipeline_state(
     })
 }
 
+/// Test-only panic injection: when set, the N-th call to
+/// `advance_persistent_pipeline_with_cancel` panics. Used by TEST-03
+/// (`streaming_panic_in_one_pipeline_others_complete`) to verify per-task
+/// `panic::catch_unwind` shim.
+#[cfg(test)]
+pub(crate) static PANIC_ON_PIPELINE_INDEX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(crate) static PIPELINE_INVOCATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Cancel-aware variant of `advance_persistent_pipeline` used by streaming.
 /// Phase 31 Task 5/6 inserts a real cancel check at the per-change loop
 /// boundary. For now this just delegates so the streaming code compiles.
@@ -1211,6 +1223,14 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
     db_path: &str,
     _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<RowChange> {
+    #[cfg(test)]
+    {
+        let idx = PIPELINE_INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let panic_at = PANIC_ON_PIPELINE_INDEX.load(std::sync::atomic::Ordering::SeqCst);
+        if idx == panic_at {
+            panic!("test-injected panic at pipeline index {}", idx);
+        }
+    }
     // TODO(Task 6): observe _cancel between iterations of the per-change loop.
     advance_persistent_pipeline(pipeline, changes, db_path)
 }
