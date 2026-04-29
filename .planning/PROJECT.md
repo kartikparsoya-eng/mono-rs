@@ -35,7 +35,12 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 
 ### Active
 
-(v5.0 Streaming requirements to be defined via /gsd-new-milestone)
+- [ ] Per-pipeline streaming Rust API (advance_streaming, hydrate_streaming) — additive
+- [ ] TS streaming wrappers (advanceStreaming, addQueriesStreaming) returning AsyncIterable
+- [ ] Cancellation via Arc<AtomicBool> — TS timer can stop Rust work
+- [ ] view-syncer migrated to streaming (pokes fire as fast pipelines complete)
+- [ ] Bench: TTFB drops from max(pipeline_time) to min(pipeline_time)
+- [ ] Audit fixes: LIKE case sensitivity, EXISTS split_edit_keys, debug_assert→assert, Exists Edit with or_predicate
 
 ### Out of Scope
 
@@ -86,19 +91,38 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 - **v3.0** — Test Coverage & Correctness Hardening (2026-04-21): 139 Rust tests, E2E Docker validation
 - **v4.0** — Parallel IVM Runtime (2026-04-29): Full operator tree in Rust, parallel hydration + advance, cross-ViewSyncer parallel poke, binary FFI format, dual-exec correctness harness
 
-## Next Milestone: v5.0 Streaming (planned)
+## Current Milestone: v5.0 Streaming
 
-**Goal:** Make the v4.0 rayon parallelism investment visible to clients as reduced time-to-first-byte. Today, parallelism only reduces total server-side wall time — clients still wait for the slowest pipeline because everything is materialized into a single Buffer before returning to JS. Per-pipeline streaming changes that.
+**Goal:** Make the v4.0 rayon parallelism investment visible to clients as reduced time-to-first-byte. Today, parallelism only reduces total server-side wall time — clients still wait for the slowest pipeline because everything is materialized into a single Buffer before returning to JS. Per-pipeline streaming changes that. Also fix two real bugs and three latent risks identified in the port audit.
 
 **Target features:**
 
-- New `advance_streaming` / `hydrate_streaming` napi methods returning AsyncIterator-shaped per-pipeline chunks (existing buffered methods preserved).
+- New `advance_streaming` / `hydrate_streaming` napi methods returning AsyncIterator-shaped per-pipeline chunks (existing buffered methods preserved as opt-out).
 - TS `pipeline-driver.ts::advanceStreaming` / `addQueriesStreaming` returning `AsyncIterable<RowChange | 'yield'>` (existing methods preserved).
 - View-syncer migrated to streaming so `pokers.pokePart` fires as fast pipelines complete, not at the end.
 - Cancellation via `Arc<AtomicBool>` — TS timer can actually stop Rust work on `advancement-timeout`, not just stop iterating.
+- Audit fixes: LIKE case sensitivity in `parse_predicate_json`, `EXISTS` parent_field missing from `split_edit_keys`, `debug_assert!` → `assert!` for framework invariants, `Exists` Edit-with-or_predicate evaluating both old and new node.
 
 See `.planning/IVM-STREAMING-PLAN.md` and `.planning/IVM-PORT-AUDIT.md`.
 
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+
+**After each milestone** (via `/gsd-complete-milestone`):
+
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
+
 ---
 
-_Last updated: 2026-04-29 after v4.0 milestone completion_
+_Last updated: 2026-04-29 starting v5.0 Streaming_
