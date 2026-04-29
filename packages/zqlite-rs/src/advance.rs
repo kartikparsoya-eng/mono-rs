@@ -866,6 +866,21 @@ fn collect_split_edit_keys(ast: &crate::ast_to_config::Ast) -> Vec<String> {
                     collect_from_cond(c, keys);
                 }
             }
+            // AUDIT-02 / D-04: EXISTS (and NOT EXISTS) inside the where
+            // clause must contribute its parent_field columns to
+            // split_edit_keys so an edit that flips the membership is
+            // emitted as Remove+Add (not Edit). Recurse into the
+            // subquery's own where so nested EXISTS are caught too.
+            // TS parity: packages/zql/src/builder/builder.ts:273-290 via
+            // gatherCorrelatedSubqueryQueryConditions.
+            crate::ast_to_config::Condition::CorrelatedSubquery { related, .. } => {
+                for f in &related.correlation.parent_field {
+                    keys.insert(f.clone());
+                }
+                if let Some(inner) = &related.subquery.where_cond {
+                    collect_from_cond(inner, keys);
+                }
+            }
             _ => {}
         }
     }
