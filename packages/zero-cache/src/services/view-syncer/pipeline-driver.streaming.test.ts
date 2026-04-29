@@ -244,13 +244,92 @@ describe('advanceStreaming + RustStreamError', () => {
     expect(err.name).toBe('RustStreamError');
   });
 
-  test('iterator.return cancels rust work (placeholder for TEST-05 in Task 5)', () => {
-    // Task 5 replaces this with a counter-based assertion that
-    // `for await { break }` triggers stream.return() and Rust pipelines
-    // stop work within one push boundary (STREAM-04).
+  test('iterator.return cancels rust work (TEST-05)', async () => {
+    // TEST-05: verify `for await { break }` triggers the finally block's
+    // `stream.return()` call (D-15 belt-and-suspenders), which flips the
+    // Rust cancel flag (D-14). Per RESEARCH/VALIDATION, the actual cancel
+    // propagation is verified end-to-end by 31-01's Rust TEST-01
+    // (cancelled drain wall-time = 207µs vs 2.4s ungated; ratio = 0.00).
     //
-    // For RED commit, the test exists so the structural grep
-    // `iterator.return cancels rust work` passes.
-    expect(true).toBe(true);
+    // The TS-side guarantee is narrower: that `stream.return()` is called
+    // exactly once when the for-await is interrupted. We verify this by
+    // installing a Proxy on the napi stream returned by `advanceStreaming`
+    // that counts `return()` invocations.
+    //
+    // Bounded-push assertion (per STREAM-04): impractical to measure
+    // directly from TS without exposing a napi atomic counter. The Rust
+    // TEST-01 covers the bounded-push contract; this test covers the
+    // TS-side `try { } finally { stream.return() }` contract.
+
+    const {default: zqliteRs} = await import('zqlite-rs');
+    const ManagerCls = (zqliteRs as {RustPipelineManager: unknown})
+      .RustPipelineManager as {
+      prototype: {
+        advanceStreaming: (id: string, changesJson: string) => unknown;
+      };
+    };
+    const originalAdvanceStreaming = ManagerCls.prototype.advanceStreaming;
+    let returnCallCount = 0;
+    let nextCallCount = 0;
+    ManagerCls.prototype.advanceStreaming = function patched(
+      id: string,
+      changesJson: string,
+    ): unknown {
+      const realStream = originalAdvanceStreaming.call(this, id, changesJson) as {
+        next: () => Promise<unknown>;
+        return: () => void;
+      };
+      return new Proxy(realStream, {
+        get(target, prop) {
+          if (prop === 'return') {
+            return () => {
+              returnCallCount++;
+              return target.return();
+            };
+          }
+          if (prop === 'next') {
+            return () => {
+              nextCallCount++;
+              return target.next();
+            };
+          }
+          return Reflect.get(target, prop);
+        },
+      });
+    };
+
+    try {
+      fxA = setupFixture('cancel_test', lc);
+      [...(await fxA.pipelines.addQueriesAsync(
+        [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+        fxA.startTimer(),
+      ))];
+
+      // Apply a transaction so advanceStreaming has work to do.
+      fxA.replicator.processTransaction(
+        '124',
+        messages.insert('items', {id: 'i3', name: 'three'}),
+        messages.insert('items', {id: 'i4', name: 'four'}),
+      );
+
+      const result = await fxA.pipelines.advanceStreaming(NO_TIME_TIMER);
+
+      // Drain ONE non-yield change, then break.
+      let drainedCount = 0;
+      for await (const c of result.changes) {
+        if (c !== 'yield') {
+          drainedCount++;
+          if (drainedCount >= 1) break;
+        }
+      }
+
+      // The for-await `break` must trigger #streamChanges' finally, which
+      // calls `stream.return()` exactly once (D-15).
+      expect(returnCallCount).toBe(1);
+      // Sanity: at least one `next()` call happened (we drained ≥1 chunk).
+      expect(nextCallCount).toBeGreaterThan(0);
+    } finally {
+      ManagerCls.prototype.advanceStreaming = originalAdvanceStreaming;
+    }
   });
 });
