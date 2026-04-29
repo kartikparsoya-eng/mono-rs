@@ -836,6 +836,7 @@ export async function setup(
     desiredQueriesPatch: UpQueriesPatch,
     clientSchema: ClientSchema | null = defaultClientSchema,
     activeClients?: string[],
+    onMessage?: (msg: Downstream, t: number) => void,
   ): {queue: Queue<Downstream>; source: Source<Downstream>} {
     const selector = {clientID: ctx.clientID, wsID: ctx.wsID};
     vs.contextManager.registerConnection(
@@ -876,6 +877,9 @@ export async function setup(
     void (async function () {
       try {
         for await (const msg of source) {
+          if (onMessage !== undefined) {
+            onMessage(msg, performance.now());
+          }
           queue.enqueue(msg);
         }
       } catch (e) {
