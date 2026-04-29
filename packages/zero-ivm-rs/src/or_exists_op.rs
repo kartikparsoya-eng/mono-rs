@@ -1056,4 +1056,112 @@ mod tests {
         // Second push panics with "Unexpected re-entrancy".
         let _ = op.push(Change::Add(make_node(2)));
     }
+
+    // ─── Category: OR-branch combinations (D-09 EXPLICIT requirement) ──────
+
+    #[test]
+    fn test_or_exists_two_branches_both_pass() {
+        // 2 branches, both with matching children. Push Add(parent) →
+        // emits Add (any-branch-passes is true; both branches pass).
+        let parents = vec![make_node(1)];
+        let ch_a = vec![make_node_with_parent(10, 1)];
+        let ch_b = vec![make_node_with_parent(20, 1)];
+        let mut op = build_or_exists_two_branches(parents, ch_a, ch_b);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Add(make_node(1)));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    #[test]
+    fn test_or_exists_two_branches_one_passes() {
+        // 2 branches: A has matching children, B has none. OR semantics
+        // means parent passes if ANY branch passes. Push Add(parent) →
+        // emits Add via branch A.
+        let parents = vec![make_node(1)];
+        let ch_a = vec![make_node_with_parent(10, 1)];
+        let ch_b: Vec<Node> = vec![];
+        let mut op = build_or_exists_two_branches(parents, ch_a, ch_b);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Add(make_node(1)));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    #[test]
+    fn test_or_exists_two_branches_neither_passes() {
+        // 2 branches, neither has matching children. Push Add(parent) →
+        // emits nothing (any_branch_passes is false; or_predicate is None).
+        let parents = vec![make_node(1)];
+        let ch_a: Vec<Node> = vec![];
+        let ch_b: Vec<Node> = vec![];
+        let mut op = build_or_exists_two_branches(parents, ch_a, ch_b);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Add(make_node(1)));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_or_exists_mixed_exists_not_exists_branches() {
+        // 2 branches: A is EXISTS (not_exists=false), B is NOT EXISTS
+        // (not_exists=true). Each branch has its own child source.
+        // Branch A child source has 0 children for parent_id=1 → A fails.
+        // Branch B child source has 0 children for parent_id=1 → with
+        // not_exists=true, count==0 means B PASSES.
+        // OR semantics: parent passes via B → emit Add.
+        let parents = vec![make_node(1)];
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: parents });
+        let child_source_a: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let child_source_b: Box<dyn Operator> = Box::new(MockInput { nodes: vec![] });
+        let branches = vec![
+            (
+                child_source_a,
+                "exists_rel".to_string(),
+                false, // EXISTS
+                vec!["id".to_string()],
+                vec!["parent_id".to_string()],
+            ),
+            (
+                child_source_b,
+                "not_exists_rel".to_string(),
+                true, // NOT EXISTS
+                vec!["id".to_string()],
+                vec!["parent_id".to_string()],
+            ),
+        ];
+        let mut op = OrExistsOperator::new(parent_source, branches, None);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let result = op.push(Change::Add(make_node(1)));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Add(_)));
+    }
+
+    // ─── Category: Builder-spec parity (D-09 EXPLICIT requirement) ─────────
+
+    #[test]
+    fn test_or_exists_op_type_smoke() {
+        // SIMPLIFIED per <behavior>: the production construction path goes
+        // through pipeline.rs::build_operator which requires SQLite-backed
+        // child sources (not callable from a pure-Rust unit test). The
+        // simplified parity test asserts:
+        //   1. op.op_type() returns the canonical "or_exists" string.
+        //   2. A direct OrExistsOperator::new() call yields a working
+        //      operator that responds to fetch + push without panicking.
+        // This covers the contract (op_type stability) downstream
+        // pipeline-driver code depends on. See SUMMARY for rationale.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        assert_eq!(op.op_type(), "or_exists");
+
+        // Sanity: fetch + push roundtrip doesn't panic.
+        let nodes = op.fetch(&FetchRequest::default());
+        assert!(!nodes.is_empty());
+        let pushed = op.push(Change::Add(make_node(1)));
+        assert_eq!(pushed.len(), 1);
+    }
 }
