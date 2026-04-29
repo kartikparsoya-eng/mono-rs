@@ -74,7 +74,12 @@ Plans:
 4. `TEST-05` confirms `for await { break }` over `advanceStreaming.changes` calls Rust `stream.return_()` and Rust pipeline tasks stop work within one operator-push boundary.
 5. Backwards compatibility: full vitest suite (`pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts` 1k iterations, `decode-advance-buf.test.ts`) and `cargo test` in both Rust crates pass unchanged. Buffered method signatures (`advance`, `advanceAsync`, `hydrate*`, `addQuery*`, `addQueries*`) and the `encode_advance_result_buf` / `decodeAdvanceResultBuf` binary format are byte-for-byte identical to v4.0 (verified by diff against the v4.0 tag).
 
-**Plans:** TBD
+**Plans:** 2 plans
+
+Plans:
+
+- [ ] 31-01-PLAN.md — Rust streaming primitives (chunk_encoder, AdvanceStream/HydrateStream napi classes, advance_streaming/hydrate_streaming/hydrate_query_streaming methods, TEST-01/02/03) (Wave 1)
+- [ ] 31-02-PLAN.md — TS streaming wrappers (decodeAdvanceChunkBuf, RustStreamError, advanceStreaming/addQueriesStreaming, TEST-04 fuzz, TEST-05 cancel propagation) (Wave 2, depends on 31-01)
 
 ---
 
@@ -122,7 +127,7 @@ Plans:
 | Phase                                       | Plans Complete | Status      | Completed  |
 | ------------------------------------------- | -------------- | ----------- | ---------- |
 | 30. Audit Fixes                             | 5/5            | Complete    | 2026-04-29 |
-| 31. Rust Streaming Primitives + TS Wrappers | 0/0            | Not started | —          |
+| 31. Rust Streaming Primitives + TS Wrappers | 0/2            | Planned     | —          |
 | 32. View-Syncer Streaming Migration         | 0/0            | Not started | —          |
 | 33. Performance Tuning + Benchmarks         | 0/0            | Not started | —          |
 
