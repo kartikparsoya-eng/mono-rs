@@ -249,21 +249,59 @@ impl ExistsOperator {
                     vec![]
                 }
             }
-            Change::Edit { .. } => {
-                let row = change.node().row.clone();
-                if self.or_condition_matches(&row) {
-                    return vec![change];
-                }
-                let pk = self.parent_key_str(&row);
-                let count = self.parent_sizes.get(&pk).copied().unwrap_or_else(|| {
-                    let c = self.fetch_child_count(&row);
-                    self.parent_sizes.insert(pk.clone(), c);
-                    c
-                });
-                if self.passes_filter(count) {
-                    vec![change]
+            Change::Edit { old_node, node, .. } => {
+                // AUDIT-04 (Plan 30-03 / D-12, D-13): evaluate or_predicate on
+                // BOTH old_node.row and node.row, then emit per the 4-case truth table.
+                // With AUDIT-02 enforced upstream, parent_field doesn't change in an
+                // Edit reaching this branch, so old_pk == new_pk and the cached
+                // parent_sizes entry is correct for both sides.
+                let old_row = old_node.row.clone();
+                let new_row = node.row.clone();
+
+                // Compute old-side passed state.
+                let old_passed = if self.or_condition_matches(&old_row) {
+                    true
                 } else {
-                    vec![]
+                    let old_pk = self.parent_key_str(&old_row);
+                    let old_count = self
+                        .parent_sizes
+                        .get(&old_pk)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let c = self.fetch_child_count(&old_row);
+                            self.parent_sizes.insert(old_pk.clone(), c);
+                            c
+                        });
+                    self.passes_filter(old_count)
+                };
+
+                // Compute new-side passed state.
+                let new_passed = if self.or_condition_matches(&new_row) {
+                    true
+                } else {
+                    let new_pk = self.parent_key_str(&new_row);
+                    let new_count = self
+                        .parent_sizes
+                        .get(&new_pk)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let c = self.fetch_child_count(&new_row);
+                            self.parent_sizes.insert(new_pk.clone(), c);
+                            c
+                        });
+                    self.passes_filter(new_count)
+                };
+
+                match (old_passed, new_passed) {
+                    (true, true) => {
+                        // Pass-through Edit (current behavior). `change` was
+                        // moved into push_impl and is still owned, so reuse it.
+                        let owned = change;
+                        vec![owned]
+                    }
+                    (true, false) => vec![Change::Remove(old_node.clone())],
+                    (false, true) => vec![Change::Add(node.clone())],
+                    (false, false) => vec![],
                 }
             }
             Change::Child { node, child } => {
