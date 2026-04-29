@@ -246,3 +246,209 @@ describe('decodeAdvanceChunkBuf', () => {
     );
   });
 });
+
+// Phase 32-01 (CR-01): i64 decoder safe-integer boundary regression tests.
+//
+// The pre-fix `readJsonValue` case 1 (i64) constructs `n = hi * 0x100000000 + lo`
+// BEFORE comparing against MAX_SAFE_INTEGER / MIN_SAFE_INTEGER — when |hi| >= 2^21
+// (= 0x200000) the JS Number arithmetic is already lossy, defeating the guard.
+//
+// Per CONTEXT D-12..D-14 + RESEARCH §3 P-06/P-07 + §4, the post-fix gate is:
+//   if (hi >= 0x200000 || hi <= -0x200000) return BigInt branch
+//   else return Number branch (safe range)
+//
+// These tests pin the type+value contract for both decoders. They PASS on the
+// current code today (the BigInt fallback already produces correct values even
+// when entered after lossy arithmetic — see RESEARCH §3 P-06). Task 2 (GREEN)
+// fortifies the implementation by moving the gate before the lossy multiplication.
+function buildSingleI64ChunkBuf(lo: number, hi: number): Buffer {
+  // Builds a single-row chunk buffer with one column 'value' carrying an i64.
+  // Layout matches `decodeAdvanceChunkBuf` per-chunk encoding:
+  //   [u32 count=1][u8 flags=0]
+  //   [u8 ct=0 add][u16 qid_len][qid="q1"][u16 tbl_len][tbl="t1"]
+  //   [json_value row_key tag=6 + JSON]
+  //   [u8 has_row=1][u16 col_count=1]
+  //   [u16 col_name_len][col_name="value"]
+  //   [u8 tag=1][u32 lo LE][i32 hi LE]
+  const parts: Buffer[] = [];
+
+  // Header: count=1, flags=0
+  const header = Buffer.alloc(5);
+  header.writeUInt32LE(1, 0);
+  header[4] = 0;
+  parts.push(header);
+
+  // change_type = 0 (add)
+  parts.push(Buffer.from([0]));
+
+  // query_id = "q1"
+  const qid = Buffer.from('q1', 'utf-8');
+  const qidLen = Buffer.alloc(2);
+  qidLen.writeUInt16LE(qid.length, 0);
+  parts.push(qidLen, qid);
+
+  // table = "t1"
+  const tbl = Buffer.from('t1', 'utf-8');
+  const tblLen = Buffer.alloc(2);
+  tblLen.writeUInt16LE(tbl.length, 0);
+  parts.push(tblLen, tbl);
+
+  // row_key json fallback (tag=6) {"id":"1"}
+  const rowKeyJson = Buffer.from('{"id":"1"}', 'utf-8');
+  const rowKeyHeader = Buffer.alloc(5);
+  rowKeyHeader[0] = 6;
+  rowKeyHeader.writeUInt32LE(rowKeyJson.length, 1);
+  parts.push(rowKeyHeader, rowKeyJson);
+
+  // has_row = 1, col_count = 1
+  parts.push(Buffer.from([1]));
+  const colCount = Buffer.alloc(2);
+  colCount.writeUInt16LE(1, 0);
+  parts.push(colCount);
+
+  // col "value" with i64 tag=1
+  const colName = Buffer.from('value', 'utf-8');
+  const colNameLen = Buffer.alloc(2);
+  colNameLen.writeUInt16LE(colName.length, 0);
+  parts.push(colNameLen, colName);
+
+  // i64 tag + 8 bytes (lo, hi) little-endian
+  const valBuf = Buffer.alloc(9);
+  valBuf[0] = 1; // i64 tag
+  valBuf.writeUInt32LE(lo >>> 0, 1);
+  valBuf.writeInt32LE(hi | 0, 5);
+  parts.push(valBuf);
+
+  return Buffer.concat(parts);
+}
+
+describe('decodeAdvanceChunkBuf — i64 boundary cases (CR-01)', () => {
+  test('case 1: MAX_SAFE_INTEGER (hi=0x001FFFFF, lo=0xFFFFFFFF) returns Number', () => {
+    // 9007199254740991 = 2^53 - 1
+    const buf = buildSingleI64ChunkBuf(0xffffffff, 0x001fffff);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('number');
+    expect(v).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  test('case 2: MAX_SAFE_INTEGER + 1 = 2^53 (hi=0x00200000, lo=0x00000000) returns BigInt', () => {
+    // 9007199254740992 = 2^53 — first integer JS Number cannot represent
+    // distinctly from 2^53 + 1, so must be BigInt.
+    const buf = buildSingleI64ChunkBuf(0x00000000, 0x00200000);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(9007199254740992n);
+  });
+
+  test('case 3: i64::MAX (hi=0x7FFFFFFF, lo=0xFFFFFFFF) returns BigInt 9223372036854775807n', () => {
+    const buf = buildSingleI64ChunkBuf(0xffffffff, 0x7fffffff);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(9223372036854775807n);
+  });
+
+  test('case 4: i64::MIN (hi=0x80000000 signed=-2147483648, lo=0) returns BigInt -9223372036854775808n', () => {
+    // hi = 0x80000000 as int32 = -2147483648 (sign-extended)
+    const buf = buildSingleI64ChunkBuf(0x00000000, -2147483648);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(-9223372036854775808n);
+  });
+
+  test('case 5: MIN_SAFE_INTEGER (hi=0xFFE00001 signed=-2097151, lo=1) returns Number', () => {
+    // -9007199254740991 = -(2^53 - 1)
+    // Two's complement i64: 0xFFE0_0000_0000_0001
+    //   hi = 0xFFE00001 (as int32 = -2097151)
+    //   lo = 0x00000001
+    const buf = buildSingleI64ChunkBuf(0x00000001, -2097151);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('number');
+    expect(v).toBe(Number.MIN_SAFE_INTEGER);
+  });
+
+  test('case 6: MIN_SAFE_INTEGER - 1 = -2^53 (hi=0xFFE00000 signed=-2097152, lo=0) returns BigInt', () => {
+    // -9007199254740992 = -2^53
+    // hi = 0xFFE00000 (as int32 = -2097152 = -0x200000)
+    // The post-fix `<= -0x200000` (inclusive) gate routes this to BigInt,
+    // symmetric with case 2.
+    const buf = buildSingleI64ChunkBuf(0x00000000, -2097152);
+    const result = decodeAdvanceChunkBuf(buf);
+    expect(result).toHaveLength(1);
+    const v = result[0].row?.value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(-9007199254740992n);
+  });
+});
+
+describe('decodeAdvanceResultBuf — i64 parity (CR-01)', () => {
+  test('i64::MAX in buffered result returns BigInt 9223372036854775807n (shared readJsonValue)', () => {
+    // Build a buffered AdvanceResult with a single row carrying i64::MAX
+    // in column 'value'. Mirrors the chunk-buf test for case 3 to guard
+    // against regression in the buffered decoder path that shares
+    // `readJsonValue` with the streaming chunk decoder.
+    const parts: Buffer[] = [];
+
+    // Header: change_count=1, flags=0
+    const header = Buffer.alloc(5);
+    header.writeUInt32LE(1, 0);
+    header[4] = 0;
+    parts.push(header);
+
+    // change_type = 0 (add)
+    parts.push(Buffer.from([0]));
+
+    // query_id = "q1"
+    const qid = Buffer.from('q1', 'utf-8');
+    const qidLen = Buffer.alloc(2);
+    qidLen.writeUInt16LE(qid.length, 0);
+    parts.push(qidLen, qid);
+
+    // table = "t1"
+    const tbl = Buffer.from('t1', 'utf-8');
+    const tblLen = Buffer.alloc(2);
+    tblLen.writeUInt16LE(tbl.length, 0);
+    parts.push(tblLen, tbl);
+
+    // row_key json fallback {"id":"1"}
+    const rowKeyJson = Buffer.from('{"id":"1"}', 'utf-8');
+    const rowKeyHeader = Buffer.alloc(5);
+    rowKeyHeader[0] = 6;
+    rowKeyHeader.writeUInt32LE(rowKeyJson.length, 1);
+    parts.push(rowKeyHeader, rowKeyJson);
+
+    // has_row=1, col_count=1
+    parts.push(Buffer.from([1]));
+    const colCount = Buffer.alloc(2);
+    colCount.writeUInt16LE(1, 0);
+    parts.push(colCount);
+
+    // col "value" = i64::MAX (tag=1, lo=0xFFFFFFFF, hi=0x7FFFFFFF)
+    const colName = Buffer.from('value', 'utf-8');
+    const colNameLen = Buffer.alloc(2);
+    colNameLen.writeUInt16LE(colName.length, 0);
+    parts.push(colNameLen, colName);
+
+    const valBuf = Buffer.alloc(9);
+    valBuf[0] = 1; // i64 tag
+    valBuf.writeUInt32LE(0xffffffff, 1);
+    valBuf.writeInt32LE(0x7fffffff, 5);
+    parts.push(valBuf);
+
+    const buf = Buffer.concat(parts);
+    const result = decodeAdvanceResultBuf(buf);
+    expect(result.changes).toHaveLength(1);
+    const v = result.changes[0].row?.value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(9223372036854775807n);
+  });
+});
