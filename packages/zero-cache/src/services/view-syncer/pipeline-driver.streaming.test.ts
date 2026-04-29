@@ -142,7 +142,7 @@ const messages = new ReplicationMessages({
 });
 
 function sortChanges(rows: RowChange[]): RowChange[] {
-  return [...rows].sort((a, b) => {
+  return rows.toSorted((a, b) => {
     const ak = `${a.queryID}|${a.table}|${a.type}|${JSON.stringify(a.rowKey)}`;
     const bk = `${b.queryID}|${b.table}|${b.type}|${JSON.stringify(b.rowKey)}`;
     return ak < bk ? -1 : ak > bk ? 1 : 0;
@@ -210,7 +210,7 @@ describe('advanceStreaming + RustStreamError', () => {
     expect(streamingChanges.length).toBeGreaterThan(0);
   });
 
-  test('throws ResetPipelinesSignal on companion scalar reset', async () => {
+  test('throws ResetPipelinesSignal on companion scalar reset', () => {
     // Companion scalar resets are emitted as StreamItem::ResetSignal by Rust.
     // The streaming wrapper MUST translate that into ResetPipelinesSignal
     // with reason='scalar-subquery' (WRAP-04) — same throw shape as the
