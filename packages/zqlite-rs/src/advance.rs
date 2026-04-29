@@ -1969,6 +1969,136 @@ mod tests {
         );
     }
 
+    // ─── AUDIT-02 production AST shape regression (Plan 30-05) ─────────────
+    //
+    // Pins the full runtime production AST shape captured from the failing
+    // `pipeline-driver.exists-parent-edit.test.ts` integration test (which
+    // sends the AST through `pipeline-driver.ts::#rustHydrateQuery` →
+    // `manager.addQuery` → `build_pipeline_state`). Before Plan 30-02,
+    // `collect_split_edit_keys` would fall through `_ => {}` for the EXISTS
+    // condition and never collect `child_id`, causing the source to emit a
+    // single `Edit` instead of `Remove(old) + Add(new)`. After 30-02 +
+    // 30-05, the keys are collected AND `maybe_split_edit_for_advance`
+    // splits the captured Edit into `[Remove, Add]`.
+    //
+    // Source of the captured shape: `.tmp/audit-02-gap-rootcause.md`
+    // (Plan 30-05 Task 1 diagnostic log, [audit-02-diag] entries from
+    // `build_pipeline_state` and `source_table_branch`).
+    //
+    // This test does NOT regress AUDIT-02 because it asserts the full
+    // runtime shape (with serde-rename fields + system + alias + the exact
+    // `_0_version` system column the row carries in production) — future
+    // refactors that drop the CorrelatedSubquery arm or weaken the helper
+    // will cause this test to fail.
+    #[test]
+    fn test_audit_02_production_ast_shape_does_not_regress() {
+        // Build the exact AST shape produced by pipeline-driver.ts after
+        // resolveSimpleScalarSubqueries — `system: Some("client")`,
+        // `alias: Some("c")`, `order_by: Some([("id", "asc")])`, etc.
+        // This mirrors the JSON the napi-rs deserializer receives from
+        // `manager.addQuery(this.#instanceId, queryJson)` for the failing
+        // pipeline-driver.exists-parent-edit.test.ts fixture.
+        let csq = CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: vec!["child_id".to_string()],
+                child_field: vec!["parent_id".to_string()],
+            },
+            subquery: Box::new(Ast {
+                table: "children".to_string(),
+                alias: Some("c".to_string()),
+                where_cond: None,
+                related: None,
+                limit: None,
+                order_by: Some(vec![("id".to_string(), "asc".to_string())]),
+                start: None,
+            }),
+            hidden: None,
+            system: Some("client".to_string()),
+        };
+        let ast = Ast {
+            table: "parents".to_string(),
+            alias: None,
+            where_cond: Some(Box::new(Condition::CorrelatedSubquery {
+                related: Box::new(csq),
+                op: "EXISTS".to_string(),
+                flip: None,
+                scalar: None,
+            })),
+            related: None,
+            limit: None,
+            order_by: Some(vec![("id".to_string(), "asc".to_string())]),
+            start: None,
+        };
+
+        let keys = super::collect_split_edit_keys(&ast);
+        assert_eq!(
+            keys, vec!["child_id".to_string()],
+            "AUDIT-02 production AST shape MUST collect child_id into split_edit_keys; got {keys:?}"
+        );
+
+        // Build the exact SourceChange::Edit captured at the source-table
+        // branch from the diagnostic log — including the `_0_version`
+        // system column that flows through alongside user columns.
+        let mut old_row: crate::source::Row = serde_json::Map::new();
+        old_row.insert("id".to_string(), serde_json::json!("p1"));
+        old_row.insert("child_id".to_string(), serde_json::json!("A"));
+        old_row.insert("_0_version".to_string(), serde_json::json!("123"));
+
+        let mut new_row: crate::source::Row = serde_json::Map::new();
+        new_row.insert("id".to_string(), serde_json::json!("p1"));
+        new_row.insert("child_id".to_string(), serde_json::json!("B"));
+        new_row.insert("_0_version".to_string(), serde_json::json!("124"));
+
+        let edit = crate::source::SourceChange::Edit {
+            row: new_row.clone(),
+            old_row: old_row.clone(),
+        };
+
+        let split = super::maybe_split_edit_for_advance(edit, &keys);
+        assert_eq!(
+            split.len(), 2,
+            "AUDIT-02: production-shape Edit MUST split into 2 SourceChanges (Remove + Add); got {split:?}"
+        );
+        match (&split[0], &split[1]) {
+            (
+                crate::source::SourceChange::Remove(r),
+                crate::source::SourceChange::Add(a),
+            ) => {
+                assert_eq!(
+                    r.get("child_id"), Some(&serde_json::json!("A")),
+                    "first split element MUST be Remove(old_row) with child_id='A'"
+                );
+                assert_eq!(
+                    a.get("child_id"), Some(&serde_json::json!("B")),
+                    "second split element MUST be Add(new_row) with child_id='B'"
+                );
+            }
+            _ => panic!(
+                "AUDIT-02: split MUST be exactly [Remove(old), Add(new)]; got {split:?}"
+            ),
+        }
+
+        // Membership-preserved control: when child_id does NOT change, the
+        // helper must pass the Edit through unchanged (no spurious split).
+        let mut new_row_same: crate::source::Row = serde_json::Map::new();
+        new_row_same.insert("id".to_string(), serde_json::json!("p1"));
+        new_row_same.insert("child_id".to_string(), serde_json::json!("A"));
+        new_row_same.insert("_0_version".to_string(), serde_json::json!("125"));
+        let edit_same_key = crate::source::SourceChange::Edit {
+            row: new_row_same,
+            old_row: old_row.clone(),
+        };
+        let split_same = super::maybe_split_edit_for_advance(edit_same_key, &keys);
+        assert_eq!(
+            split_same.len(), 1,
+            "membership-preserved Edit MUST pass through unchanged; got {split_same:?}"
+        );
+        assert!(
+            matches!(split_same[0], crate::source::SourceChange::Edit { .. }),
+            "passthrough MUST preserve the Edit variant; got {:?}", split_same[0]
+        );
+    }
+
     // ─── Persistent Pipeline Benchmark ──────────────────────────────────────
     //
     // Run with: cargo test -p zqlite-rs bench_persistent_pipeline_sequential_vs_parallel --release -- --nocapture
