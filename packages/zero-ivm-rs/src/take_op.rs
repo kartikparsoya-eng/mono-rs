@@ -317,10 +317,26 @@ impl Operator for TakeOperator {
                 return result;
             }
         } else if let Some(c) = &req.constraint {
-            // No explicit partition_key, but a constraint is present (e.g. child
-            // Take inside a Join — each parent passes a different constraint).
-            // Derive a per-constraint state key so each parent gets its own
-            // take state instead of sharing a single global bound.
+            // B3: per-constraint state-key fallback. Reachable when
+            // partition_key is None AND a constraint is present (legacy child
+            // Take inside Join). Pre-Phase-34 Rust hard-coded partition_key=None
+            // at ast_to_config.rs:245, making this branch the only key-derivation
+            // path for child Takes — but push uses take_state_key(&row) which
+            // returns "[\"take\"]" for None partition, so push silently no-oped
+            // (state miss). Post-Phase-34 plan 34-05 threads partition_key, so
+            // this branch should never fire in correctly-built pipelines.
+            // Per AUDIT-03 (.planning/IVM-PORT-AUDIT.md Risk #2) framework
+            // invariants are assert! not debug_assert! — promoted here so a
+            // missed call site surfaces in release builds, not just debug.
+            assert!(
+                self.partition_key.is_some() || c.columns.is_empty(),
+                "Take fetch: partition_key not threaded for constrained child \
+                 Take. See .planning/IVM-PORT-AUDIT-DEEP.md §B3 and \
+                 .planning/IVM-PORT-AUDIT.md Risk #1."
+            );
+            // Safety-net key derivation for the (now-unreachable) None-partition
+            // path. Keep the legacy shape so any pipeline still emitting None
+            // doesn't crash — the assert above will already have fired.
             let mut vals: Vec<serde_json::Value> = vec![serde_json::Value::String("take".to_string())];
             let mut keys: Vec<&String> = c.columns.keys().collect();
             keys.sort();
@@ -1067,66 +1083,148 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 34 Wave 0 — Red-state stub for B3 secondary site (CONTEXT D-18).
-    // The PRIMARY B3 fix is in zqlite-rs::ast_to_config (parameter threading).
-    // This test asserts the take_op-side symptom: when partition_key is None
-    // (i.e., not threaded), `take_state_key(&row)` returns the global bucket
-    // `"[\"take\"]"`, which is a constant — not a row-derived key. Wave 1
-    // re-tests after threading: state_key should derive from the row's
-    // partition columns and match the fetch-time constraint-derived key.
+    // Phase 34 Wave 2 — B3 fix landed (plan 34-05). The Wave 0 secondary-site
+    // stub (`test_b3_partition_state_consistency`) is replaced below with a
+    // behavioral assertion: with `partition_key: Some([…])`, fetch (constraint-
+    // driven) and push (row-driven) produce identical state keys, so push no
+    // longer silently no-ops on child Takes. Plus a focused regression
+    // (`test_b3_push_emits_change_for_constrained_child_take`) confirms the
+    // end-to-end push path produces a real change instead of an empty Vec.
     // ========================================================================
 
-    /// **B3 (BLOCKING — secondary site) — Take state-key consistency.**
+    /// **B3 (BLOCKING — secondary site) — Take state-key consistency. (GREEN)**
     ///
     /// Spec: TS `packages/zql/src/ivm/take.ts:710-757` (`getTakeStateKey`)
     /// uses `partitionKey` to extract values from EITHER a row (push path) OR
     /// a constraint (fetch path). The same partition values must produce the
     /// same key on both paths.
     ///
-    /// Current Rust:
-    /// - `take_op.rs:55-67` (`take_state_key`, used by push) — returns
+    /// Pre-Phase-34 Rust:
+    /// - `take_op.rs:55-67` (`take_state_key`, used by push) returned
     ///   `"[\"take\"]"` when `partition_key: None`.
-    /// - `take_op.rs:317-329` (fetch fallback) — when partition_key is None
-    ///   but a constraint is present (child Take inside a Join), builds a
-    ///   different key including the constraint columns + values.
+    /// - `take_op.rs:317-329` (fetch fallback) when partition_key was None
+    ///   but a constraint was present built a different key including the
+    ///   constraint columns + values, so push silently no-oped.
     ///
-    /// The two paths emit different keys → push silently no-ops because
-    /// `states.get(&push_key)` returns None.
-    ///
-    /// Wave 0 Red-state: a TakeOperator with `partition_key: None` returns
-    /// the constant `"[\"take\"]"` from `take_state_key` regardless of the
-    /// row contents. Wave 1 (after B3 fix lands and partition_key is threaded
-    /// from ast_to_config) re-tests: a TakeOperator with
-    /// `partition_key: Some(vec!["channelId"])` should derive a row-specific
-    /// key, and that key should equal the constraint-derived key.
+    /// Post-Phase-34 plan 34-05: ast_to_config now threads partition_key, so
+    /// the fetch path at lines 286-289 builds a Row from constraint and calls
+    /// `take_state_key(&m)` — exactly mirroring the push path
+    /// `take_state_key(&change.node().row)`. Same key shape.
     #[test]
-    #[ignore = "Phase 34 Wave 1 will flip this green by threading partition_key \
-        through ast_to_operator_configs (zqlite-rs B3 fix) and asserting that \
-        TakeOperator with Some(partition_key) emits matching push/fetch keys. \
-        Spec: TS take.ts:710-757."]
     fn test_b3_partition_state_consistency() {
-        // Build a Take with partition_key None — current bug surface.
+        // Build a Take with partition_key Some(["channelId"]).
         let mock = MockInput::new(vec![make_node(1), make_node(2)]);
-        let op = TakeOperator::new(Box::new(mock), 2, default_sort(), None);
+        let op = TakeOperator::new(
+            Box::new(mock),
+            2,
+            default_sort(),
+            Some(vec!["channelId".to_string()]),
+        );
 
-        // Inspect the state-key behavior. Wave 0 stub: directly use the
-        // private helper via shared state inspection. Since `take_state_key`
-        // is private, we observe its effect via push: when push runs and
-        // partition_key is None, the key collapses to a global bucket — so
-        // two distinct rows with different partition columns share state.
-        // Wave 1 will replace this with: build with Some(["channelId"]),
-        // derive both keys, assert they match.
+        // Push path: row-driven key.
+        let mut row = Row::new();
+        row.insert("channelId".to_string(), serde_json::json!("ch-1"));
+        row.insert("id".to_string(), serde_json::json!(42));
+        let push_key = op.take_state_key(&row);
 
-        // Red state: drop op (no-op for the assertion); rely on the source
-        // marker inspection — the literal `"[\"take\"]"` constant is the
-        // documented broken behavior. Wave 1 removes it.
-        drop(op);
-        let src = include_str!("take_op.rs");
+        // Fetch path: constraint-driven key. Mirrors the fetch logic at
+        // take_op.rs:286-289 (build a Row from constraint, call take_state_key).
+        let constraint = crate::types::Constraint::single(
+            "channelId".to_string(),
+            serde_json::json!("ch-1"),
+        );
+        let fetch_row: Row = constraint
+            .columns
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let fetch_key = op.take_state_key(&fetch_row);
+
+        assert_eq!(
+            fetch_key, push_key,
+            "B3 (TS take.ts:710-757): fetch and push keys must match for \
+             matching partition values. Got fetch={} push={}",
+            fetch_key, push_key
+        );
+        // And the key must NOT be the global bucket "[\"take\"]" — the prior
+        // bug surface.
+        assert_ne!(
+            push_key, "[\"take\"]",
+            "B3: with Some(partition_key), the key must be row-derived, \
+             not the global bucket."
+        );
+    }
+
+    /// **B3 — push emits a change for a constrained child Take. (GREEN)**
+    ///
+    /// Mirrors TS take.ts:219 push semantics — a child Take with partition_key
+    /// set, after fetch primes state via constraint, push for a row matching
+    /// that constraint must produce a non-empty change vec (not silent no-op).
+    ///
+    /// Pre-fix: `take_state_key(&row)` returned `"[\"take\"]"`, push got `None`
+    /// from `states.get`, returned `vec![]` (BUG). Post-fix: keys match,
+    /// states.get returns Some, transition is emitted.
+    #[test]
+    fn test_b3_push_emits_change_for_constrained_child_take() {
+        // Set up rows with a partition column.
+        let mut r1 = Row::new();
+        r1.insert("channelId".to_string(), serde_json::json!("ch-1"));
+        r1.insert("id".to_string(), serde_json::json!(1));
+        let n1 = Node {
+            row: r1,
+            relationships: HashMap::new(),
+        };
+        let mut r2 = Row::new();
+        r2.insert("channelId".to_string(), serde_json::json!("ch-1"));
+        r2.insert("id".to_string(), serde_json::json!(2));
+        let n2 = Node {
+            row: r2,
+            relationships: HashMap::new(),
+        };
+
+        let mock = MockInput::new(vec![n1, n2]);
+        let mut op = TakeOperator::new(
+            Box::new(mock),
+            5,
+            default_sort(),
+            Some(vec!["channelId".to_string()]),
+        );
+
+        // Prime state via fetch with a constraint matching the partition.
+        let constraint = crate::types::Constraint::single(
+            "channelId".to_string(),
+            serde_json::json!("ch-1"),
+        );
+        let req = FetchRequest {
+            constraint: Some(constraint),
+            start: None,
+            reverse: false,
+        };
+        let initial = op.fetch(&req);
+        assert_eq!(
+            initial.len(),
+            2,
+            "B3 setup: fetch should return both rows (limit=5, 2 rows in input)"
+        );
+
+        // Now push an Add for a third row in the same partition. Pre-fix this
+        // would silently no-op because the state key for `["take"]` (push) did
+        // not match the state key the fetch wrote under
+        // `["take","channelId","ch-1"]`. Post-fix both paths derive the key
+        // from the partition column → states.get returns Some → push emits.
+        let mut r3 = Row::new();
+        r3.insert("channelId".to_string(), serde_json::json!("ch-1"));
+        r3.insert("id".to_string(), serde_json::json!(3));
+        let n3 = Node {
+            row: r3,
+            relationships: HashMap::new(),
+        };
+        let result = op.push(Change::Add(n3));
         assert!(
-            src.contains("None => \"[\\\"take\\\"]\".to_string(),"),
-            "Wave 0 expected the partition_key=None branch returning the global bucket \
-             constant `[\"take\"]` (current bug). Not found — Wave 1 may have landed \
-             without removing the stub."
+            !result.is_empty(),
+            "B3: push must produce a change for a row matching the constrained \
+             partition (limit=5, current size=2 → Add transitions). Got {:?}",
+            result
         );
     }
 }
