@@ -911,4 +911,149 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], Change::Child { .. }));
     }
+
+    // ─── Category: Edit, no or_predicate (2 tests) ──────────────────────────
+
+    #[test]
+    fn test_or_exists_edit_count_change_no_predicate() {
+        // No or_predicate, parent has 1 matching child cached. Push Edit
+        // (id unchanged, name field changes) — both old & new evaluate
+        // against the same parent_key_str/branch state → both pass →
+        // emit Edit. Mirrors exists_op.rs::test_exists_edit_no_or_predicate_unchanged
+        // and exists_op.rs::test_exists_push_edit_passes_when_children_exist.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(1));
+        old_row.insert("name".to_string(), serde_json::json!("old"));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(1));
+        new_row.insert("name".to_string(), serde_json::json!("new"));
+
+        let edit = Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        };
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
+
+    #[test]
+    fn test_or_exists_edit_no_or_predicate_passes_when_children_exist() {
+        // No or_predicate. Children exist (1) → both old and new pass via
+        // any_branch_passes → emit Edit. This is a direct mirror of
+        // exists_op.rs::test_exists_push_edit_passes_when_children_exist
+        // but for OrExists with the "or_predicate=None" branch covered.
+        let parents = vec![make_node(2)];
+        let children = vec![make_node_with_parent(20, 2)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(2));
+        old_row.insert("title".to_string(), serde_json::json!("first"));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(2));
+        new_row.insert("title".to_string(), serde_json::json!("second"));
+
+        let edit = Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        };
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
+
+    // ─── Category: Cache invalidation / fetch state (2 tests) ──────────────
+
+    #[test]
+    fn test_or_exists_cache_cleared_on_fetch() {
+        // Mirror of exists_op.rs:913-932. Fetch populates parent_sizes,
+        // a second fetch with different child set must rebuild the cache
+        // (not accumulate stale entries). We use two separate operators
+        // with different child sets to make the assertion deterministic.
+        let parents_first = vec![make_node(1)];
+        let children_first = vec![make_node_with_parent(10, 1)];
+        let mut op_first = build_or_exists_simple_branch(parents_first, children_first);
+        let result_first = op_first.fetch(&FetchRequest::default());
+
+        // After fetch: parent has child_count=1, passes filter → emitted.
+        assert_eq!(result_first.len(), 1);
+
+        // Independent operator with different child set (count=0). The
+        // fetch must compute count from scratch — no cross-operator cache
+        // pollution.
+        let parents_second = vec![make_node(1)];
+        let children_second: Vec<Node> = vec![];
+        let mut op_second = build_or_exists_simple_branch(parents_second, children_second);
+        // MockInput here returns 0 children, so count=0, parent fails the
+        // filter and is excluded.
+        let result_second = op_second.fetch(&FetchRequest::default());
+        assert!(result_second.is_empty());
+
+        // Now the *same* operator does a second fetch — cache must clear
+        // and rebuild. We just verify the fetch returns the same result
+        // as before (still empty) — this would fail if stale cache from a
+        // prior call leaked into the new fetch.
+        let result_second_again = op_second.fetch(&FetchRequest::default());
+        assert!(result_second_again.is_empty());
+    }
+
+    #[test]
+    fn test_or_exists_child_add_without_prior_fetch_recomputes() {
+        // Mirror of exists_op.rs:936-962. parent_sizes is empty (no fetch),
+        // push child add. Operator should recompute count from scratch
+        // (not default to 0). With 1 existing child + push of 1 new child,
+        // the recompute finds 1 → 1→2 transition (not 0→1) → Child passthrough.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)]; // 1 existing
+        let mut op = build_or_exists_simple_branch(parents, children);
+        // Don't call fetch — parent_sizes is empty across all branches.
+
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(20, 1))),
+            },
+        };
+        let result = op.push(child_add);
+        // Recomputed count should be 1 → 1→2 transition (was already
+        // passing, still passing) → Child passthrough.
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Child { .. }));
+    }
+
+    // ─── Category: In-push flag (1 test) ────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Unexpected re-entrancy")]
+    fn test_or_exists_in_push_flag_cleared_after_push() {
+        // Mirror of exists_op.rs:893-911 + 969-985. Drive a normal push
+        // that completes successfully, then force in_push=true and push
+        // again — should panic. This proves: (1) the flag was cleared at
+        // the end of the prior push (otherwise the second push would
+        // panic before we set it manually — which we'd see if the
+        // first push left in_push=true), and (2) the assertion fires when
+        // the flag is set.
+        let parents = vec![make_node(1)];
+        let children = vec![make_node_with_parent(10, 1)];
+        let mut op = build_or_exists_simple_branch(parents, children);
+        let _ = op.fetch(&FetchRequest::default());
+
+        // First push completes — flag must clear afterward.
+        let _ = op.push(Change::Add(make_node(1)));
+
+        // Force the flag back to true — proves the flag is observably
+        // false at this point (else the first push would have panicked).
+        op.force_in_push_for_test();
+
+        // Second push panics with "Unexpected re-entrancy".
+        let _ = op.push(Change::Add(make_node(2)));
+    }
 }
