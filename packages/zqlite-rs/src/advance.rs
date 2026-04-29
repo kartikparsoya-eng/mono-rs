@@ -1109,6 +1109,11 @@ pub(crate) fn build_pipeline_state(
         schema_cache,
         &query.ast,
         &query.primary_key,
+        // B3: top-level callers pass None — partition_key is only meaningful
+        // for child subqueries (related[] / EXISTS). Recursive calls inside
+        // ast_to_operator_configs pass Some(rel.correlation.child_field).
+        // Mirrors TS builder.ts top-level invocation. See plan 34-05.
+        None,
     )?;
 
     let split_edit_keys = collect_split_edit_keys(&query.ast);

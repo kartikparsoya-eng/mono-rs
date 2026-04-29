@@ -197,6 +197,13 @@ pub fn ast_to_operator_configs(
     schema: &mut SchemaCache,
     ast: &Ast,
     primary_key: &[String],
+    // B3: partition_key threaded per TS builder.ts:260-261. When the caller is
+    // the related-subquery recursion (or an EXISTS-subquery recursion), this
+    // carries the parent's `correlation.child_field` so a child Take inside
+    // the subquery uses a per-parent state bucket — mirrors TS
+    // `buildPipelineInternal(sq.subquery, ..., sq.correlation.childField)` at
+    // builder.ts:626. Closes IVM-PORT-AUDIT-DEEP §B3 + IVM-PORT-AUDIT Risk #1.
+    partition_key: Option<Vec<String>>,
 ) -> Result<Vec<OperatorConfig>, String> {
     let table_name = &ast.table;
     let columns = schema.get_columns(table_name)?;
@@ -246,22 +253,35 @@ pub fn ast_to_operator_configs(
         append_condition_configs(schema, &mut configs, cond, primary_key)?;
     }
 
-    // 4. Limit -> Take. Mirrors TS builder.ts:335-345. partition_key threading
-    //    lands in B3 (plan 34-05) — currently `None` is preserved here.
+    // 4. Limit -> Take. Mirrors TS builder.ts:335-345 + builder.ts:341
+    //    (`new Take(end, ..., partitionKey)`). B3: partition_key flows in via
+    //    the parameter — top-level callers pass None; recursive calls pass
+    //    `Some(rel.correlation.child_field.clone())` for related[] and
+    //    EXISTS-subquery sites. Pre-Phase-34 Rust hard-coded `None` here,
+    //    causing silent push-as-no-op on every related-with-limit shape.
+    //    See IVM-PORT-AUDIT-DEEP §B3 + IVM-PORT-AUDIT Risk #1.
     if let Some(limit) = ast.limit {
         configs.push(OperatorConfig::Take {
             limit,
             sort: sort.clone(),
-            partition_key: None,
+            partition_key: partition_key.clone(),
         });
     }
 
     // 5. Related -> Join. Mirrors TS builder.ts:347-356.
+    //    B3: child Take inherits parent's correlation.child_field as its
+    //    partition_key. Mirrors TS builder.ts:626-632:
+    //      `buildPipelineInternal(sq.subquery, ..., sq.correlation.childField)`
     if let Some(related) = &ast.related {
         for rel in related {
             let child_pk = schema.get_primary_key(&rel.subquery.table)?;
-            let child_configs =
-                ast_to_operator_configs(schema, &rel.subquery, &child_pk)?;
+            let child_partition = Some(rel.correlation.child_field.clone());
+            let child_configs = ast_to_operator_configs(
+                schema,
+                &rel.subquery,
+                &child_pk,
+                child_partition,
+            )?;
             configs.push(OperatorConfig::Join {
                 parent_key: rel.correlation.parent_field.clone(),
                 child_key: rel.correlation.child_field.clone(),
@@ -382,14 +402,25 @@ fn append_condition_configs(
             let not_exists = op == "NOT EXISTS";
             let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
+            // B3: thread parent's correlation.child_field into the child
+            // pipeline so any Take inside the EXISTS subquery (including the
+            // EXISTS_LIMIT downgrade Take applied below) gets the per-parent
+            // partition. Mirrors TS builder.ts:626-632 + builder.ts:308-329
+            // EXISTS context — partition is the parent.correlation.childField.
+            let child_partition = Some(related.correlation.child_field.clone());
             let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
+                child_partition,
             )?;
             // TS FlippedJoin does not apply EXISTS_LIMIT
             if !is_flipped {
-                apply_exists_limit(&mut child_configs, related.system.as_deref());
+                apply_exists_limit(
+                    &mut child_configs,
+                    related.system.as_deref(),
+                    Some(related.correlation.child_field.clone()),
+                );
             }
             configs.push(OperatorConfig::Exists {
                 relationship_name: relationship_name(related),
@@ -426,13 +457,22 @@ fn append_csq_as_exists(
             let not_exists = op == "NOT EXISTS";
             let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
+            // B3: thread parent's correlation.child_field — same as the
+            // top-level CSQ recursion at line ~385. Mirrors TS
+            // builder.ts:626-632 EXISTS subquery partition propagation.
+            let child_partition = Some(related.correlation.child_field.clone());
             let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
+                child_partition,
             )?;
             if !is_flipped {
-                apply_exists_limit(&mut child_configs, related.system.as_deref());
+                apply_exists_limit(
+                    &mut child_configs,
+                    related.system.as_deref(),
+                    Some(related.correlation.child_field.clone()),
+                );
             }
             configs.push(OperatorConfig::Exists {
                 relationship_name: relationship_name(related),
@@ -550,13 +590,21 @@ fn collect_exists_branches(
             let not_exists = op == "NOT EXISTS";
             let is_flipped = flip.unwrap_or(false);
             let child_pk = schema.get_primary_key(&related.subquery.table)?;
+            // B3: thread parent's correlation.child_field — same as the other
+            // two EXISTS recursion sites. Mirrors TS builder.ts:626-632.
+            let child_partition = Some(related.correlation.child_field.clone());
             let mut child_configs = ast_to_operator_configs(
                 schema,
                 &related.subquery,
                 &child_pk,
+                child_partition,
             )?;
             if !is_flipped {
-                apply_exists_limit(&mut child_configs, related.system.as_deref());
+                apply_exists_limit(
+                    &mut child_configs,
+                    related.system.as_deref(),
+                    Some(related.correlation.child_field.clone()),
+                );
             }
             branches.push(ExistsBranch {
                 relationship_name: relationship_name(related),
@@ -614,7 +662,17 @@ fn collect_exists_branches(
 /// Matches TS behavior where EXISTS subqueries always have a limit applied.
 /// The Take inherits the sort order from the child Source config so that
 /// the bound-based fetch path (after warm-up) correctly limits rows.
-fn apply_exists_limit(child_configs: &mut Vec<OperatorConfig>, system: Option<&str>) {
+///
+/// B3: `partition_key` is the EXISTS subquery's `correlation.child_field`,
+/// passed by every CSQ-recursion site (3 call sites in this file). When this
+/// Take fires, the child rows are partitioned per parent so push-side state
+/// keys match fetch-side keys. Pre-Phase-34 this was hard-coded `None`,
+/// causing the same silent push-as-no-op as the related[] Take site.
+fn apply_exists_limit(
+    child_configs: &mut Vec<OperatorConfig>,
+    system: Option<&str>,
+    partition_key: Option<Vec<String>>,
+) {
     // Check if there's already a Take in the child configs
     let has_take = child_configs.iter().any(|c| matches!(c, OperatorConfig::Take { .. }));
     if !has_take {
@@ -632,7 +690,7 @@ fn apply_exists_limit(child_configs: &mut Vec<OperatorConfig>, system: Option<&s
         child_configs.push(OperatorConfig::Take {
             limit,
             sort,
-            partition_key: None,
+            partition_key,
         });
     }
 }
@@ -1032,40 +1090,66 @@ mod tests {
         }
     }
 
-    /// **B3 (BLOCKING) — Take partition_key threading.**
+    /// **B3 (BLOCKING) — Take partition_key threading. (Phase 34 Wave 2 — GREEN)**
     ///
     /// Spec: TS `packages/zql/src/builder/builder.ts:626-632` propagates
     /// `sq.correlation.childField` as the child subquery's partition key.
     /// `take.ts:80-83, 99, 219` use this so fetch (constraint-driven) and
     /// push (row-driven) state keys match.
     ///
-    /// Current Rust (`ast_to_config.rs:240-247`): hard-coded `partition_key: None`
-    /// — the recursive call at line 254 also ignores the parent's child_field.
+    /// Pre-Phase-34 Rust (`ast_to_config.rs:240-247`) hard-coded
+    /// `partition_key: None` — the recursive calls also ignored the parent's
+    /// child_field. Phase 34 plan 34-05 threaded a `partition_key` parameter
+    /// through `ast_to_operator_configs` and updated all 4 internal recursive
+    /// call sites (related[] at line ~263 + 3 EXISTS sites at lines ~385,
+    /// ~429, ~553) to pass `Some(rel.correlation.child_field.clone())`.
     ///
-    /// Wave 0 Red-state assertion: the `partition_key: None,` literal exists in
-    /// the Take config branch. Wave 1 changes it to `partition_key: partition_key.clone(),`
-    /// and threads a new parameter through `ast_to_operator_configs`.
+    /// GREEN-state check: the Take config branch now uses the parameter
+    /// (`partition_key: partition_key.clone(),`), and the function signature
+    /// gains the `partition_key: Option<Vec<String>>` parameter.
     #[test]
-    #[ignore = "Phase 34 Wave 1 will flip this green by accepting \
-        `partition_key: Option<Vec<String>>` as a parameter and threading \
-        `Some(rel.correlation.child_field.clone())` into recursive related[] calls. \
-        Spec: TS builder.ts:626-632 + take.ts:80-83."]
     fn test_b3_partition_key_threading() {
         let src = include_str!("ast_to_config.rs");
+
+        // 1. Signature carries the new parameter.
+        let sig_marker =
+            src.find("pub fn ast_to_operator_configs(").expect("signature missing");
+        let sig_block = &src[sig_marker..sig_marker + 800];
+        assert!(
+            sig_block.contains("partition_key: Option<Vec<String>>"),
+            "B3 (TS builder.ts:260-261): ast_to_operator_configs must accept \
+             partition_key: Option<Vec<String>>. Got signature block: {}",
+            sig_block
+        );
+
+        // 2. Take config uses the parameter (no longer hard-coded None).
         let take_block_start = src
             .find("// 4. Limit -> Take")
             .expect("missing Take marker — code refactored?");
-        // Window widened to 600 chars after Phase 34 Plan 02 added a multi-line
-        // doc comment to the Take section as part of the B1 fix. The
-        // `partition_key: None,` literal sits ~290-330 chars past the marker
-        // depending on comment formatting.
-        let take_block = &src[take_block_start..take_block_start + 600];
-        // Red state: the literal `partition_key: None,` is present inside the
-        // Take config branch. Wave 1 removes it (replaces with the parameter).
+        let take_block = &src[take_block_start..take_block_start + 1000];
         assert!(
-            take_block.contains("partition_key: None,"),
-            "Wave 0 expected `partition_key: None,` in the Take branch (current bug); \
-             not found. Did Wave 1 fix land without removing the stub?"
+            take_block.contains("partition_key: partition_key.clone(),"),
+            "B3 (TS builder.ts:341): Take config must thread the parameter. \
+             Got take_block:\n{}",
+            take_block
+        );
+        assert!(
+            !take_block.contains("partition_key: None,\n        });"),
+            "B3: hard-coded `partition_key: None` at the Take config site \
+             must be replaced with the parameter."
+        );
+
+        // 3. Related-recursion site passes child_field.
+        let related_block_start = src
+            .find("// 5. Related -> Join")
+            .expect("missing Related marker");
+        let related_block = &src[related_block_start..related_block_start + 1000];
+        assert!(
+            related_block.contains("Some(rel.correlation.child_field.clone())"),
+            "B3 (TS builder.ts:626-632): related-recursion must pass \
+             Some(rel.correlation.child_field.clone()) as partition_key. \
+             Got related_block:\n{}",
+            related_block
         );
     }
 }
