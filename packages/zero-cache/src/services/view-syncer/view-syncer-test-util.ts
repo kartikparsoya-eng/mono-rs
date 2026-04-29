@@ -475,6 +475,114 @@ export async function nextPokeParts(
     .map(([, body]) => body);
 }
 
+/**
+ * Merge a sequence of `pokePart` bodies (from one or more `Downstream`
+ * messages within a single poke) into a single normalized `PokePartBody` for
+ * assertion purposes.
+ *
+ * Why: Under `ZQLITE_RS_USE_STREAMING_CONSUMER=true` (Phase 32 / CONTEXT D-06),
+ * view-syncer flushes `processBatch` per chunk boundary, producing multiple
+ * `pokePart` messages where the buffered path produced one. The wire
+ * protocol explicitly allows multi-part pokes (see `packages/zero-protocol/
+ * src/poke.ts`): "The poke continues with zero to many `poke-part` messages
+ * ... These patch parts should be merged in the order received."
+ *
+ * Tests that previously asserted a single-pokePart shape via inline snapshot
+ * use this helper to remain mode-agnostic — they assert WHAT data arrives in
+ * the poke (user-visible contract), not HOW MANY pokeParts batch it
+ * (internal cadence). Cf. CONTEXT D-06.
+ *
+ * Merge rules (mirror the client-side merge semantics in `packages/zero-
+ * client/src/client/poke-handler.ts`):
+ * - `pokeID` — must be identical across parts; preserved from first part.
+ * - `lastMutationIDChanges` — record-merge (later wins per-key).
+ * - `desiredQueriesPatches` — record of arrays; per-clientID concat.
+ * - `gotQueriesPatch`, `rowsPatch`, `mutationsPatch` — array concat in order.
+ * - Keys that are absent across all parts remain absent (not set to []/{}).
+ */
+export function mergePokePartsIntoOne(
+  parts: readonly PokePartBody[],
+): PokePartBody {
+  if (parts.length === 0) {
+    throw new Error('mergePokePartsIntoOne: parts must not be empty');
+  }
+  const first = parts[0];
+  const merged: PokePartBody = {pokeID: first.pokeID};
+
+  for (const part of parts) {
+    if (part.pokeID !== merged.pokeID) {
+      throw new Error(
+        `mergePokePartsIntoOne: pokeID mismatch (${merged.pokeID} vs ${part.pokeID})`,
+      );
+    }
+    if (part.lastMutationIDChanges !== undefined) {
+      merged.lastMutationIDChanges = {
+        ...(merged.lastMutationIDChanges ?? {}),
+        ...part.lastMutationIDChanges,
+      };
+    }
+    if (part.desiredQueriesPatches !== undefined) {
+      const accum = {...(merged.desiredQueriesPatches ?? {})};
+      for (const [clientID, patch] of Object.entries(
+        part.desiredQueriesPatches,
+      )) {
+        accum[clientID] = [...(accum[clientID] ?? []), ...patch];
+      }
+      merged.desiredQueriesPatches = accum;
+    }
+    if (part.gotQueriesPatch !== undefined) {
+      merged.gotQueriesPatch = [
+        ...(merged.gotQueriesPatch ?? []),
+        ...part.gotQueriesPatch,
+      ];
+    }
+    if (part.rowsPatch !== undefined) {
+      merged.rowsPatch = [...(merged.rowsPatch ?? []), ...part.rowsPatch];
+    }
+    if (part.mutationsPatch !== undefined) {
+      merged.mutationsPatch = [
+        ...(merged.mutationsPatch ?? []),
+        ...part.mutationsPatch,
+      ];
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Streaming-mode-tolerant variant of `nextPoke`. Returns the full poke as a
+ * 3-element tuple `[pokeStart, pokePart, pokeEnd]` where the `pokePart` body
+ * is the merge of all `pokePart` messages emitted between `pokeStart` and
+ * `pokeEnd`. See `mergePokePartsIntoOne` for merge semantics.
+ *
+ * Use this in PG tests that assert against the full poke shape via
+ * `toMatchInlineSnapshot` — under streaming mode the buffered single-part
+ * snapshot is reconstructed by merging.
+ *
+ * If the poke contains zero `pokePart` messages (rare — e.g., empty advance
+ * with only metadata), the returned shape is `[pokeStart, pokeEnd]` (the
+ * `pokePart` slot is omitted). Tests that expect a `pokePart` should ensure
+ * the underlying advance produces one.
+ */
+export async function nextPokeMerged(
+  client: Queue<Downstream>,
+): Promise<Downstream[]> {
+  const pokes = await nextPoke(client);
+  const start = pokes.find(m => m[0] === 'pokeStart');
+  const end = pokes.find(m => m[0] === 'pokeEnd');
+  const partBodies = pokes
+    .filter((m: Downstream) => m[0] === 'pokePart')
+    .map(([, body]) => body as PokePartBody);
+  const result: Downstream[] = [];
+  if (start) result.push(start);
+  if (partBodies.length > 0) {
+    result.push(['pokePart', mergePokePartsIntoOne(partBodies)] as Downstream);
+  }
+  if (end) result.push(end);
+  return result;
+}
+
 export async function expectNoPokes(client: Queue<Downstream>) {
   // Use the dequeue() API that cancels the dequeue() request after a timeout.
   const timedOut = 'nothing' as unknown as Downstream;
