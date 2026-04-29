@@ -1434,27 +1434,27 @@ export function buildArbitraries(adapted: AdaptedSchema): {
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Should the advance napi method's signature for B11 use `set_prev_snapshot` (Option B — additive method) or extend `advance(changes_json, prev_db_path?)` (Option A — new optional arg)?**
    - What we know: D-22 / CLAUDE.md verification gate #4 says "no signature change to existing buffered methods (`advance`, ...)". Option A is technically a signature change (additive arg); Option B is purely additive (new method).
    - What's unclear: is the spirit of the constraint "no breaking change" (Option A is fine) or "no surface-area change at all" (Option B is required)?
-   - Recommendation: **Option B** by default (safer interpretation of the constraint, no risk to TS callers, no napi-rs Option<T> ergonomics surprises). Planner can flag for user input if they prefer Option A.
+   - **RESOLVED:** Option B (additive `set_prev_snapshot` method). Strict reading of CLAUDE.md gate #4 prohibits any modification to the named buffered-method signatures, so a new arg on `advance` is rejected. Implemented in plan 34-06 Task 1.
 
 2. **Should `tools/ivm-parity/synth-p6.ts` and `synth-p7.ts` be merged into the new fast-check generator (CD-03)?**
    - What we know: They are existing shipped-query archetype synthesizers. fast-check generates random ASTs.
    - What's unclear: do they cover shapes the random generator won't reach probabilistically?
-   - Recommendation: **Keep separate**. They feed `seed-extractor.ts` which produces `seed_*` corpus entries — these are deterministic and high-confidence. Fast-check is exploratory. Both exist; both run.
+   - **RESOLVED:** Keep separate (CONTEXT CD-03 explicitly defers to researcher/planner; planner chose separate). `synth-p*.ts` feed `seed-extractor.ts` producing deterministic `seed_*` corpus entries; fast-check is exploratory. Both exist and both run in the integrated `npm test` script per plan 34-07 Task 2.
 
 3. **Is the 2-min budget for 1k iterations achievable with current zero-cache startup overhead?**
    - What we know: Last `harness-advance-coverage.ts` full run was 221.2s for 1084 ASTs.
    - What's unclear: Phase 34's batch size, mutation pruning, and concurrency optimizations get to <120s. But existing 221s is JUST OVER budget already.
-   - Recommendation: **Wave 1 must include a probing task** that times the skeleton fuzz harness with 100 iterations and projects to 1000. If projected total > 150s, optimize (BATCH_SIZE=60, mutation pruning) before extending FUZZ-02 schema.
+   - **RESOLVED:** Wave 1 includes a 100-iteration timing probe (plan 34-03 Task 3) that projects to 1000 BEFORE FUZZ-02 schema extends the table count. If projected > 150s, BATCH_SIZE=60 + mutation pruning are applied. Final 1k gate runs in plan 34-07 Task 1 with explicit `< 120000ms` assertion.
 
 4. **What is the right allow-list format (CD-04)?**
    - What we know: 5 catalogued divergences exist (`PARITY_STATUS.md`). 4 deferred (B5/B6/B7/B12) shapes need pre-filtering.
    - What's unclear: per-AST exact-match (canonical key) vs shape-pattern match (e.g., "any AST with `flip: true`")?
-   - Recommendation: **Per-canonical-key** (use existing `canonicalKey` from `ast-fuzz.ts:834`). Pattern-match adds complexity and risks over-suppressing real divergences. List in `tools/ivm-parity/allow-list.json`.
+   - **RESOLVED:** Hybrid — 5 catalogued divergences use per-canonical-key match (exact `seed_18`, `fuzz_00132/133/139/140` IDs); 4 deferred items (B5/B6/B7/B12) use shape-pattern match because the random generator will surface novel canonical keys exhibiting those shapes. Implemented as `parity-allowlist.json` with `keys[]` and `patterns[]` arrays in plan 34-01 Task 1.
 
 ---
 
