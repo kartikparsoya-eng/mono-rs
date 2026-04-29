@@ -163,7 +163,8 @@ impl Operator for CapOperator {
             Change::Edit { old_node, .. } => {
                 let old_part_key = cap_state_key(self.partition_key.as_deref(), &old_node.row);
                 let new_part_key = cap_state_key(self.partition_key.as_deref(), &change.node().row);
-                debug_assert_eq!(
+                // Promoted from debug_assert_eq! per AUDIT-03 (Phase 30 D-08).
+                assert_eq!(
                     old_part_key, new_part_key,
                     "Cap: partition key must not change on edit"
                 );

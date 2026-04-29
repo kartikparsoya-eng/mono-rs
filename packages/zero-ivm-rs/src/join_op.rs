@@ -215,8 +215,10 @@ impl Operator for JoinOperator {
                 vec![Change::Remove(node)]
             }
             Change::Edit { node, old_node } => {
-                // TS asserts the edit cannot change the join key
-                debug_assert!(
+                // TS asserts the edit cannot change the join key.
+                // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08): a
+                // silent miscalculation downstream is worse than a loud panic.
+                assert!(
                     !self.join_key_changed(&old_node.row, &node.row),
                     "Parent edit must not change relationship."
                 );
@@ -259,8 +261,9 @@ impl Operator for JoinOperator {
                 self.push_child_change(&node.row.clone(), change)
             }
             Change::Edit { node, old_node } => {
-                // TS asserts child edit cannot change the join key
-                debug_assert!(
+                // TS asserts child edit cannot change the join key.
+                // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08).
+                assert!(
                     !self.child_key_changed(&old_node.row, &node.row),
                     "Child edit must not change relationship."
                 );

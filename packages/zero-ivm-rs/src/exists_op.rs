@@ -174,8 +174,9 @@ impl Operator for ExistsOperator {
     }
 
     fn push(&mut self, change: Change) -> Vec<Change> {
-        // TS: assert(!this.#inPush, 'Unexpected re-entrancy') (e1)
-        debug_assert!(!self.in_push, "Unexpected re-entrancy");
+        // TS: assert(!this.#inPush, 'Unexpected re-entrancy') (e1).
+        // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08).
+        assert!(!self.in_push, "Unexpected re-entrancy");
         self.in_push = true;
         let result = self.push_impl(change);
         self.in_push = false;

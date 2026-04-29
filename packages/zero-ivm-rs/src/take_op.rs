@@ -196,8 +196,9 @@ impl TakeOperator {
         if old_cmp == Greater {
             // Both outside
             if new_cmp == Greater || new_cmp == Equal {
-                // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key')
-                debug_assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
+                // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key').
+                // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08).
+                assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
                 return vec![];
             }
 
@@ -242,8 +243,9 @@ impl TakeOperator {
             return vec![Change::Edit { node, old_node }];
         }
 
-        // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key')
-        debug_assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
+        // TS: assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key').
+        // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08).
+        assert!(new_cmp != Equal, "Invalid state. Row has duplicate primary key");
 
         // Old inside, new outside (newCmp > 0)
         assert!(new_cmp == Greater);

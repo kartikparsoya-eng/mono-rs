@@ -229,7 +229,9 @@ impl Operator for OrExistsOperator {
     }
 
     fn push(&mut self, change: Change) -> Vec<Change> {
-        debug_assert!(!self.in_push, "Unexpected re-entrancy");
+        // Promoted from debug_assert! per AUDIT-03 (Phase 30 D-08, parity with
+        // ExistsOperator). Re-entrancy is a framework invariant.
+        assert!(!self.in_push, "Unexpected re-entrancy");
         self.in_push = true;
         let result = self.push_impl(change);
         self.in_push = false;
