@@ -56,10 +56,10 @@
 
 ### Audit Bug Fixes (from `.planning/IVM-PORT-AUDIT.md`)
 
-- [ ] **AUDIT-01** (Bug #1): Fix `LIKE` case sensitivity at `packages/zqlite-rs/src/hydrate.rs:769`. Change `Predicate::Like(field, pattern, true)` to `false` for the `like` key. Add a regression test that distinguishes `LIKE 'Foo%'` from `LIKE 'foo%'`.
-- [ ] **AUDIT-02** (Bug #2): Fix `EXISTS` parent_field missing from `collect_split_edit_keys` in `packages/zqlite-rs/src/advance.rs`. Add `Condition::CorrelatedSubquery` arm that recurses and adds `related.correlation.parent_field` to keys. Add regression test: edit a column that is an EXISTS parent_field; assert source emits Remove+Add (not Edit) and downstream output is correct.
-- [ ] **AUDIT-03** (Risk #2): Promote framework-invariant `debug_assert!` to `assert!` in `join_op.rs` (parent edit / child edit must not change relationship), `exists_op.rs` (Unexpected re-entrancy), `take_op.rs` (Invalid state — duplicate primary key), `cap_op.rs` (partition key must not change on edit).
-- [ ] **AUDIT-04** (Risk #3): Fix `ExistsOperator` and `OrExistsOperator` Edit handling when `or_predicate` is set — evaluate `or_predicate` on both `old_node.row` and `node.row`; emit Remove if old passed but new doesn't, Add if vice versa, pass-through if both match the same way.
+- [x] **AUDIT-01** (Bug #1): Fix `LIKE` case sensitivity at `packages/zqlite-rs/src/hydrate.rs:769`. Change `Predicate::Like(field, pattern, true)` to `false` for the `like` key. Add a regression test that distinguishes `LIKE 'Foo%'` from `LIKE 'foo%'`.
+- [x] **AUDIT-02** (Bug #2): Fix `EXISTS` parent_field missing from `collect_split_edit_keys` in `packages/zqlite-rs/src/advance.rs`. Add `Condition::CorrelatedSubquery` arm that recurses and adds `related.correlation.parent_field` to keys. Add regression test: edit a column that is an EXISTS parent_field; assert source emits Remove+Add (not Edit) and downstream output is correct.
+- [x] **AUDIT-03** (Risk #2): Promote framework-invariant `debug_assert!` to `assert!` in `join_op.rs` (parent edit / child edit must not change relationship), `exists_op.rs` (Unexpected re-entrancy), `take_op.rs` (Invalid state — duplicate primary key), `cap_op.rs` (partition key must not change on edit).
+- [x] **AUDIT-04** (Risk #3): Fix `ExistsOperator` and `OrExistsOperator` Edit handling when `or_predicate` is set — evaluate `or_predicate` on both `old_node.row` and `node.row`; emit Remove if old passed but new doesn't, Add if vice versa, pass-through if both match the same way.
 
 ---
 
