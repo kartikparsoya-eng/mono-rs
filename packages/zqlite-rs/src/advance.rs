@@ -1215,13 +1215,25 @@ pub(crate) static PIPELINE_INVOCATION_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Cancel-aware variant of `advance_persistent_pipeline` used by streaming.
-/// Phase 31 Task 5/6 inserts a real cancel check at the per-change loop
-/// boundary. For now this just delegates so the streaming code compiles.
+///
+/// Differs from the buffered path in exactly one place: the per-change loop
+/// observes `cancel.load(Ordering::Relaxed)` at its top and short-circuits
+/// (returning whatever row_changes have been accumulated so far) when set.
+///
+/// Cadence: once-per-change at the natural insertion point per RESEARCH
+/// Open Q #2. If big-pipeline scenarios reveal this is insufficient,
+/// escalation to once-per-operator inside `push_through_ptrs`
+/// (advance.rs:1264-1275) is the documented fallback.
+///
+/// All other code is byte-identical to `advance_persistent_pipeline` so the
+/// non-cancelled output is unchanged. Existing buffered call sites continue
+/// to use `advance_persistent_pipeline` directly (COMPAT-02 — no signature
+/// change to existing function).
 pub(crate) fn advance_persistent_pipeline_with_cancel(
     pipeline: &mut PipelineState,
     changes: &[Change],
     db_path: &str,
-    _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<RowChange> {
     #[cfg(test)]
     {
@@ -1231,8 +1243,198 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
             panic!("test-injected panic at pipeline index {}", idx);
         }
     }
-    // TODO(Task 6): observe _cancel between iterations of the per-change loop.
-    advance_persistent_pipeline(pipeline, changes, db_path)
+
+    if !pipeline.has_operators {
+        return changes_to_row_changes_direct(
+            changes,
+            &FullPipelineConfig {
+                query_id: pipeline.query_id.clone(),
+                source_table: pipeline.source_table.clone(),
+                operator_config: pipeline.operator_config.clone(),
+                primary_key: pipeline.primary_key.clone(),
+                split_edit_keys: vec![],
+                column_types: pipeline.column_types.clone(),
+                all_primary_keys: pipeline.all_primary_keys.clone(),
+                rel_to_table: pipeline.rel_to_table.clone(),
+            },
+            &pipeline.source_table,
+            &pipeline.primary_key,
+        );
+    }
+
+    /// Push a change through operators via raw pointers (inner→outer).
+    /// SAFETY: `ptrs` and `len` describe a valid slice of raw pointers into
+    /// heap-allocated operators in the nested chain. Sequential — no aliasing.
+    unsafe fn push_through_ptrs(change: IvmChange, ptrs: *const *mut dyn IvmOperator, len: usize) -> Vec<IvmChange> {
+        let mut current = vec![change];
+        for i in 0..len {
+            let ptr = *ptrs.add(i);
+            let mut next = Vec::new();
+            for c in current {
+                next.extend((*ptr).push(c));
+            }
+            current = next;
+        }
+        current
+    }
+
+    let mut row_changes = Vec::new();
+
+    for change in changes.iter() {
+        // STREAM-04: cancel observation at change boundary (RESEARCH Open Q #2).
+        // Once-per-change is the natural insertion point. If TEST-01 reveals
+        // big-pipeline scenarios where this is insufficient, escalate to
+        // once-per-operator inside push_through_ptrs (advance.rs:1264-1275).
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return row_changes;
+        }
+
+        if change.table == pipeline.source_table {
+            let raw_source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            let source_changes: Vec<SourceChange> = raw_source_changes
+                .into_iter()
+                .flat_map(|sc| maybe_split_edit_for_advance(sc, &pipeline.split_edit_keys))
+                .collect();
+            for sc in source_changes {
+                let ivm_change = source_change_to_ivm_change(&sc);
+                let output_changes = unsafe {
+                    push_through_ptrs(ivm_change, pipeline.push_ptrs.as_ptr(), pipeline.push_ptrs.len())
+                };
+                for oc in &output_changes {
+                    flatten_ivm_change_to_row_changes(
+                        &mut row_changes,
+                        oc,
+                        &pipeline.query_id,
+                        &change.table,
+                        &pipeline.primary_key,
+                        &pipeline.all_primary_keys,
+                    );
+                    if let IvmChange::Remove(node) = oc {
+                        let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
+                        if !has_child_rows && !pipeline.children_of_map.is_empty() {
+                            let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                    }
+                }
+            }
+        } else if let Some(op_entries) = pipeline.child_table_to_op_index.get(&change.table) {
+            let op_entries = op_entries.clone();
+            for (op_idx, child_pk) in &op_entries {
+                let child_source_changes = diff_change_to_source_changes(change, child_pk);
+                for sc in child_source_changes {
+                    let ivm_change = source_change_to_ivm_change(&sc);
+                    let child_outputs = unsafe { (*pipeline.push_ptrs[*op_idx]).push_child(ivm_change) };
+                    let remaining_start = op_idx + 1;
+                    let remaining_len = pipeline.push_ptrs.len() - remaining_start;
+                    let current = if remaining_len > 0 {
+                        unsafe {
+                            let mut current = child_outputs;
+                            let ptrs = pipeline.push_ptrs.as_ptr().add(remaining_start);
+                            for i in 0..remaining_len {
+                                let ptr = *ptrs.add(i);
+                                let mut next = Vec::new();
+                                for c in current {
+                                    next.extend((*ptr).push(c));
+                                }
+                                current = next;
+                            }
+                            current
+                        }
+                    } else {
+                        child_outputs
+                    };
+                    for oc in &current {
+                        flatten_ivm_change_to_row_changes(
+                            &mut row_changes,
+                            oc,
+                            &pipeline.query_id,
+                            &pipeline.source_table,
+                            &pipeline.primary_key,
+                            &pipeline.all_primary_keys,
+                        );
+                    }
+                }
+            }
+        } else if let Some(child_infos) = pipeline.child_table_map.get(&change.table) {
+            for ci in child_infos {
+                let child_source_changes = diff_change_to_source_changes(change, &ci.child_pk);
+                for sc in &child_source_changes {
+                    match sc {
+                        SourceChange::Remove(ref row) => {
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: None,
+                                change_type: "remove".to_string(),
+                            });
+                            let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            emit_descendant_removals(
+                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                            );
+                        }
+                        SourceChange::Add(ref row) => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row_map.into_iter().collect()),
+                                change_type: "add".to_string(),
+                            });
+                        }
+                        SourceChange::Edit { row, .. } => {
+                            let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !child_row_has_parent(db_path, ci, &row_map) {
+                                continue;
+                            }
+                            let row_key = extract_row_key_from_source_row(row, &ci.child_pk);
+                            row_changes.push(RowChange {
+                                query_id: pipeline.query_id.clone(),
+                                table: ci.relationship_name.clone(),
+                                row_key,
+                                row: Some(row_map.into_iter().collect()),
+                                change_type: "edit".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate (matches buffered path)
+    {
+        let mut seen = HashSet::new();
+        row_changes.retain(|rc| {
+            let key = format!("{}|{}|{}", rc.table,
+                serde_json::to_string(&rc.row_key).unwrap_or_default(), rc.change_type);
+            seen.insert(key)
+        });
+    }
+
+    // Filter output columns (matches buffered path)
+    if let Some(ref ct) = pipeline.column_types {
+        for rc in &mut row_changes {
+            if let Some(ref mut row) = rc.row {
+                if let Some(cols) = ct.get(&rc.table) {
+                    row.retain(|k, _| cols.contains_key(k));
+                }
+            }
+        }
+    }
+
+    row_changes
 }
 
 pub(crate) fn advance_persistent_pipeline(
