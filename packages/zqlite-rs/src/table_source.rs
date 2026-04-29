@@ -920,16 +920,16 @@ mod tests {
         let mut src = make_source(&db);
         let cid = src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
 
-        assert_eq!(src.push_epoch, 0);
+        assert_eq!(*src.push_epoch.lock().unwrap(), 0);
 
         let row1 = make_row(&[("id", json!("4")), ("name", json!("Dave")), ("age", json!(40))]);
         src.push(SourceChange::Add(row1)).unwrap();
-        assert_eq!(src.push_epoch, 1);
+        assert_eq!(*src.push_epoch.lock().unwrap(), 1);
         assert_eq!(src.connections[cid].last_pushed_epoch, 1);
 
         let row2 = make_row(&[("id", json!("5")), ("name", json!("Eve")), ("age", json!(28))]);
         src.push(SourceChange::Add(row2)).unwrap();
-        assert_eq!(src.push_epoch, 2);
+        assert_eq!(*src.push_epoch.lock().unwrap(), 2);
         assert_eq!(src.connections[cid].last_pushed_epoch, 2);
     }
 
