@@ -193,6 +193,39 @@ const MUTATIONS: Step[] = [
     run: `DELETE FROM team_members WHERE id = 'tm3'`,
     undo: `INSERT INTO team_members (id, "orgID", "deptID", name) VALUES ('tm3', 'acme', 'sales', 'Carol')`,
   },
+  // ===========================================================================
+  // FUZZ-02 mutations per CONTEXT D-09..D-12 — exercise the new events /
+  // event_tags surface introduced in plan 34-04. Order matters: the INSERT
+  // event must precede the UPDATE-metadataJson and the event_tags INSERT
+  // (which both depend on ev-test-1 existing). The NULL→u2 flip on
+  // ev-null-test-1 is independent.
+  //
+  // ev-null-test-1 was introduced by THIS phase's seed-extras.sql with the
+  // -test- infix marking lifecycle as additive-test, so SKILL.md hard rule
+  // 2 (never modify baseline seed.sql rows) is preserved — the flip + revert
+  // operates on a fixture row, not a baseline seed row.
+  // ===========================================================================
+  {
+    label: 'insert event ev-test-1 (jsonb x2 + timestamptz x2 coverage)',
+    run: `INSERT INTO events (id, "occurredAt", "processedAt", "metadataJson", "auditTrail", amount, quantity, "isProcessed", "actorUserId", notes, "relatedTicketId") VALUES ('ev-test-1', '2026-04-29T12:00:00Z', '2026-04-29T12:30:00Z', '{"k":"v"}', '{"by":"harness","at":"2026-04-29T12:00:00Z"}', 99.99, 1, false, 'u1', 'test event', 'co-1')`,
+    undo: `DELETE FROM events WHERE id = 'ev-test-1'`,
+  },
+  {
+    label: 'edit event ev-test-1 metadataJson (jsonb edit)',
+    run: `UPDATE events SET "metadataJson" = '{"k":"v2","added":true}' WHERE id = 'ev-test-1'`,
+    undo: ``,
+  },
+  {
+    label:
+      'flip events.actorUserId NULL→u2 on ev-null-test-1 (NULL semantics edit)',
+    run: `UPDATE events SET "actorUserId" = 'u2' WHERE id = 'ev-null-test-1'`,
+    undo: `UPDATE events SET "actorUserId" = NULL WHERE id = 'ev-null-test-1'`,
+  },
+  {
+    label: 'add event_tag (eventId, tagKey) compound-key partition Take',
+    run: `INSERT INTO event_tags ("eventId", "tagKey", "tagValue", confidence, "metadataJson") VALUES ('ev-test-1', 'priority', 'high', 0.9900, '{}')`,
+    undo: `DELETE FROM event_tags WHERE "eventId" = 'ev-test-1' AND "tagKey" = 'priority'`,
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -575,6 +608,17 @@ async function cleanupDb(sql: postgres.Sql): Promise<void> {
       await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
       await sql`DELETE FROM team_members WHERE id IN ('tm-test-1', 'tm-test-2')`;
       await sql`DELETE FROM departments WHERE "orgID" = 'acme' AND "deptID" = 'legal'`;
+      // FUZZ-02 (plan 34-04) defensive cleanup. FK-ordered: event_tags
+      // before events. Both target -test- infixed rows so SKILL.md hard
+      // rule 2 (no baseline seed touched) is preserved.
+      await sql`DELETE FROM event_tags WHERE "eventId" = 'ev-test-1'`;
+      await sql`DELETE FROM events WHERE id = 'ev-test-1'`;
+      // Restore ev-null-test-1 actorUserId in case the flip→u2 step's
+      // undo did not fire (e.g., harness errored mid-batch). The
+      // ev-null-test-1 row was introduced by seed-extras.sql with the
+      // -test- infix specifically to allow this lifecycle pattern; the
+      // baseline seed.sql is never touched.
+      await sql`UPDATE events SET "actorUserId" = NULL WHERE id = 'ev-null-test-1' AND "actorUserId" IS NOT NULL`;
     } catch (e) {
       console.error(
         `[cleanupDb] explicit DELETE failed (attempt ${attempt}): ${(e as Error).message}`,
