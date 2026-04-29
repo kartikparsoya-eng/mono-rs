@@ -308,12 +308,31 @@ impl Operator for OrExistsOperator {
 impl OrExistsOperator {
     fn push_impl(&mut self, change: Change) -> Vec<Change> {
         match &change {
-            Change::Add(_) | Change::Remove(_) | Change::Edit { .. } => {
+            Change::Add(_) | Change::Remove(_) => {
                 let row = change.node().row.clone();
                 if self.row_passes(&row) {
                     vec![change]
                 } else {
                     vec![]
+                }
+            }
+            Change::Edit { old_node, node, .. } => {
+                // AUDIT-04 (Plan 30-03 / D-12): evaluate row_passes on BOTH
+                // old_node.row and node.row, then emit per the 4-case truth
+                // table. row_passes = or_condition_matches OR any_branch_passes.
+                let old_row = old_node.row.clone();
+                let new_row = node.row.clone();
+                let old_passed = self.row_passes(&old_row);
+                let new_passed = self.row_passes(&new_row);
+                match (old_passed, new_passed) {
+                    (true, true) => {
+                        // Pass-through Edit. `change` is owned and reusable.
+                        let owned = change;
+                        vec![owned]
+                    }
+                    (true, false) => vec![Change::Remove(old_node.clone())],
+                    (false, true) => vec![Change::Add(node.clone())],
+                    (false, false) => vec![],
                 }
             }
             Change::Child { node, child } => {
