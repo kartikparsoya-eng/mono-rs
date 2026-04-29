@@ -1,4 +1,6 @@
 import {createRequire} from 'node:module';
+import {readdirSync, statSync} from 'node:fs';
+import {dirname, join} from 'node:path';
 import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
 import {must} from '../../../../shared/src/must.ts';
@@ -74,8 +76,82 @@ interface RustPipelineManagerInstance {
   pipelineCount(id: string): number;
 }
 
+/**
+ * AUDIT-02 / Plan 30-05 build-freshness gate.
+ *
+ * Asserts the resolved zqlite-rs `.node` binary is at least as new as the
+ * most-recently-modified Rust source file in the same package. If the
+ * binary is stale (a developer or CI ran `vitest run` directly without
+ * first running `npm run build` in `packages/zqlite-rs/`), throw a clear
+ * error pointing at the rebuild command instead of silently running
+ * pre-fix IVM logic.
+ *
+ * The original AUDIT-02 verification gap (`30-VERIFICATION.md` truths #6
+ * and #7) was exactly this failure mode: the source contained the 30-02
+ * fix but the parent repo's `.node` binary had been built before the fix
+ * landed, so the integration test silently observed pre-fix behavior.
+ *
+ * Disabled in production (`NODE_ENV === 'production'`) — there, the
+ * binary ships pre-built and the source tree is not on disk.
+ */
+function assertNapiBinaryFreshness(resolvedNodePath: string): void {
+  if (process.env['NODE_ENV'] === 'production') return;
+  if (process.env['ZQLITE_RS_SKIP_FRESHNESS_CHECK'] === '1') return;
+  let nodeMtime: number;
+  try {
+    nodeMtime = statSync(resolvedNodePath).mtimeMs;
+  } catch {
+    return; // binary not on disk → existing load path will report
+  }
+  // The resolved `.node` lives at e.g. `packages/zqlite-rs/zqlite-rs.darwin-arm64.node`;
+  // its sibling `src/` directory holds the Rust source that compiled it.
+  const srcDir = join(dirname(resolvedNodePath), 'src');
+  let newestSrcMtime = 0;
+  let newestSrcFile = '';
+  try {
+    for (const entry of readdirSync(srcDir, {withFileTypes: true})) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.rs')) continue;
+      const srcPath = join(srcDir, entry.name);
+      const m = statSync(srcPath).mtimeMs;
+      if (m > newestSrcMtime) {
+        newestSrcMtime = m;
+        newestSrcFile = srcPath;
+      }
+    }
+  } catch {
+    return; // src dir absent (e.g. installed package, no source tree)
+  }
+  if (newestSrcMtime === 0) return;
+  if (newestSrcMtime > nodeMtime) {
+    throw new Error(
+      `zqlite-rs napi binary is stale relative to its Rust source.\n` +
+        `  binary: ${resolvedNodePath} (mtime ${new Date(nodeMtime).toISOString()})\n` +
+        `  source: ${newestSrcFile} (mtime ${new Date(newestSrcMtime).toISOString()})\n` +
+        `Rebuild with: (cd packages/zqlite-rs && npm run build)\n` +
+        `Or set ZQLITE_RS_SKIP_FRESHNESS_CHECK=1 to bypass (NOT recommended for tests).`,
+    );
+  }
+}
+
 try {
   const esmRequire = createRequire(import.meta.url);
+  const resolvedPath = esmRequire.resolve('zqlite-rs');
+  // The resolved path points at zqlite-rs/index.js; the actual `.node`
+  // file sits next to it. Try to find a sibling .node file matching this
+  // platform; if found, gate on its freshness.
+  try {
+    const pkgDir = dirname(resolvedPath);
+    for (const entry of readdirSync(pkgDir)) {
+      if (entry.endsWith('.node') && entry.startsWith('zqlite-rs.')) {
+        assertNapiBinaryFreshness(join(pkgDir, entry));
+        break;
+      }
+    }
+  } catch {
+    // Best-effort — if we can't introspect the package directory the load
+    // proceeds and the existing fallback warning fires on actual failure.
+  }
   const bindings = esmRequire('zqlite-rs');
   RustPipelineManagerClass = bindings?.RustPipelineManager;
 } catch (e) {

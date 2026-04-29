@@ -1982,8 +1982,8 @@ mod tests {
     // splits the captured Edit into `[Remove, Add]`.
     //
     // Source of the captured shape: `.tmp/audit-02-gap-rootcause.md`
-    // (Plan 30-05 Task 1 diagnostic log, [audit-02-diag] entries from
-    // `build_pipeline_state` and `source_table_branch`).
+    // (Plan 30-05 Task 1 diagnostic log; the audit-02 diagnostic prefix
+    // entries from `build_pipeline_state` and `source_table_branch`).
     //
     // This test does NOT regress AUDIT-02 because it asserts the full
     // runtime shape (with serde-rename fields + system + alias + the exact

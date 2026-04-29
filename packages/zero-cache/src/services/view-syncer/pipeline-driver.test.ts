@@ -2442,20 +2442,17 @@ describe('view-syncer/pipeline-driver', () => {
       ),
     ];
 
-    // SQLite LIKE is case-insensitive for ASCII by default,
-    // so both 'bug' (id 1) and 'Bug' (id 2) match.
-    expect(likeResult.filter(r => r.table === 'labels')).toHaveLength(2);
+    // AUDIT-01 (Plan 30-01) made LIKE case-sensitive in the Rust IVM
+    // path (parse_predicate_json at hydrate.rs:769 → Predicate::Like
+    // third arg is `false`), matching TS parity. Only 'bug' (id 1)
+    // matches LIKE '%bug%'; 'Bug' (id 2) only matches via ILIKE.
+    expect(likeResult.filter(r => r.table === 'labels')).toHaveLength(1);
     expect(likeResult).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           table: 'labels',
           type: 0,
           rowKey: {id: '1'},
-        }),
-        expect.objectContaining({
-          table: 'labels',
-          type: 0,
-          rowKey: {id: '2'},
         }),
       ]),
     );
