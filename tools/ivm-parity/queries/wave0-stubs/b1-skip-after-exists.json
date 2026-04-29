@@ -1,0 +1,35 @@
+{
+  "fix_id": "B1",
+  "title": "Skip placement order — Skip BEFORE conditions",
+  "description": "Trigger shape for B1: paginated cursor (start) on a parent table whose where clause includes an EXISTS-correlated subquery. Per TS builder.ts:302-345 the pipeline should be Source → Skip → CSQ-Exists → Filter → ... — Skip lands BEFORE conditions. Current Rust does Source → Filter+Exists → Skip, which diverges architecturally even when both produce the same payload for this exact AST. Wave 1 fix realigns the order; this stub becomes the regression test that proves the new ordering still works.",
+  "spec_source": {
+    "ts_file": "packages/zql/src/builder/builder.ts",
+    "ts_lines": "302-345",
+    "rust_file": "packages/zqlite-rs/src/ast_to_config.rs",
+    "rust_lines": "226-238"
+  },
+  "expected_status": "broken-pre-wave1",
+  "wave1_action": "Re-run differential sweep against this AST after B1 fix lands; assert TS and RS payloads byte-equal.",
+  "ast": {
+    "table": "messages",
+    "orderBy": [["createdAt", "asc"], ["id", "asc"]],
+    "start": {
+      "row": {"createdAt": 6500, "id": "x-m-3"},
+      "exclusive": false
+    },
+    "where": {
+      "type": "correlatedSubquery",
+      "op": "EXISTS",
+      "related": {
+        "correlation": {
+          "parentField": ["id"],
+          "childField": ["messageId"]
+        },
+        "subquery": {
+          "table": "attachments",
+          "alias": "b1_attachments"
+        }
+      }
+    }
+  }
+}

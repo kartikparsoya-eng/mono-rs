@@ -1,0 +1,64 @@
+{
+  "fix_id": "B3",
+  "title": "Take partition_key threading — related[] with explicit limit (HEADLINE FIX)",
+  "description": "Trigger shape for B3: parent table with related[] subquery that includes a child Take (limit). Without partition_key threading, child Take fetch (constraint-driven) and push (row-driven) emit different state keys. Hydrate uses fetch and works; push silently no-ops because states.get(push_key) returns None. Net effect: every related-with-limit silently mishandles child-table edits/adds/removes. Mutation: edit/add/remove a message inside the limited subquery — TS emits the change, RS does not.",
+  "spec_source": {
+    "ts_file_primary": "packages/zql/src/builder/builder.ts",
+    "ts_lines_primary": "626-632 (buildPipelineInternal recursion threads sq.correlation.childField)",
+    "ts_file_secondary": "packages/zql/src/ivm/take.ts",
+    "ts_lines_secondary": "80-83, 99, 219, 710-757 (partitionKey use in Take constructor + getTakeStateKey)",
+    "rust_file": "packages/zqlite-rs/src/ast_to_config.rs",
+    "rust_lines": "240-247 (hard-coded partition_key: None)",
+    "rust_file_secondary": "packages/zero-ivm-rs/src/take_op.rs",
+    "rust_lines_secondary": "55-67 (take_state_key), 317-329 (fetch fallback), 389-393 (push early-return)"
+  },
+  "expected_status": "broken-pre-wave1",
+  "wave1_action": "After B3 fix lands (partition_key threaded through ast_to_operator_configs), re-run with mutation block updating a message body inside a related-with-limit subquery; assert TS and RS emit identical Edit transition.",
+  "ast": {
+    "table": "channels",
+    "where": {
+      "type": "simple",
+      "op": "=",
+      "left": {"type": "column", "name": "visibility"},
+      "right": {"type": "literal", "value": "public"}
+    },
+    "related": [
+      {
+        "correlation": {
+          "parentField": ["id"],
+          "childField": ["channelId"]
+        },
+        "subquery": {
+          "table": "conversations",
+          "alias": "b3_conversations",
+          "related": [
+            {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["conversationId"]
+              },
+              "subquery": {
+                "table": "messages",
+                "alias": "b3_messages",
+                "orderBy": [["createdAt", "desc"], ["id", "desc"]],
+                "limit": 2
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "mutation_block": [
+    {
+      "label": "Update an existing message body — must propagate through related-with-limit",
+      "run": "UPDATE messages SET body = 'b3-edited-body' WHERE id = 'x-m-1'",
+      "undo": "UPDATE messages SET body = 'standup notes for monday' WHERE id = 'x-m-1'"
+    },
+    {
+      "label": "Add a new message that lands within the limit window",
+      "run": "INSERT INTO messages (id, \"conversationId\", \"authorId\", body, \"createdAt\", \"visibleTo\") VALUES ('b3-m-test', 'x-co-1', 'u1', 'b3-trigger', 8500, NULL)",
+      "undo": "DELETE FROM messages WHERE id = 'b3-m-test'"
+    }
+  ]
+}

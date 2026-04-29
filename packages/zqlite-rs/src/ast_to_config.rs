@@ -916,4 +916,84 @@ mod tests {
         let cond: Condition = serde_json::from_str(json).unwrap();
         assert!(matches!(cond, Condition::CorrelatedSubquery { .. }));
     }
+
+    // ========================================================================
+    // Phase 34 Wave 0 — Red-state stubs (CONTEXT D-18). Each test asserts the
+    // CURRENT BROKEN behavior so Wave 1 fixes flip them green by removing
+    // `#[ignore]` AND inverting the assertion to the TS-spec correct value.
+    // The `#[ignore]` attribute keeps default `cargo test` runs green; run
+    // with `cargo test -- --ignored` to exercise.
+    // ========================================================================
+
+    /// **B1 (BLOCKING) — Skip placement order.**
+    ///
+    /// Spec: TS `packages/zql/src/builder/builder.ts:302-345` orders the
+    /// pipeline: Source → Skip → CSQ-Exists → Filter → Take → related Joins.
+    /// Skip lands BEFORE conditions (line 302-306).
+    ///
+    /// Current Rust (`ast_to_config.rs:226-238`): order is Source → Filter+Exists
+    /// → Skip → Take → Joins. Skip lands AFTER conditions, violating TS spec.
+    ///
+    /// Wave 0 Red-state assertion: the source code at line 232 (Skip emission)
+    /// is positioned AFTER the where-condition block (line 227). Wave 1 fixes
+    /// the source by moving Skip up, then deletes this stub and replaces it
+    /// with a proper config-ordering assertion against ast_to_operator_configs
+    /// output.
+    #[test]
+    #[ignore = "Phase 34 Wave 1 will flip this green by moving Skip emission \
+        BEFORE append_condition_configs in ast_to_operator_configs. \
+        Spec: TS builder.ts:302-345."]
+    fn test_b1_skip_before_conditions() {
+        // Source-level Red-state check: read this file and confirm the broken
+        // ordering still holds. Wave 1 inverts the indices.
+        let src = include_str!("ast_to_config.rs");
+        // Find the position of the Skip-emission marker comment ("3. Start ->
+        // Skip") and the where-condition marker ("2. Where conditions").
+        let where_marker = src
+            .find("// 2. Where conditions -> Filter + Exists")
+            .expect("missing where-condition marker — code refactored?");
+        let skip_marker = src
+            .find("// 3. Start -> Skip")
+            .expect("missing Skip marker — code refactored?");
+        // Red state: Skip comes AFTER conditions (current bug). Wave 1 inverts:
+        // assert!(skip_marker < where_marker, "Skip must precede conditions per TS builder.ts:302");
+        assert!(
+            skip_marker > where_marker,
+            "Wave 0 expected Skip-after-conditions broken state; got Skip BEFORE conditions \
+             — does this mean Wave 1 fix landed without removing the stub? Update the test."
+        );
+    }
+
+    /// **B3 (BLOCKING) — Take partition_key threading.**
+    ///
+    /// Spec: TS `packages/zql/src/builder/builder.ts:626-632` propagates
+    /// `sq.correlation.childField` as the child subquery's partition key.
+    /// `take.ts:80-83, 99, 219` use this so fetch (constraint-driven) and
+    /// push (row-driven) state keys match.
+    ///
+    /// Current Rust (`ast_to_config.rs:240-247`): hard-coded `partition_key: None`
+    /// — the recursive call at line 254 also ignores the parent's child_field.
+    ///
+    /// Wave 0 Red-state assertion: the `partition_key: None,` literal exists in
+    /// the Take config branch. Wave 1 changes it to `partition_key: partition_key.clone(),`
+    /// and threads a new parameter through `ast_to_operator_configs`.
+    #[test]
+    #[ignore = "Phase 34 Wave 1 will flip this green by accepting \
+        `partition_key: Option<Vec<String>>` as a parameter and threading \
+        `Some(rel.correlation.child_field.clone())` into recursive related[] calls. \
+        Spec: TS builder.ts:626-632 + take.ts:80-83."]
+    fn test_b3_partition_key_threading() {
+        let src = include_str!("ast_to_config.rs");
+        let take_block_start = src
+            .find("// 4. Limit -> Take")
+            .expect("missing Take marker — code refactored?");
+        let take_block = &src[take_block_start..take_block_start + 300];
+        // Red state: the literal `partition_key: None,` is present inside the
+        // Take config branch. Wave 1 removes it (replaces with the parameter).
+        assert!(
+            take_block.contains("partition_key: None,"),
+            "Wave 0 expected `partition_key: None,` in the Take branch (current bug); \
+             not found. Did Wave 1 fix land without removing the stub?"
+        );
+    }
 }

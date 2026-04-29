@@ -1,0 +1,48 @@
+{
+  "fix_id": "B2",
+  "title": "Exists parent_sizes cache poisoning — OR(simple, EXISTS) with empty children",
+  "description": "Trigger shape for B2: a row that matches a simple OR-branch but has zero children for the EXISTS-OR-branch. Rust's `parent_sizes.insert(pk, children.len().max(1))` poisons the cache to store 1 instead of 0. Subsequent push transitions miss the 0→1 boundary or, combined with AUDIT-04 flip path, leave a stale row in output when the real count is 0. Mutation: add a child row to the empty parent — TS emits an Add transition, RS misses it.",
+  "spec_source": {
+    "ts_file": "packages/zql/src/ivm/exists.ts",
+    "ts_lines": "Push semantics — pure FilterOperator consults real Join relationship contents",
+    "rust_file": "packages/zero-ivm-rs/src/exists_op.rs",
+    "rust_lines": "152 (the .max(1) cache poison)"
+  },
+  "expected_status": "broken-pre-wave1",
+  "wave1_action": "After B2 fix lands (.max(1) removed), re-run with mutation block adding a child to an empty parent; assert TS and RS emit identical Add transition.",
+  "ast": {
+    "table": "channels",
+    "where": {
+      "type": "or",
+      "conditions": [
+        {
+          "type": "simple",
+          "op": "=",
+          "left": {"type": "column", "name": "visibility"},
+          "right": {"type": "literal", "value": "public"}
+        },
+        {
+          "type": "correlatedSubquery",
+          "op": "EXISTS",
+          "related": {
+            "correlation": {
+              "parentField": ["id"],
+              "childField": ["channelId"]
+            },
+            "subquery": {
+              "table": "conversations",
+              "alias": "b2_conversations"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "mutation_block": [
+    {
+      "label": "Add a conversation to x-ch-empty (which had zero conversations)",
+      "run": "INSERT INTO conversations (id, \"channelId\", title, \"createdAt\") VALUES ('b2-co-test', 'x-ch-empty', 'b2 trigger', 9000)",
+      "undo": "DELETE FROM conversations WHERE id = 'b2-co-test'"
+    }
+  ]
+}

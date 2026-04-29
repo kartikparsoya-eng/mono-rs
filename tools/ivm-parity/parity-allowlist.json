@@ -1,0 +1,88 @@
+{
+  "_comment": "Phase 34 Wave 0 allow-list (CD-04). Hybrid format: keys[] = exact canonical-key match for catalogued divergences from PARITY_STATUS.md; patterns[] = shape-pattern match for deferred B-items the random generator may newly surface. The fast-check driver filters detected divergences whose AST normalized canonical-key matches keys[], or whose AST shape matches any patterns[] entry. Anything else fails the fuzz run.",
+  "_source_refs": {
+    "PARITY_STATUS.md": "Remaining 5 Divergences",
+    "IVM-PORT-AUDIT-DEEP.md": "B5 (OrExists short-circuit), B6 (EXISTS_LIMIT downgrade), B7 (FlippedJoin), B12 (companion scalar drift)",
+    "34-CONTEXT.md": "D-15 (in-scope) + D-16 (deferred to Phase 35)",
+    "34-RESEARCH.md": "Open Questions §4 RESOLVED — hybrid format (5 keys + 4 patterns)"
+  },
+  "keys": [
+    {
+      "id": "seed_18",
+      "canonical_key_hint": "channels.where(AND(EXISTS(participants alias=zsubq_participants), EXISTS(participants alias=zsubq_participants)))",
+      "reason": "Duplicate CSQ alias overwrite — TS uniquifies (zsubq_participants_1) producing 6 rows; RS overwrites first relationship's children producing 3 rows.",
+      "phase_to_fix": "v6.0 (won't-fix in v5.0; minimal production impact)",
+      "tracking": "PARITY_STATUS.md row #1"
+    },
+    {
+      "id": "fuzz_00132",
+      "canonical_key_hint": "channels.where(OR(cmp('id', 'ch-pub-1'), exists('conversations', flip=true)))",
+      "reason": "OR(simple, EXISTS flip=true) — TS FlippedJoin does child→parent traversal (inner-join semantics), naturally limiting output. RS treats flip as regular EXISTS (parent→child).",
+      "phase_to_fix": "Phase 35 or v6.0 (requires FlippedJoin + UnionFanIn + UnionFanOut Rust operators)",
+      "tracking": "PARITY_STATUS.md row #2; IVM-PORT-AUDIT-DEEP.md §B7"
+    },
+    {
+      "id": "fuzz_00133",
+      "canonical_key_hint": "channels.where(OR(cmp('id', 'ch-pub-1'), exists('conversations', flip=true))) -- variant",
+      "reason": "Same root cause as fuzz_00132 (FlippedJoin variant).",
+      "phase_to_fix": "Phase 35 or v6.0",
+      "tracking": "PARITY_STATUS.md row #2"
+    },
+    {
+      "id": "fuzz_00139",
+      "canonical_key_hint": "channels.where(AND(exists('conversations'), exists('conversations', scalar=true)))",
+      "reason": "scalar=true on second EXISTS — TS resolves scalar EXISTS as companion query (out of main IVM tree); RS emits child rows for both, producing extras beyond first EXISTS_LIMIT.",
+      "phase_to_fix": "Phase 35 (requires scalar-companion resolution in Rust pipeline manager)",
+      "tracking": "PARITY_STATUS.md row #3; IVM-PORT-AUDIT-DEEP.md §B12"
+    },
+    {
+      "id": "fuzz_00140",
+      "canonical_key_hint": "channels.where(OR(exists('conversations'), exists('conversations', scalar=true)))",
+      "reason": "Same root cause as fuzz_00139 (scalar-companion variant).",
+      "phase_to_fix": "Phase 35",
+      "tracking": "PARITY_STATUS.md row #3"
+    }
+  ],
+  "patterns": [
+    {
+      "id": "B5-or-exists-short-circuit",
+      "shape_match": {
+        "where": {"type": "or", "any_branch_matches": {"type": "correlatedSubquery", "op": "EXISTS"}, "min_csq_branches": 2},
+        "comment": "Two or more EXISTS branches OR'd together where they share the same child source. Rust or_exists_op.rs:288-292 short-circuits on first matching branch; TS doesn't have this construction (Rust-only)."
+      },
+      "reason": "B5 — OrExists.push_child short-circuits on first matching branch, dropping branch B…N when branches share a child source.",
+      "phase_to_fix": "Phase 35",
+      "tracking": "IVM-PORT-AUDIT-DEEP.md §B5; CONTEXT D-16"
+    },
+    {
+      "id": "B6-exists-limit-downgrade",
+      "shape_match": {
+        "where": {"type": "correlatedSubquery", "op": "EXISTS", "subquery_has_limit_gt": 1},
+        "comment": "EXISTS subquery with explicit user-supplied limit > EXISTS_LIMIT. TS downgrades the limit (builder.ts:316-319); RS keeps the larger limit. Performance + PERMISSIONS_EXISTS_LIMIT security implication."
+      },
+      "reason": "B6 — Rust apply_exists_limit short-circuits when child config already has a Take; TS replaces the limit BEFORE recursion.",
+      "phase_to_fix": "Phase 35 (security-relevant for permissions)",
+      "tracking": "IVM-PORT-AUDIT-DEEP.md §B6; CONTEXT D-16"
+    },
+    {
+      "id": "B7-flipped-join",
+      "shape_match": {
+        "any_csq_has": {"flip": true},
+        "comment": "Any AST containing a CorrelatedSubquery with flip=true. TS has dedicated FlippedJoin/UnionFanIn/UnionFanOut; Rust has none."
+      },
+      "reason": "B7 — flip:true on CSQ silently treated as regular Exists in Rust. Latent BLOCKING when planner produces flipped CSQs.",
+      "phase_to_fix": "Phase 35 or v6.0 (requires new operator family)",
+      "tracking": "IVM-PORT-AUDIT-DEEP.md §B7; CONTEXT D-16"
+    },
+    {
+      "id": "B12-companion-scalar-drift",
+      "shape_match": {
+        "any_csq_has": {"scalar": true},
+        "comment": "Any AST containing a CorrelatedSubquery with scalar=true. Rust pipeline_manager.rs:648 doesn't update companion.resolved_value post-advance — spurious resets when value drifts A→B→A."
+      },
+      "reason": "B12 — Companion scalar-subquery resolved_value never updated post-advance.",
+      "phase_to_fix": "Phase 35",
+      "tracking": "IVM-PORT-AUDIT-DEEP.md §B12; CONTEXT D-16"
+    }
+  ]
+}

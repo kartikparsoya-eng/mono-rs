@@ -1123,4 +1123,48 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], Change::Edit { .. }));
     }
+
+    // ========================================================================
+    // Phase 34 Wave 0 — Red-state stub for B2 (CONTEXT D-18).
+    // Wave 1 will flip this green by removing `#[ignore]` and inverting the
+    // `.max(1)` removal at exists_op.rs:152.
+    // ========================================================================
+
+    /// **B2 (BLOCKING) — Exists `parent_sizes` cache poisoning.**
+    ///
+    /// Spec: TS `packages/zql/src/ivm/exists.ts` is a pure FilterOperator. Its
+    /// per-parent count tracking comes from the upstream Join's relationship
+    /// contents — there is no `.max(1)` adjustment. The real children count is
+    /// what gets cached.
+    ///
+    /// Current Rust (`exists_op.rs:152`):
+    ///   `self.parent_sizes.insert(pk, children.len().max(1));`
+    /// When `or_condition_matches` is true and `children.is_empty()`, the
+    /// cache stores 1 instead of 0. Subsequent push transitions consult this
+    /// lie and miss the 0→1 boundary trigger, OR (combined with AUDIT-04 flip
+    /// path) leave a row in output when the real count is 0.
+    ///
+    /// Wave 0 Red-state: source contains the literal `.max(1)` on the
+    /// or_condition_matches branch insert. Wave 1 deletes `.max(1)` and replaces
+    /// the assertion with a runtime check on parent_sizes after a hydrate of
+    /// a parent matching or_condition with zero children — expected count = 0,
+    /// not 1.
+    #[test]
+    #[ignore = "Phase 34 Wave 1 will flip this green by removing `.max(1)` from \
+        the or_condition_matches branch (exists_op.rs:152) and asserting \
+        runtime parent_sizes shows REAL count 0. Spec: TS exists.ts."]
+    fn test_b2_parent_sizes_real_count() {
+        let src = include_str!("exists_op.rs");
+        // Red state: the offending `.max(1)` literal is still present at the
+        // or_condition_matches branch insert.
+        assert!(
+            src.contains("self.parent_sizes.insert(pk, children.len().max(1));"),
+            "Wave 0 expected `.max(1)` cache poison still present (current bug). \
+             Not found — Wave 1 may have already landed without removing the stub."
+        );
+        // Wave 1 will replace this stub with a behavioral test:
+        //   - Build ExistsOperator with an or_predicate that matches.
+        //   - Hydrate a parent with 0 children that matches or_predicate.
+        //   - assert_eq!(op.parent_sizes_for_test()[pk], 0);  // not 1
+    }
 }
