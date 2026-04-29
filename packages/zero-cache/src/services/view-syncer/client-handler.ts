@@ -71,12 +71,23 @@ export type PatchToVersion = {
 
 export interface PokeHandler {
   addPatch(patch: PatchToVersion): Promise<void>;
+  /**
+   * Flush any accumulated poke body as a `pokePart` immediately, without
+   * waiting for the natural PART_COUNT_FLUSH_THRESHOLD or `end()`.
+   *
+   * Phase 32 MIGRATE-03: invoked by view-syncer.#processChanges at
+   * streaming chunk boundaries (`'chunk-end'` markers) so the first
+   * `pokePart` reaches the client BEFORE the slowest pipeline finishes.
+   * No-op when no patches have accumulated since the last flush.
+   */
+  flush(): Promise<void>;
   cancel(): Promise<void>;
   end(finalVersion: CVRVersion): Promise<void>;
 }
 
 const NOOP: PokeHandler = {
   addPatch: () => promiseVoid,
+  flush: () => promiseVoid,
   cancel: () => promiseVoid,
   end: () => promiseVoid,
 };
@@ -94,6 +105,11 @@ export function startPoke(
   return {
     addPatch: async patch => {
       await Promise.allSettled(pokers.map(poker => poker.addPatch(patch)));
+    },
+    flush: async () => {
+      // Phase 32 MIGRATE-03: forward chunk-boundary flush to all per-client
+      // pokers so each connected client sees a `pokePart` mid-stream.
+      await Promise.allSettled(pokers.map(poker => poker.flush()));
     },
     cancel: async () => {
       await Promise.allSettled(pokers.map(poker => poker.cancel()));
@@ -296,6 +312,18 @@ export class ClientHandler {
           if (patchToVersion.patch.type === 'row') {
             this.#pokedRows.add(1);
           }
+        } catch (e) {
+          this.#downstream.fail(wrapWithProtocolError(e));
+        }
+      },
+
+      flush: async () => {
+        // Phase 32 MIGRATE-03: emit any accumulated body as a `pokePart`
+        // immediately. Called at streaming chunk boundaries so the client
+        // sees mid-stream progress before the slowest pipeline finishes.
+        // No-op when body is undefined (no patches accumulated).
+        try {
+          await flushBody();
         } catch (e) {
           this.#downstream.fail(wrapWithProtocolError(e));
         }

@@ -2143,12 +2143,14 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           if (change === 'chunk-end') {
             // Phase 32 MIGRATE-03: chunk-boundary flush. Streaming wrappers
             // emit this sentinel between per-pipeline / per-query chunks.
-            // Flush any accumulated rows so the client sees a `pokePart`
-            // BEFORE the slowest pipeline finishes. Buffered consumers
-            // never produce this marker — branch is a no-op for them.
+            // Flush any accumulated rows + force the pokers to emit a
+            // `pokePart` so the client sees mid-stream progress BEFORE the
+            // slowest pipeline finishes. Buffered consumers never produce
+            // this marker — branch is a no-op for them.
             if (rows.size > 0) {
               await processBatch();
             }
+            await pokers.flush();
             continue;
           }
           const {type, queryID, table, rowKey, row} = change;
