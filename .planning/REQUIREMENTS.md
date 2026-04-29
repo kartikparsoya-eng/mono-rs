@@ -13,19 +13,19 @@
 
 ### Streaming Primitives (Rust)
 
-- [ ] **STREAM-01**: New `RustPipelineManager.advance_streaming(id, changesJson)` napi method emits one chunk per pipeline via an mpsc-backed AsyncIterator-shaped class. Existing `advance` / `advance_async` are unchanged.
-- [ ] **STREAM-02**: New `RustPipelineManager.hydrate_streaming(id)` and `hydrate_query_streaming(id, queryId)` napi methods, symmetric to streaming advance. Existing `hydrate` / `hydrate_async` / `hydrate_query` / `hydrate_query_async` are unchanged.
-- [ ] **STREAM-03**: Per-pipeline rayon tasks lock only their own `Mutex<PipelineState>`; the instance lock is held briefly only to read immutable specs. Pipelines run in parallel for both `advance_streaming` and `hydrate_streaming`.
-- [ ] **STREAM-04**: Cancellation via `Arc<AtomicBool>` checked between operator pushes inside `advance_persistent_pipeline` — JS `iterator.return()` actually stops Rust work in flight.
-- [ ] **STREAM-05**: Companion scalar subquery check runs once after all pipeline tasks join; reset signal arrives as a final `StreamItem::ResetSignal`. Companion row changes arrive as one final `StreamItem::Chunk`.
-- [ ] **STREAM-06**: Permission table filter and minRowVersion bump applied per chunk inside the per-pipeline task (mathematically identical to today's combined-Vec pass).
+- [x] **STREAM-01**: New `RustPipelineManager.advance_streaming(id, changesJson)` napi method emits one chunk per pipeline via an mpsc-backed AsyncIterator-shaped class. Existing `advance` / `advance_async` are unchanged.
+- [x] **STREAM-02**: New `RustPipelineManager.hydrate_streaming(id)` and `hydrate_query_streaming(id, queryId)` napi methods, symmetric to streaming advance. Existing `hydrate` / `hydrate_async` / `hydrate_query` / `hydrate_query_async` are unchanged.
+- [x] **STREAM-03**: Per-pipeline rayon tasks lock only their own `Mutex<PipelineState>`; the instance lock is held briefly only to read immutable specs. Pipelines run in parallel for both `advance_streaming` and `hydrate_streaming`.
+- [x] **STREAM-04**: Cancellation via `Arc<AtomicBool>` checked between operator pushes inside `advance_persistent_pipeline` — JS `iterator.return()` actually stops Rust work in flight.
+- [x] **STREAM-05**: Companion scalar subquery check runs once after all pipeline tasks join; reset signal arrives as a final `StreamItem::ResetSignal`. Companion row changes arrive as one final `StreamItem::Chunk`.
+- [x] **STREAM-06**: Permission table filter and minRowVersion bump applied per chunk inside the per-pipeline task (mathematically identical to today's combined-Vec pass).
 
 ### Streaming Wrappers (TS)
 
-- [ ] **WRAP-01**: New `decodeAdvanceChunkBuf(buf): DecodedRowChange[]` per-chunk decoder in `decode-advance-buf.ts`. Existing `decodeAdvanceResultBuf` is unchanged.
-- [ ] **WRAP-02**: New `pipeline-driver.ts::advanceStreaming(timer, vsId?): Promise<{version, numChanges, changes: AsyncIterable<RowChange | 'yield'>}>` — wraps `manager.advance_streaming`, applies snapshotter diff + swap as today.
-- [ ] **WRAP-03**: New `pipeline-driver.ts::addQueriesStreaming(queries, timer): AsyncIterable<RowChange | 'yield'>` — wraps `manager.hydrate_streaming`, falls back to TS hydrate for queries with companions (same `rustEligible` check as today's `addQueriesAsync`).
-- [ ] **WRAP-04**: TS streaming wrapper surfaces `ResetPipelinesSignal('scalar-subquery')` and `ResetPipelinesSignal('advancement-timeout')` with the same throw shape as today's buffered path; calls `stream.return_()` on timeout.
+- [x] **WRAP-01**: New `decodeAdvanceChunkBuf(buf): DecodedRowChange[]` per-chunk decoder in `decode-advance-buf.ts`. Existing `decodeAdvanceResultBuf` is unchanged.
+- [x] **WRAP-02**: New `pipeline-driver.ts::advanceStreaming(timer, vsId?): Promise<{version, numChanges, changes: AsyncIterable<RowChange | 'yield'>}>` — wraps `manager.advance_streaming`, applies snapshotter diff + swap as today.
+- [x] **WRAP-03**: New `pipeline-driver.ts::addQueriesStreaming(queries, timer): AsyncIterable<RowChange | 'yield'>` — wraps `manager.hydrate_streaming`, falls back to TS hydrate for queries with companions (same `rustEligible` check as today's `addQueriesAsync`).
+- [x] **WRAP-04**: TS streaming wrapper surfaces `ResetPipelinesSignal('scalar-subquery')` and `ResetPipelinesSignal('advancement-timeout')` with the same throw shape as today's buffered path; calls `stream.return_()` on timeout.
 
 ### View-Syncer Migration
 
@@ -36,17 +36,17 @@
 
 ### Backwards Compatibility / Test Preservation
 
-- [ ] **COMPAT-01**: All existing tests pass unchanged: `pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts`, `decode-advance-buf.test.ts`, all Rust unit tests.
-- [ ] **COMPAT-02**: Buffered methods (`advance`, `advanceAsync`, `hydrate`, `hydrateAsync`, `hydrateQuery`, `hydrateQueryAsync`, `addQuery`, `addQueries`, `addQueriesAsync`) unchanged in signature and behavior. The streaming path is purely additive.
-- [ ] **COMPAT-03**: `encode_advance_result_buf` and `decodeAdvanceResultBuf` formats are unchanged.
+- [x] **COMPAT-01**: All existing tests pass unchanged: `pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts`, `decode-advance-buf.test.ts`, all Rust unit tests.
+- [x] **COMPAT-02**: Buffered methods (`advance`, `advanceAsync`, `hydrate`, `hydrateAsync`, `hydrateQuery`, `hydrateQueryAsync`, `addQuery`, `addQueries`, `addQueriesAsync`) unchanged in signature and behavior. The streaming path is purely additive.
+- [x] **COMPAT-03**: `encode_advance_result_buf` and `decodeAdvanceResultBuf` formats are unchanged.
 
 ### Streaming Tests (New)
 
-- [ ] **TEST-01**: Rust unit test — per-pipeline cancellation: queue many pipelines, cancel after a few; assert no more than ~cancelled+1 chunks delivered.
-- [ ] **TEST-02**: Rust unit test — reset signal mid-stream: companion scalar changes; reset delivered, channel closes, no further chunks.
-- [ ] **TEST-03**: Rust unit test — panic isolation: one pipeline panics; others still complete; panic surfaces as `StreamItem::Error`.
-- [ ] **TEST-04**: TS test — parity with buffered path on a fixed input (same RowChanges modulo cross-pipeline ordering).
-- [ ] **TEST-05**: TS test — `iterator.return()` (e.g., `for await { break }`) calls Rust `stream.return_()` and stops work.
+- [x] **TEST-01**: Rust unit test — per-pipeline cancellation: queue many pipelines, cancel after a few; assert no more than ~cancelled+1 chunks delivered.
+- [x] **TEST-02**: Rust unit test — reset signal mid-stream: companion scalar changes; reset delivered, channel closes, no further chunks.
+- [x] **TEST-03**: Rust unit test — panic isolation: one pipeline panics; others still complete; panic surfaces as `StreamItem::Error`.
+- [x] **TEST-04**: TS test — parity with buffered path on a fixed input (same RowChanges modulo cross-pipeline ordering).
+- [x] **TEST-05**: TS test — `iterator.return()` (e.g., `for await { break }`) calls Rust `stream.return_()` and stops work.
 
 ### Performance / Tuning
 
