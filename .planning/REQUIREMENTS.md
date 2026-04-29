@@ -80,36 +80,34 @@
 
 ## Traceability
 
-(Populated by roadmapper.)
-
-| REQ-ID     | Phase | Status      |
-| ---------- | ----- | ----------- |
-| STREAM-01  | TBD   | Not started |
-| STREAM-02  | TBD   | Not started |
-| STREAM-03  | TBD   | Not started |
-| STREAM-04  | TBD   | Not started |
-| STREAM-05  | TBD   | Not started |
-| STREAM-06  | TBD   | Not started |
-| WRAP-01    | TBD   | Not started |
-| WRAP-02    | TBD   | Not started |
-| WRAP-03    | TBD   | Not started |
-| WRAP-04    | TBD   | Not started |
-| MIGRATE-01 | TBD   | Not started |
-| MIGRATE-02 | TBD   | Not started |
-| MIGRATE-03 | TBD   | Not started |
-| MIGRATE-04 | TBD   | Not started |
-| COMPAT-01  | TBD   | Not started |
-| COMPAT-02  | TBD   | Not started |
-| COMPAT-03  | TBD   | Not started |
-| TEST-01    | TBD   | Not started |
-| TEST-02    | TBD   | Not started |
-| TEST-03    | TBD   | Not started |
-| TEST-04    | TBD   | Not started |
-| TEST-05    | TBD   | Not started |
-| PERF-01    | TBD   | Not started |
-| PERF-02    | TBD   | Not started |
-| PERF-03    | TBD   | Not started |
-| AUDIT-01   | TBD   | Not started |
-| AUDIT-02   | TBD   | Not started |
-| AUDIT-03   | TBD   | Not started |
-| AUDIT-04   | TBD   | Not started |
+| REQ-ID     | Phase    | Status      |
+| ---------- | -------- | ----------- |
+| STREAM-01  | Phase 31 | Not started |
+| STREAM-02  | Phase 31 | Not started |
+| STREAM-03  | Phase 31 | Not started |
+| STREAM-04  | Phase 31 | Not started |
+| STREAM-05  | Phase 31 | Not started |
+| STREAM-06  | Phase 31 | Not started |
+| WRAP-01    | Phase 31 | Not started |
+| WRAP-02    | Phase 31 | Not started |
+| WRAP-03    | Phase 31 | Not started |
+| WRAP-04    | Phase 31 | Not started |
+| MIGRATE-01 | Phase 32 | Not started |
+| MIGRATE-02 | Phase 32 | Not started |
+| MIGRATE-03 | Phase 32 | Not started |
+| MIGRATE-04 | Phase 32 | Not started |
+| COMPAT-01  | Phase 31 | Not started |
+| COMPAT-02  | Phase 31 | Not started |
+| COMPAT-03  | Phase 31 | Not started |
+| TEST-01    | Phase 31 | Not started |
+| TEST-02    | Phase 31 | Not started |
+| TEST-03    | Phase 31 | Not started |
+| TEST-04    | Phase 31 | Not started |
+| TEST-05    | Phase 31 | Not started |
+| PERF-01    | Phase 33 | Not started |
+| PERF-02    | Phase 33 | Not started |
+| PERF-03    | Phase 33 | Not started |
+| AUDIT-01   | Phase 30 | Not started |
+| AUDIT-02   | Phase 30 | Not started |
+| AUDIT-03   | Phase 30 | Not started |
+| AUDIT-04   | Phase 30 | Not started |
