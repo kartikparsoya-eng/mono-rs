@@ -17,3 +17,4 @@ pub mod table_source;
 pub mod hydrate;
 pub mod ast_to_config;
 pub mod pipeline_manager;
+pub mod chunk_encoder;
