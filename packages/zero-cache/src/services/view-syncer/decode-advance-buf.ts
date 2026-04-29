@@ -29,7 +29,7 @@ const textDecoder = new TextDecoder();
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const MIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
 
-const CHANGE_TYPES = ['add', 'remove', 'edit', 'other'] as const;
+export const CHANGE_TYPES = ['add', 'remove', 'edit', 'other'] as const;
 
 export type DecodedRowChange = {
   queryID: string;
@@ -177,6 +177,81 @@ function readU64(view: DataView, offset: number): number {
   const lo = view.getUint32(offset, true);
   const hi = view.getUint32(offset + 4, true);
   return hi * 0x100000000 + lo;
+}
+
+/**
+ * Decode a per-pipeline chunk buffer from `RustPipelineManager.advanceStreaming`
+ * / `hydrateStreaming` / `hydrateQueryStreaming` (Phase 31 streaming surface).
+ *
+ * Binary format (little-endian) — emitted by `crate::chunk_encoder::encode_chunk_buf`:
+ *
+ *   [u32] change_count
+ *   [u8]  flags  ── Reserved flags byte. MUST be 0 in v1; future versions may
+ *                   set bits for per-pipeline timing telemetry. The decoder
+ *                   throws on non-zero to force a decoder upgrade rather than
+ *                   silently misinterpret subsequent bytes.
+ *                   See `.planning/IVM-STREAMING-PLAN.md` §10 Phase D and
+ *                   31-CONTEXT.md D-03..D-05.
+ *   Per RowChange: identical encoding to `decodeAdvanceResultBuf` — see
+ *                  that function for the per-row layout (change_type byte,
+ *                  query_id, table, row_key, has_row, optional column map).
+ *
+ * NOTE: The chunk format does NOT carry error flags or reset_signal trailers.
+ * Errors and resets travel as separate `StreamItem` variants
+ * (`StreamItem::Error`, `StreamItem::ResetSignal`) outside the chunk encoding.
+ * The TS streaming wrapper in `pipeline-driver.ts::#streamChanges` maps those
+ * variants to `RustStreamError` / `ResetPipelinesSignal` throws.
+ */
+export function decodeAdvanceChunkBuf(buf: Buffer): DecodedRowChange[] {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let offset = 0;
+
+  const changeCount = view.getUint32(offset, true);
+  offset += 4;
+
+  const flags = buf[offset++];
+  if (flags !== 0) {
+    // D-04: fail loud on unknown flags rather than silently misinterpret.
+    throw new Error(
+      'decodeAdvanceChunkBuf: unexpected non-zero flags byte ' +
+        `(got 0x${flags.toString(16)}; need decoder upgrade for new format bits)`,
+    );
+  }
+
+  const changes: DecodedRowChange[] = Array.from({length: changeCount});
+  for (let i = 0; i < changeCount; i++) {
+    const ct = buf[offset++];
+    let queryID: string;
+    [queryID, offset] = readStr(buf, view, offset);
+    let table: string;
+    [table, offset] = readStr(buf, view, offset);
+    let rowKey: unknown;
+    [rowKey, offset] = readJsonValue(buf, view, offset);
+
+    const hasRow = buf[offset++];
+    let row: Record<string, unknown> | null = null;
+    if (hasRow) {
+      const colCount = view.getUint16(offset, true);
+      offset += 2;
+      row = {};
+      for (let c = 0; c < colCount; c++) {
+        let colName: string;
+        [colName, offset] = readStr(buf, view, offset);
+        let colValue: unknown;
+        [colValue, offset] = readJsonValue(buf, view, offset);
+        row[colName] = colValue;
+      }
+    }
+
+    changes[i] = {
+      queryID,
+      table,
+      row_key: rowKey,
+      row,
+      type: CHANGE_TYPES[ct] ?? 'other',
+    };
+  }
+  return changes;
 }
 
 function readJsonValue(
