@@ -151,6 +151,33 @@ fn ivm_change_to_row_changes(
     }
 }
 
+/// AUDIT-02: split a `SourceChange::Edit` into `Remove(old)+Add(new)` when
+/// any column in `split_edit_keys` differs between old_row and new_row.
+/// Mirrors `RustTableSource::maybe_split_edit` for the persistent advance
+/// path which builds SourceChange directly without going through
+/// `source.push()`. Other variants pass through unchanged.
+fn maybe_split_edit_for_advance(
+    sc: SourceChange,
+    split_edit_keys: &[String],
+) -> Vec<SourceChange> {
+    if split_edit_keys.is_empty() {
+        return vec![sc];
+    }
+    if let SourceChange::Edit { ref row, ref old_row } = sc {
+        for key in split_edit_keys {
+            let old_val = old_row.get(key);
+            let new_val = row.get(key);
+            if old_val != new_val {
+                return vec![
+                    SourceChange::Remove(old_row.clone()),
+                    SourceChange::Add(row.clone()),
+                ];
+            }
+        }
+    }
+    vec![sc]
+}
+
 fn source_change_to_ivm_change(sc: &SourceChange) -> IvmChange {
     let make_node = |row: &crate::source::Row| zero_ivm_rs::types::Node {
         row: row.clone(),
@@ -1025,6 +1052,10 @@ pub(crate) struct PipelineState {
     /// Maps child table name → Vec<(op_index, child_pk)> for routing
     /// child changes through push_child() on the correct operator.
     pub(crate) child_table_to_op_index: HashMap<String, Vec<(usize, Vec<String>)>>,
+    /// Columns whose change must split a source Edit into Remove+Add so
+    /// downstream Join/Exists operators see the membership transition.
+    /// Populated from `collect_split_edit_keys(&query.ast)` (AUDIT-02).
+    pub(crate) split_edit_keys: Vec<String>,
 }
 
 // SAFETY: PipelineState's raw pointers in push_ptrs point into heap-allocated
@@ -1167,6 +1198,7 @@ pub(crate) fn build_pipeline_state(
         has_operators,
         rel_to_table,
         child_table_to_op_index,
+        split_edit_keys,
     })
 }
 
@@ -1229,7 +1261,15 @@ pub(crate) fn advance_persistent_pipeline(
     for change in changes.iter() {
         if change.table == pipeline.source_table {
             let td0 = std::time::Instant::now();
-            let source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            let raw_source_changes = diff_change_to_source_changes(change, &pipeline.primary_key);
+            // AUDIT-02: split source Edits when an EXISTS parent_field
+            // (or any other column in split_edit_keys) changes, so the
+            // downstream Join/Exists operator sees Remove+Add rather
+            // than a silent in-place Edit.
+            let source_changes: Vec<SourceChange> = raw_source_changes
+                .into_iter()
+                .flat_map(|sc| maybe_split_edit_for_advance(sc, &pipeline.split_edit_keys))
+                .collect();
             t_diff += td0.elapsed();
             for sc in source_changes {
                 let ivm_change = source_change_to_ivm_change(&sc);
