@@ -54,14 +54,14 @@
 
 ### Production Hardening (Phase 33)
 
-- [ ] **HARDEN-01**: Wire `dualExecCompare` (already exists at `dual-executor.ts:283`) into `pipeline-driver.ts` `advanceAsync` / `hydrateAsync` paths under feature flag `ZQLITE_RS_PARITY_CHECK` (default off in CI; on for the dedicated parity-check vitest run added by this phase). Every existing test that exercises pipeline-driver becomes a TS-vs-Rust differential check. Log + count divergences; in strict mode (`ZQLITE_RS_PARITY_CHECK=strict`), throw on divergence.
-- [ ] **HARDEN-02**: Expand `or_exists_op.rs` test coverage to ≥30 tests, matching the categories in `exists_op.rs` (44 tests today). Cover: fetch, push, hydrate, edit-with/without-or-predicate, all 4 transitions per AUDIT-04, in_push re-entrancy, framework-invariant assertions, builder-spec parity. Closes the 4.4× test-breadth gap.
+- [x] **HARDEN-01**: Wire `dualExecCompare` (already exists at `dual-executor.ts:283`) into `pipeline-driver.ts` `advanceAsync` / `hydrateAsync` paths under feature flag `ZQLITE_RS_PARITY_CHECK` (default off in CI; on for the dedicated parity-check vitest run added by this phase). Every existing test that exercises pipeline-driver becomes a TS-vs-Rust differential check. Log + count divergences; in strict mode (`ZQLITE_RS_PARITY_CHECK=strict`), throw on divergence.
+- [x] **HARDEN-02**: Expand `or_exists_op.rs` test coverage to ≥30 tests, matching the categories in `exists_op.rs` (44 tests today). Cover: fetch, push, hydrate, edit-with/without-or-predicate, all 4 transitions per AUDIT-04, in_push re-entrancy, framework-invariant assertions, builder-spec parity. Closes the 4.4× test-breadth gap.
 
 ### Performance / Tuning (Phase 33)
 
-- [ ] **PERF-01**: Bounded `mpsc::sync_channel(pipeline_count.max(1) + 1)` already shipped in Phase 31 per CONTEXT D-16 + research deviation; this requirement adds the Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
-- [ ] **PERF-02**: Microbenchmark in `rust-ivm-bench.ts` (or new file) — N pipelines with one slow tail pipeline; assert TTFB ~min(pipeline_time), not max. Records to `.planning/milestones/v5.0-bench-results.md`.
-- [ ] **PERF-03**: Memory peak measurement — peak Rust heap drops from `O(total_changes)` to `O(max_pipeline_changes)` during advance/hydrate.
+- [x] **PERF-01**: Bounded `mpsc::sync_channel(pipeline_count.max(1) + 1)` already shipped in Phase 31 per CONTEXT D-16 + research deviation; this requirement adds the Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
+- [x] **PERF-02**: Microbenchmark in `rust-ivm-bench.ts` (or new file) — N pipelines with one slow tail pipeline; assert TTFB ~min(pipeline_time), not max. Records to `.planning/milestones/v5.0-bench-results.md`.
+- [x] **PERF-03**: Memory peak measurement — peak Rust heap drops from `O(total_changes)` to `O(max_pipeline_changes)` during advance/hydrate.
 
 ### Differential Fuzz + Schema Extension (Phase 34)
 
