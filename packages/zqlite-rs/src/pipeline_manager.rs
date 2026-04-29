@@ -374,6 +374,315 @@ impl RustPipelineManager {
             query_id,
         }))
     }
+
+    /// Streaming version of advance_async — emits one StreamItem::Chunk per
+    /// pipeline as it completes, plus a final StreamItem::ResetSignal or
+    /// StreamItem::Chunk for companion handling.
+    ///
+    /// Channel capacity is `pipeline_count.max(1) + 1` per RESEARCH Open Q #1
+    /// + Pitfall 1: every pipeline gets one slot, plus one extra for the
+    /// final ResetSignal/companion-Chunk so the coordinator never blocks
+    /// post-scope. (Differs from CONTEXT D-16's literal `pipeline_count` to
+    /// eliminate the cancel-deadlock window for trivial cost.)
+    #[napi(ts_return_type = "AdvanceStream")]
+    pub fn advance_streaming(
+        &self,
+        id: String,
+        changes_json: String,
+    ) -> napi::Result<AdvanceStream> {
+        let changes: Vec<Change> = serde_json::from_str(&changes_json)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to parse changes: {e}")))?;
+
+        let instance_arc = {
+            let instances = self.instances.read()
+                .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+            instances.get(&id)
+                .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?
+                .clone()
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // RESEARCH Open Q #3: numChanges = 0 early-return.
+        if changes.is_empty() {
+            let (_tx, rx) = mpsc::sync_channel::<StreamItem>(1);
+            // Drop _tx immediately → channel closed → first next() returns done.
+            return Ok(AdvanceStream {
+                rx: Arc::new(Mutex::new(rx)),
+                cancel,
+                _coordinator: None,
+            });
+        }
+
+        // D-17: read pipeline_count under brief instance lock.
+        let pipeline_count = {
+            let inst = instance_arc.lock()
+                .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+            inst.pipelines.len()
+        };
+
+        // RESEARCH Open Q #1 + Pitfall 1: pipeline_count + 1 to guarantee a
+        // slot for the final ResetSignal/companion-Chunk. Avoids the cancel-
+        // deadlock window where all per-pipeline slots are full and the
+        // coordinator blocks on tx.send for the post-scope item.
+        let (tx, rx) = mpsc::sync_channel::<StreamItem>(pipeline_count.max(1) + 1);
+        let cancel_for_thread = cancel.clone();
+
+        let coordinator = thread::Builder::new()
+            .name(format!("advance-stream-{id}"))
+            .spawn(move || {
+                let instance = match instance_arc.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let _ = tx.send(StreamItem::Error(
+                            "instance lock poisoned".to_string(),
+                            "rayon_error".to_string()));
+                        return;
+                    }
+                };
+
+                rayon::scope(|s| {
+                    for pm in instance.pipelines.iter() {
+                        let tx = tx.clone();
+                        let cancel = cancel_for_thread.clone();
+                        let permission_tables = &instance.permission_tables;
+                        let syncable_tables = &instance.syncable_tables;
+                        let db_path = instance.db_path.as_str();
+                        let changes_ref = &changes;
+                        s.spawn(move |_| {
+                            if cancel.load(Ordering::Relaxed) { return; }
+                            // Pitfall 3: AssertUnwindSafe per task. A panic
+                            // here surfaces as StreamItem::Error("panic",..)
+                            // and does NOT take down siblings.
+                            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                                let mut pipeline = pm.lock().unwrap();
+                                // STREAM-04: cancel-aware advance (Task 5/6).
+                                let chunk = crate::advance::advance_persistent_pipeline_with_cancel(
+                                    &mut pipeline, changes_ref, db_path, &cancel,
+                                );
+                                // STREAM-06 / D-20: filter per-chunk.
+                                let mut filtered = chunk;
+                                apply_permission_and_version_filters(
+                                    &mut filtered,
+                                    permission_tables,
+                                    syncable_tables,
+                                );
+                                if filtered.is_empty() {
+                                    None
+                                } else {
+                                    Some(crate::chunk_encoder::encode_chunk_buf(&filtered))
+                                }
+                            }));
+                            match result {
+                                Ok(Some(buf)) => { let _ = tx.send(StreamItem::Chunk(buf)); }
+                                Ok(None) => { /* nothing to send */ }
+                                Err(payload) => {
+                                    let msg = format_panic_payload(payload);
+                                    let _ = tx.send(StreamItem::Error(msg, "panic".to_string()));
+                                }
+                            }
+                        });
+                    }
+                }); // ← all pipelines joined here
+
+                // STREAM-05: companion check after join.
+                if !instance.companions.is_empty() {
+                    let changed_tables: HashSet<&str> = changes.iter()
+                        .map(|c| c.table.as_str())
+                        .collect();
+                    match check_companions_and_emit(
+                        &instance.companions, &changes,
+                        &changed_tables, &instance.db_path,
+                    ) {
+                        CompanionResult::Reset(reason) => {
+                            let _ = tx.send(StreamItem::ResetSignal(reason));
+                        }
+                        CompanionResult::Changes(companion_changes) => {
+                            // Pitfall 4: companions MUST also be filtered.
+                            let mut cs = companion_changes;
+                            apply_permission_and_version_filters(
+                                &mut cs,
+                                &instance.permission_tables,
+                                &instance.syncable_tables,
+                            );
+                            if !cs.is_empty() {
+                                let buf = crate::chunk_encoder::encode_chunk_buf(&cs);
+                                let _ = tx.send(StreamItem::Chunk(buf));
+                            }
+                        }
+                    }
+                }
+                // tx dropped here → rx.recv() returns Err → JS sees done=true.
+            })
+            .map_err(|e| napi::Error::from_reason(format!("Failed to spawn coordinator: {e}")))?;
+
+        Ok(AdvanceStream {
+            rx: Arc::new(Mutex::new(rx)),
+            cancel,
+            _coordinator: Some(coordinator),
+        })
+    }
+
+    /// Streaming version of hydrate_async — emits one StreamItem::Chunk per
+    /// pipeline. No companion check (companions only run on advance).
+    #[napi(ts_return_type = "HydrateStream")]
+    pub fn hydrate_streaming(&self, id: String) -> napi::Result<HydrateStream> {
+        let instance_arc = {
+            let instances = self.instances.read()
+                .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+            instances.get(&id)
+                .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?
+                .clone()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let pipeline_count = {
+            let inst = instance_arc.lock()
+                .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+            inst.pipelines.len()
+        };
+        let (tx, rx) = mpsc::sync_channel::<StreamItem>(pipeline_count.max(1) + 1);
+        let cancel_for_thread = cancel.clone();
+
+        let coordinator = thread::Builder::new()
+            .name(format!("hydrate-stream-{id}"))
+            .spawn(move || {
+                let instance = match instance_arc.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let _ = tx.send(StreamItem::Error(
+                            "instance lock poisoned".to_string(),
+                            "rayon_error".to_string()));
+                        return;
+                    }
+                };
+                rayon::scope(|s| {
+                    for pm in instance.pipelines.iter() {
+                        let tx = tx.clone();
+                        let cancel = cancel_for_thread.clone();
+                        let permission_tables = &instance.permission_tables;
+                        let syncable_tables = &instance.syncable_tables;
+                        s.spawn(move |_| {
+                            if cancel.load(Ordering::Relaxed) { return; }
+                            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                                let mut pipeline = pm.lock().unwrap();
+                                let chunk = hydrate_single_pipeline(&mut pipeline);
+                                let mut filtered = chunk;
+                                apply_permission_and_version_filters(
+                                    &mut filtered, permission_tables, syncable_tables);
+                                if filtered.is_empty() { None }
+                                else { Some(crate::chunk_encoder::encode_chunk_buf(&filtered)) }
+                            }));
+                            match result {
+                                Ok(Some(buf)) => { let _ = tx.send(StreamItem::Chunk(buf)); }
+                                Ok(None) => {}
+                                Err(payload) => {
+                                    let msg = format_panic_payload(payload);
+                                    let _ = tx.send(StreamItem::Error(msg, "panic".to_string()));
+                                }
+                            }
+                        });
+                    }
+                });
+                // tx dropped → channel closed → done.
+            })
+            .map_err(|e| napi::Error::from_reason(format!("Failed to spawn coordinator: {e}")))?;
+
+        Ok(HydrateStream {
+            rx: Arc::new(Mutex::new(rx)),
+            cancel,
+            _coordinator: Some(coordinator),
+        })
+    }
+
+    /// Streaming version of hydrate_query_async — single pipeline.
+    /// Returns a HydrateStream with at most one Chunk (or zero if empty).
+    #[napi(ts_return_type = "HydrateStream")]
+    pub fn hydrate_query_streaming(
+        &self,
+        id: String,
+        query_id: String,
+    ) -> napi::Result<HydrateStream> {
+        let instance_arc = {
+            let instances = self.instances.read()
+                .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+            instances.get(&id)
+                .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?
+                .clone()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel::<StreamItem>(2); // 1 chunk + safety slot
+        let cancel_for_thread = cancel.clone();
+
+        let coordinator = thread::Builder::new()
+            .name(format!("hydrate-query-stream-{id}"))
+            .spawn(move || {
+                let instance = match instance_arc.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let _ = tx.send(StreamItem::Error(
+                            "instance lock poisoned".to_string(),
+                            "rayon_error".to_string()));
+                        return;
+                    }
+                };
+                if cancel_for_thread.load(Ordering::Relaxed) { return; }
+
+                // Find pipeline outside catch_unwind — if missing, surface
+                // as a clear rayon_error rather than a panic.
+                let pipeline_idx = instance.pipelines.iter().position(|p| {
+                    p.lock().map(|g| g.query_id == query_id).unwrap_or(false)
+                });
+                let pm = match pipeline_idx {
+                    Some(i) => &instance.pipelines[i],
+                    None => {
+                        let _ = tx.send(StreamItem::Error(
+                            format!("No pipeline for query: {query_id}"),
+                            "rayon_error".to_string()));
+                        return;
+                    }
+                };
+
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    let mut pipeline = pm.lock().unwrap();
+                    let chunk = hydrate_single_pipeline(&mut pipeline);
+                    let mut filtered = chunk;
+                    apply_permission_and_version_filters(
+                        &mut filtered,
+                        &instance.permission_tables,
+                        &instance.syncable_tables,
+                    );
+                    if filtered.is_empty() { None }
+                    else { Some(crate::chunk_encoder::encode_chunk_buf(&filtered)) }
+                }));
+                match result {
+                    Ok(Some(buf)) => { let _ = tx.send(StreamItem::Chunk(buf)); }
+                    Ok(None) => {} // empty filtered chunk
+                    Err(payload) => {
+                        let msg = format_panic_payload(payload);
+                        let _ = tx.send(StreamItem::Error(msg, "panic".to_string()));
+                    }
+                }
+            })
+            .map_err(|e| napi::Error::from_reason(format!("Failed to spawn coordinator: {e}")))?;
+
+        Ok(HydrateStream {
+            rx: Arc::new(Mutex::new(rx)),
+            cancel,
+            _coordinator: Some(coordinator),
+        })
+    }
+}
+
+/// Convert a catch_unwind panic payload into a human-readable message.
+fn format_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 // ─── Extracted instance-level operations (shared by sync + async paths) ─────

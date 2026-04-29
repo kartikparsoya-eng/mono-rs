@@ -1202,6 +1202,19 @@ pub(crate) fn build_pipeline_state(
     })
 }
 
+/// Cancel-aware variant of `advance_persistent_pipeline` used by streaming.
+/// Phase 31 Task 5/6 inserts a real cancel check at the per-change loop
+/// boundary. For now this just delegates so the streaming code compiles.
+pub(crate) fn advance_persistent_pipeline_with_cancel(
+    pipeline: &mut PipelineState,
+    changes: &[Change],
+    db_path: &str,
+    _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<RowChange> {
+    // TODO(Task 6): observe _cancel between iterations of the per-change loop.
+    advance_persistent_pipeline(pipeline, changes, db_path)
+}
+
 pub(crate) fn advance_persistent_pipeline(
     pipeline: &mut PipelineState,
     changes: &[Change],
