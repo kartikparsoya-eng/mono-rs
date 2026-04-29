@@ -474,4 +474,104 @@ mod tests {
         op.force_in_push_for_test();
         let _ = op.push(Change::Add(make_node(1)));
     }
+
+    // ===== AUDIT-04 (Plan 30-03): Edit-with-or_predicate 4-transition tests =====
+    // Mirrors the ExistsOperator tests for OrExistsOperator. The Edit branch
+    // must evaluate row_passes (or_condition_matches OR any_branch_passes) on
+    // BOTH old_node.row and node.row and emit per the 4-case truth table.
+
+    fn make_status_edit(id: i64, old_status: &str, new_status: &str) -> Change {
+        let mut old_row = Row::new();
+        old_row.insert("id".to_string(), serde_json::json!(id));
+        old_row.insert("status".to_string(), serde_json::json!(old_status));
+        let mut new_row = Row::new();
+        new_row.insert("id".to_string(), serde_json::json!(id));
+        new_row.insert("status".to_string(), serde_json::json!(new_status));
+        Change::Edit {
+            node: Node { row: new_row, relationships: HashMap::new() },
+            old_node: Node { row: old_row, relationships: HashMap::new() },
+        }
+    }
+
+    /// OrExistsOperator with one branch (no matching children) and an
+    /// or_predicate `status == "active"`. Pass-state determined entirely
+    /// by the predicate.
+    fn build_or_exists_with_status_predicate() -> OrExistsOperator {
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+        let parent_source: Box<dyn Operator> = Box::new(MockInput { nodes: parents });
+        let child_source: Box<dyn Operator> = Box::new(MockInput { nodes: children });
+        let branches = vec![(
+            child_source,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )];
+        OrExistsOperator::new(
+            parent_source,
+            branches,
+            Some(Predicate::Eq(
+                "status".to_string(),
+                Value::String("active".to_string()),
+            )),
+        )
+    }
+
+    #[test]
+    fn test_or_exists_edit_both_pass() {
+        // row_passes(old) = true AND row_passes(new) = true → emit Edit.
+        let mut op = build_or_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "active", "active");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Change::Edit { .. }));
+    }
+
+    #[test]
+    fn test_or_exists_edit_old_only() {
+        // row_passes(old) = true (active matches predicate),
+        // row_passes(new) = false (inactive, no children) → emit Remove(old_node).
+        let mut op = build_or_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "active", "inactive");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1, "expected one Remove emit");
+        assert!(
+            matches!(&result[0], Change::Remove(n)
+                if n.row.get("id").unwrap() == &serde_json::json!(1)
+                    && n.row.get("status").unwrap() == &serde_json::json!("active")),
+            "expected Remove of old_node (status=active), got {:?}",
+            &result[0]
+        );
+    }
+
+    #[test]
+    fn test_or_exists_edit_new_only() {
+        // row_passes(old) = false (inactive, no children),
+        // row_passes(new) = true (active matches predicate) → emit Add(node).
+        let mut op = build_or_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "inactive", "active");
+        let result = op.push(edit);
+        assert_eq!(result.len(), 1, "expected one Add emit");
+        assert!(
+            matches!(&result[0], Change::Add(n)
+                if n.row.get("id").unwrap() == &serde_json::json!(1)
+                    && n.row.get("status").unwrap() == &serde_json::json!("active")),
+            "expected Add of new node (status=active), got {:?}",
+            &result[0]
+        );
+    }
+
+    #[test]
+    fn test_or_exists_edit_neither() {
+        // row_passes(old) = false AND row_passes(new) = false → empty emit.
+        let mut op = build_or_exists_with_status_predicate();
+        let _ = op.fetch(&FetchRequest::default());
+        let edit = make_status_edit(1, "inactive", "inactive");
+        let result = op.push(edit);
+        assert!(result.is_empty(), "expected no emit, got {:?}", result);
+    }
 }
