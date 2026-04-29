@@ -170,14 +170,18 @@ describe('advanceStreaming + RustStreamError', () => {
     fxB = setupFixture('parity_b', lc);
 
     // Hydrate identical query on both drivers.
-    [...(await fxA.pipelines.addQueriesAsync(
-      [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
-      fxA.startTimer(),
-    ))];
-    [...(await fxB.pipelines.addQueriesAsync(
-      [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
-      fxB.startTimer(),
-    ))];
+    [
+      ...(await fxA.pipelines.addQueriesAsync(
+        [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+        fxA.startTimer(),
+      )),
+    ];
+    [
+      ...(await fxB.pipelines.addQueriesAsync(
+        [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+        fxB.startTimer(),
+      )),
+    ];
 
     // Apply identical mutation on both replicas.
     fxA.replicator.processTransaction(
@@ -200,7 +204,10 @@ describe('advanceStreaming + RustStreamError', () => {
     const streamingResult = await fxB.pipelines.advanceStreaming(NO_TIME_TIMER);
     const streamingChanges: RowChange[] = [];
     for await (const c of streamingResult.changes) {
-      if (c !== 'yield') streamingChanges.push(c);
+      // Phase 32 MIGRATE-03: streaming wrapper now emits 'chunk-end' markers
+      // at per-chunk boundaries. Filter both string sentinels — assertion
+      // is on RowChange multisets, not chunk cadence.
+      if (c !== 'yield' && c !== 'chunk-end') streamingChanges.push(c);
     }
 
     expect(streamingResult.version).toEqual(bufferedResult.version);
@@ -275,7 +282,11 @@ describe('advanceStreaming + RustStreamError', () => {
       id: string,
       changesJson: string,
     ): unknown {
-      const realStream = originalAdvanceStreaming.call(this, id, changesJson) as {
+      const realStream = originalAdvanceStreaming.call(
+        this,
+        id,
+        changesJson,
+      ) as {
         next: () => Promise<unknown>;
         return: () => void;
       };
@@ -300,10 +311,12 @@ describe('advanceStreaming + RustStreamError', () => {
 
     try {
       fxA = setupFixture('cancel_test', lc);
-      [...(await fxA.pipelines.addQueriesAsync(
-        [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
-        fxA.startTimer(),
-      ))];
+      [
+        ...(await fxA.pipelines.addQueriesAsync(
+          [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+          fxA.startTimer(),
+        )),
+      ];
 
       // Apply a transaction so advanceStreaming has work to do.
       fxA.replicator.processTransaction(
@@ -317,7 +330,8 @@ describe('advanceStreaming + RustStreamError', () => {
       // Drain ONE non-yield change, then break.
       let drainedCount = 0;
       for await (const c of result.changes) {
-        if (c !== 'yield') {
+        // Phase 32 MIGRATE-03: also skip 'chunk-end' — only RowChange counts.
+        if (c !== 'yield' && c !== 'chunk-end') {
           drainedCount++;
           if (drainedCount >= 1) break;
         }
@@ -354,9 +368,7 @@ describe('addQueriesStreaming', () => {
     fxA = setupFixture('addq_a', lc);
     fxB = setupFixture('addq_b', lc);
 
-    const queries = [
-      {transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS},
-    ];
+    const queries = [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}];
 
     // Buffered (existing): addQueriesAsync returns Iterable.
     const bufferedIter = await fxA.pipelines.addQueriesAsync(
@@ -375,7 +387,8 @@ describe('addQueriesStreaming', () => {
     );
     const streaming: RowChange[] = [];
     for await (const c of streamingIter) {
-      if (c !== 'yield') streaming.push(c);
+      // Phase 32 MIGRATE-03: also filter 'chunk-end' marker.
+      if (c !== 'yield' && c !== 'chunk-end') streaming.push(c);
     }
 
     expect(streaming.length).toBeGreaterThan(0);
@@ -388,7 +401,8 @@ describe('addQueriesStreaming', () => {
     const iter = await fxA.pipelines.addQueriesStreaming([], fxA.startTimer());
     const collected: RowChange[] = [];
     for await (const c of iter) {
-      if (c !== 'yield') collected.push(c);
+      // Phase 32 MIGRATE-03: also filter 'chunk-end' marker.
+      if (c !== 'yield' && c !== 'chunk-end') collected.push(c);
     }
     expect(collected).toEqual([]);
   });

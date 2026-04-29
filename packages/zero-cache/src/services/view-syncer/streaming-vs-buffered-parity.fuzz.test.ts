@@ -45,11 +45,7 @@ import {
   type FakeReplicator,
 } from '../replicator/test-utils.ts';
 import {compareChanges, materializeChanges} from './dual-executor.ts';
-import {
-  PipelineDriver,
-  type RowChange,
-  type Timer,
-} from './pipeline-driver.ts';
+import {PipelineDriver, type RowChange, type Timer} from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
 import {TimeSliceTimer} from './view-syncer.ts';
 
@@ -195,7 +191,11 @@ const messages = new ReplicationMessages({
   [mutationsTableName]: ['clientGroupID', 'clientID', 'mutationID'],
 });
 
-function applyOps(replicator: FakeReplicator, version: string, ops: Op[]): void {
+function applyOps(
+  replicator: FakeReplicator,
+  version: string,
+  ops: Op[],
+): void {
   // Compose all ops into one transaction. Skip degenerate ops (e.g.
   // update/delete of an id that doesn't exist) — fakeReplicator ignores
   // those at the replication-message layer.
@@ -234,68 +234,65 @@ describe('streaming-vs-buffered parity', () => {
     // Ensure no lingering DB files from the fuzz iterations.
   });
 
-  test(
-    'advance_streaming RowChange multiset equals advance_async (1k fuzz iter)',
-    async () => {
-      await fc.assert(
-        fc.asyncProperty(arbScenario, async scenario => {
-          // Build TWO identical drivers (same seed, same op sequence).
-          const fxA = setupFixture(scenario, lc);
-          const fxB = setupFixture(scenario, lc);
-          try {
-            // Hydrate identical query on both.
-            for (const _ of await fxA.pipelines.addQueriesAsync(
-              [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
-              startTimer(lc),
-            )) {
-              /* drain */
-            }
-            for (const _ of await fxB.pipelines.addQueriesAsync(
-              [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
-              startTimer(lc),
-            )) {
-              /* drain */
-            }
-
-            // Apply identical ops to both replicas.
-            applyOps(fxA.replicator, '124', scenario.ops);
-            applyOps(fxB.replicator, '124', scenario.ops);
-
-            // Buffered advance.
-            const bufferedResult = await fxA.pipelines.advanceAsync(
-              NO_TIME_TIMER,
-            );
-            const bufferedChanges = materializeChanges(bufferedResult.changes);
-
-            // Streaming advance.
-            const streamingResult = await fxB.pipelines.advanceStreaming(
-              NO_TIME_TIMER,
-            );
-            const streamingChanges: RowChange[] = [];
-            for await (const c of streamingResult.changes) {
-              if (c !== 'yield') streamingChanges.push(c);
-            }
-
-            // Multiset comparison via compareChanges (sorts both sides).
-            const cmp = compareChanges(bufferedChanges, streamingChanges);
-            if (!cmp.match) {
-              throw new Error(
-                `Parity mismatch:\n  scenario: ${JSON.stringify(scenario)}\n` +
-                  `  ts(buffered) count: ${cmp.tsCount}, rust(streaming) count: ${cmp.rustCount}\n` +
-                  `  mismatches: ${JSON.stringify(cmp.mismatches.slice(0, 3), null, 2)}`,
-              );
-            }
-            // Also: version + numChanges agreement.
-            expect(streamingResult.version).toBe(bufferedResult.version);
-            expect(streamingResult.numChanges).toBe(bufferedResult.numChanges);
-          } finally {
-            fxA.destroy();
-            fxB.destroy();
+  test('advance_streaming RowChange multiset equals advance_async (1k fuzz iter)', async () => {
+    await fc.assert(
+      fc.asyncProperty(arbScenario, async scenario => {
+        // Build TWO identical drivers (same seed, same op sequence).
+        const fxA = setupFixture(scenario, lc);
+        const fxB = setupFixture(scenario, lc);
+        try {
+          // Hydrate identical query on both.
+          for (const _ of await fxA.pipelines.addQueriesAsync(
+            [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+            startTimer(lc),
+          )) {
+            /* drain */
           }
-        }),
-        {numRuns: NUM_RUNS},
-      );
-    },
-    /* timeout: */ 600_000, // 1k iterations × per-fixture build is ~minutes worst-case.
-  );
+          for (const _ of await fxB.pipelines.addQueriesAsync(
+            [{transformationHash: 'h1', queryID: 'q1', ast: ALL_ITEMS}],
+            startTimer(lc),
+          )) {
+            /* drain */
+          }
+
+          // Apply identical ops to both replicas.
+          applyOps(fxA.replicator, '124', scenario.ops);
+          applyOps(fxB.replicator, '124', scenario.ops);
+
+          // Buffered advance.
+          const bufferedResult =
+            await fxA.pipelines.advanceAsync(NO_TIME_TIMER);
+          const bufferedChanges = materializeChanges(bufferedResult.changes);
+
+          // Streaming advance.
+          const streamingResult =
+            await fxB.pipelines.advanceStreaming(NO_TIME_TIMER);
+          const streamingChanges: RowChange[] = [];
+          for await (const c of streamingResult.changes) {
+            // Phase 32 MIGRATE-03: streaming wrapper now emits 'chunk-end'
+            // markers at per-chunk boundaries. Filter both string sentinels
+            // — parity assertion is on RowChange multisets only.
+            if (c !== 'yield' && c !== 'chunk-end') streamingChanges.push(c);
+          }
+
+          // Multiset comparison via compareChanges (sorts both sides).
+          const cmp = compareChanges(bufferedChanges, streamingChanges);
+          if (!cmp.match) {
+            throw new Error(
+              `Parity mismatch:\n  scenario: ${JSON.stringify(scenario)}\n` +
+                `  ts(buffered) count: ${cmp.tsCount}, rust(streaming) count: ${cmp.rustCount}\n` +
+                `  mismatches: ${JSON.stringify(cmp.mismatches.slice(0, 3), null, 2)}`,
+            );
+          }
+          // Also: version + numChanges agreement.
+          expect(streamingResult.version).toBe(bufferedResult.version);
+          expect(streamingResult.numChanges).toBe(bufferedResult.numChanges);
+        } finally {
+          fxA.destroy();
+          fxB.destroy();
+        }
+      }),
+      {numRuns: NUM_RUNS},
+    );
+  }, /* timeout: */ 600_000); // 1k iterations × per-fixture build is ~minutes worst-case.
 });

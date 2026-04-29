@@ -1,5 +1,5 @@
-import {createRequire} from 'node:module';
 import {readdirSync, statSync} from 'node:fs';
+import {createRequire} from 'node:module';
 import {dirname, join} from 'node:path';
 import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
@@ -1092,8 +1092,12 @@ export class PipelineDriver {
 
   /**
    * Streaming version of {@link addQueriesAsync}. Returns an
-   * `AsyncIterable<RowChange | 'yield'>` that drains each pipeline's chunk
-   * from Rust's streaming hydrate as soon as it completes.
+   * `AsyncIterable<RowChange | 'yield' | 'chunk-end'>` that drains each
+   * pipeline's chunk from Rust's streaming hydrate as soon as it completes.
+   * The `'chunk-end'` sentinel is yielded at per-query boundaries so the
+   * downstream consumer (view-syncer #processChanges) can flush its
+   * pending row batch via `processBatch()` and emit a `pokePart` mid-batch
+   * rather than only at end-of-stream (Phase 32 MIGRATE-03 enabler).
    *
    * Companion-bearing queries (the same ones `addQueriesAsync` excludes
    * from its Rust batch — `companionMeta.length > 0`) fall back to TS
@@ -1117,7 +1121,7 @@ export class PipelineDriver {
       readonly ast: AST;
     }>,
     timer: Timer,
-  ): Promise<AsyncIterable<RowChange | 'yield'>> {
+  ): Promise<AsyncIterable<RowChange | 'yield' | 'chunk-end'>> {
     if (queries.length === 0) {
       return (async function* empty() {})();
     }
@@ -1288,7 +1292,7 @@ export class PipelineDriver {
       rustEligible: boolean;
     }>,
     timer: Timer,
-  ): AsyncIterable<RowChange | 'yield'> {
+  ): AsyncIterable<RowChange | 'yield' | 'chunk-end'> {
     let lastTotalElapsed = 0;
 
     // Per-query bookkeeping helper (mirror of addQueriesAsync's per-query
@@ -1346,10 +1350,8 @@ export class PipelineDriver {
             resolvedValue: c.resolvedValue,
             whereConditions: c.ast.where,
             primaryKey:
-              this.#primaryKeys?.get(c.ast.table) ?? mustGetPrimaryKey(
-                this.#primaryKeys,
-                c.ast.table,
-              ),
+              this.#primaryKeys?.get(c.ast.table) ??
+              mustGetPrimaryKey(this.#primaryKeys, c.ast.table),
           })),
         );
         this.#manager.setQueryCompanions(
@@ -1385,6 +1387,12 @@ export class PipelineDriver {
           } as RowChange;
         }
         finalizeQuery(p);
+        // Phase 32 MIGRATE-03: per-query boundary marker. Lets the streaming
+        // consumer (view-syncer #processChanges) flush its row batch +
+        // emit a pokePart between queries instead of only at end-of-stream.
+        // No-op for buffered consumers (they iterate Iterable<...> which
+        // never sees this marker).
+        yield 'chunk-end';
       } finally {
         this.#hydrateContext = null;
       }
@@ -1471,6 +1479,8 @@ export class PipelineDriver {
           } as RowChange;
         }
         finalizeQuery(p);
+        // Phase 32 MIGRATE-03: per-query boundary marker (see Phase 3a above).
+        yield 'chunk-end';
       } finally {
         this.#hydrateContext = null;
       }
@@ -1828,8 +1838,14 @@ export class PipelineDriver {
 
   /**
    * Streaming version of {@link advanceAsync}. Returns the same `version` /
-   * `numChanges` shape, plus an `AsyncIterable<RowChange | 'yield'>` that
-   * yields each pipeline's chunk as soon as Rust completes it.
+   * `numChanges` shape, plus an
+   * `AsyncIterable<RowChange | 'yield' | 'chunk-end'>` that yields each
+   * pipeline's chunk as soon as Rust completes it. The `'chunk-end'`
+   * sentinel marks the boundary between successive Rust chunks so the
+   * downstream consumer (view-syncer #processChanges) can flush its row
+   * batch and emit a `pokePart` mid-stream rather than only at end-of-batch.
+   * (Phase 32 MIGRATE-03 enabler — buffered consumers never see this marker
+   * because the buffered Iterable<...> path does not emit it.)
    *
    * Use this instead of `advanceAsync` when you want to begin downstream
    * work (encoding, network send) before all pipelines have finished —
@@ -1854,7 +1870,7 @@ export class PipelineDriver {
   ): Promise<{
     version: string;
     numChanges: number;
-    changes: AsyncIterable<RowChange | 'yield'>;
+    changes: AsyncIterable<RowChange | 'yield' | 'chunk-end'>;
   }> {
     assert(
       this.initialized(),
@@ -1927,7 +1943,7 @@ export class PipelineDriver {
     stream: NapiAdvanceStream,
     timer: Timer,
     numChanges: number,
-  ): AsyncIterable<RowChange | 'yield'> {
+  ): AsyncIterable<RowChange | 'yield' | 'chunk-end'> {
     const totalHydrationTimeMs = this.totalHydrationTimeMs();
     this.#advanceContext = {
       timer,
@@ -1972,6 +1988,13 @@ export class PipelineDriver {
                 yield change;
               }
             }
+            // Phase 32 MIGRATE-03: per-chunk boundary marker. The streaming
+            // consumer (view-syncer #processChanges) flushes its row batch
+            // and emits a `pokePart` here, so fast pipelines surface to the
+            // client BEFORE the slowest pipeline finishes. Buffered consumers
+            // never observe this — buffered #rustAdvanceAsync materializes
+            // into Iterable<RowChange | 'yield'> with no chunk markers.
+            yield 'chunk-end';
             break;
           }
           default:

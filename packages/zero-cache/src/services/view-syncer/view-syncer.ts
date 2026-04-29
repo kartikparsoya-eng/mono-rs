@@ -2093,8 +2093,15 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     // natively iterates either — sync Iterables yield non-Promise values
     // which `await` treats as resolved no-ops. Keeps the buffered fallback
     // type-clean per CONTEXT D-05.
+    //
+    // The streaming branch additionally emits `'chunk-end'` sentinels at
+    // per-chunk / per-query boundaries (Phase 32 MIGRATE-03 enabler).
+    // We treat them as a request to flush the row batch via processBatch()
+    // so the client sees a `pokePart` BEFORE the slowest pipeline finishes.
+    // The buffered Iterable<...> path never emits 'chunk-end', so the
+    // marker handler is a no-op for buffered consumers (preserves COMPAT-02).
     changes:
-      | AsyncIterable<RowChange | 'yield'>
+      | AsyncIterable<RowChange | 'yield' | 'chunk-end'>
       | Iterable<RowChange | 'yield'>,
     updater: CVRQueryDrivenUpdater,
     pokers: PokeHandler,
@@ -2131,6 +2138,17 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         for await (const change of changes) {
           if (change === 'yield') {
             await timer.yieldProcess('yield in processChanges');
+            continue;
+          }
+          if (change === 'chunk-end') {
+            // Phase 32 MIGRATE-03: chunk-boundary flush. Streaming wrappers
+            // emit this sentinel between per-pipeline / per-query chunks.
+            // Flush any accumulated rows so the client sees a `pokePart`
+            // BEFORE the slowest pipeline finishes. Buffered consumers
+            // never produce this marker — branch is a no-op for them.
+            if (rows.size > 0) {
+              await processBatch();
+            }
             continue;
           }
           const {type, queryID, table, rowKey, row} = change;
