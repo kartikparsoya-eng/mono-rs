@@ -42,6 +42,7 @@ import {
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
 import {
+  decodeAdvanceChunkBuf,
   decodeAdvanceResultBuf,
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
@@ -74,6 +75,72 @@ interface RustPipelineManagerInstance {
   hydrateQueryAsync(id: string, queryId: string): Promise<Buffer>;
   swapSnapshot(id: string, newDbPath: string): void;
   pipelineCount(id: string): number;
+  // Phase 31-01 streaming surface — additive, alongside the buffered
+  // methods above.
+  advanceStreaming(id: string, changesJson: string): NapiAdvanceStream;
+  hydrateStreaming(id: string): NapiHydrateStream;
+  hydrateQueryStreaming(id: string, queryId: string): NapiHydrateStream;
+}
+
+/**
+ * One stream item pulled from {@link NapiAdvanceStream.next} /
+ * {@link NapiHydrateStream.next}. Mirror of `NextChunkValue` exported by
+ * `packages/zqlite-rs/index.d.ts`. Inlined here to avoid coupling the
+ * pipeline-driver module to the napi `.d.ts` generation cycle (the binary
+ * may not exist on disk in some test environments — see
+ * {@link assertNapiBinaryFreshness}).
+ */
+type NapiNextChunkValue = {
+  done: boolean;
+  kind?: string | undefined;
+  chunk?: Buffer | undefined;
+  reason?: string | undefined;
+  errorMsg?: string | undefined;
+  errorKind?: string | undefined;
+};
+
+/**
+ * Napi-side stream handle returned by `RustPipelineManager.advanceStreaming`.
+ *
+ * Note on the cancel method's name: the Rust definition is `pub fn return_`
+ * (because `return` is a Rust keyword), but napi-rs strips the trailing
+ * underscore so the generated JS method is `stream.return()`. Comments
+ * elsewhere refer to it as `stream.return_()` per the Rust source.
+ */
+interface NapiAdvanceStream {
+  next(): Promise<NapiNextChunkValue>;
+  return(): void;
+}
+
+interface NapiHydrateStream {
+  next(): Promise<NapiNextChunkValue>;
+  return(): void;
+}
+
+/**
+ * Error raised when the Rust streaming path emits a `StreamItem::Error`.
+ * The `kind` discriminator distinguishes panic-class failures from
+ * channel/rayon-class failures. Per 31-CONTEXT.md D-10/D-11.
+ *
+ * Distinct from {@link ResetPipelinesSignal}: ResetPipelinesSignal is a
+ * recoverable signal (view-syncer rolls back the advance and retries);
+ * RustStreamError is a real failure (view-syncer logs + bubbles).
+ *
+ * Phase 32's view-syncer migration MUST branch on
+ * `error instanceof RustStreamError` and `error.kind === 'panic'` —
+ * NOT on string-matching `.message` (per D-13).
+ */
+export class RustStreamError extends Error {
+  readonly source = 'rust-stream' as const;
+  readonly kind: 'panic' | 'rayon_error' | 'channel_closed';
+  constructor(
+    message: string,
+    kind: 'panic' | 'rayon_error' | 'channel_closed',
+  ) {
+    super(message);
+    this.name = 'RustStreamError';
+    this.kind = kind;
+  }
 }
 
 /**
@@ -1369,6 +1436,173 @@ export class PipelineDriver {
         rowKey: change.row_key,
         row: type === ChangeType.REMOVE ? undefined : row,
       } as RowChange;
+    }
+  }
+
+  /**
+   * Streaming version of {@link advanceAsync}. Returns the same `version` /
+   * `numChanges` shape, plus an `AsyncIterable<RowChange | 'yield'>` that
+   * yields each pipeline's chunk as soon as Rust completes it.
+   *
+   * Use this instead of `advanceAsync` when you want to begin downstream
+   * work (encoding, network send) before all pipelines have finished —
+   * peak Rust heap drops from O(total_changes) to O(max_pipeline_changes).
+   *
+   * Cancellation: `for await { break }` triggers `stream.return()` in the
+   * `finally` block (D-15), which flips the Rust cancel flag. Pipelines
+   * stop work within one push boundary (STREAM-04 / TEST-05).
+   *
+   * Errors:
+   *   - `StreamItem::ResetSignal` → `throw new ResetPipelinesSignal(reason, 'scalar-subquery')`
+   *     (WRAP-04: same throw shape as the buffered `#rustAdvanceAsync` path).
+   *   - `StreamItem::Error(msg, kind)` → `throw new RustStreamError(msg, kind)`
+   *     (D-10/D-11: kind discriminator preserved verbatim from Rust).
+   *
+   * Note: this method is alongside (not replacing) `advanceAsync`. The
+   * buffered path is preserved for tests/benches per IVM-STREAMING-PLAN.md §8.
+   */
+  async advanceStreaming(
+    timer: Timer,
+    _vsId?: string | undefined,
+  ): Promise<{
+    version: string;
+    numChanges: number;
+    changes: AsyncIterable<RowChange | 'yield'>;
+  }> {
+    assert(
+      this.initialized(),
+      'Pipeline driver must be initialized before advancing',
+    );
+    assert(
+      this.#manager,
+      'RustPipelineManager must be available — Rust is the sole advance path',
+    );
+
+    // Reuse the existing snapshotter diff path verbatim — same as
+    // #rustAdvanceAsync. (TS owns the diff/swap path; Rust cannot open
+    // its own BEGIN CONCURRENT connections.)
+    const diff = this.#snapshotter.advance(
+      this.#tableSpecs,
+      this.#allTableNames,
+    );
+    const {prev, curr, changes: numChanges} = diff;
+
+    this.#lc.debug?.(
+      `rust_advance_streaming ${prev.version} => ${curr.version}: ${numChanges} changes, ${this.#pipelines.size} pipelines`,
+    );
+
+    const collectedChanges: Array<{
+      table: string;
+      prevValues: ReadonlyArray<Readonly<Row>>;
+      nextValue: Readonly<Row> | null;
+      rowKey: unknown;
+    }> = [];
+    for (const change of diff) {
+      collectedChanges.push(change);
+    }
+
+    this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
+
+    const permTables = this.#combinedPermissionTables();
+    if (permTables && permTables.size > 0) {
+      this.#manager.setPermissionTables(
+        this.#instanceId,
+        JSON.stringify([...permTables]),
+      );
+    }
+
+    for (const table of this.#tables.values()) {
+      table.setDB(curr.db.db);
+    }
+    this.#ensureCostModelExistsIfEnabled(curr.db.db);
+
+    const stream = this.#manager.advanceStreaming(
+      this.#instanceId,
+      JSON.stringify(collectedChanges),
+    );
+
+    return {
+      version: curr.version,
+      numChanges,
+      changes: this.#streamChanges(stream, timer, numChanges),
+    };
+  }
+
+  /**
+   * Drain a Napi stream, decoding chunks via {@link decodeAdvanceChunkBuf} and
+   * mapping `StreamItem::ResetSignal` / `StreamItem::Error` to TS throws.
+   *
+   * D-15 belt-and-suspenders: `try { for await ... } finally { stream.return_() }`
+   * (the JS method is named `return` because napi-rs strips the trailing
+   * underscore from Rust's `pub fn return_`; comments use the Rust name).
+   */
+  async *#streamChanges(
+    stream: NapiAdvanceStream,
+    timer: Timer,
+    numChanges: number,
+  ): AsyncIterable<RowChange | 'yield'> {
+    const totalHydrationTimeMs = this.totalHydrationTimeMs();
+    this.#advanceContext = {
+      timer,
+      totalHydrationTimeMs,
+      numChanges,
+      pos: 0,
+    };
+    try {
+      while (true) {
+        const item = await stream.next();
+        if (item.done) break;
+        switch (item.kind) {
+          case 'reset':
+            // WRAP-04: same throw shape as today's buffered #rustAdvanceAsync.
+            throw new ResetPipelinesSignal(
+              item.reason ?? '',
+              'scalar-subquery',
+            );
+          case 'error':
+            // D-10/D-11: Rust→TS error mapping with kind discriminator.
+            throw new RustStreamError(
+              item.errorMsg ?? '',
+              (item.errorKind ?? 'panic') as
+                | 'panic'
+                | 'rayon_error'
+                | 'channel_closed',
+            );
+          case 'chunk': {
+            assert(
+              item.chunk,
+              'StreamItem::Chunk must carry a non-null buffer',
+            );
+            const decoded = decodeAdvanceChunkBuf(item.chunk);
+            for (const change of this.#convertDispatchChanges(decoded)) {
+              if (change !== 'yield') {
+                if (this.#shouldAdvanceYieldMaybeAbortAdvance()) {
+                  yield 'yield';
+                }
+                yield change;
+                this.#advanceContext!.pos++;
+              } else {
+                yield change;
+              }
+            }
+            break;
+          }
+          default:
+            // Forward-compat: unknown kinds are ignored (D-11 additive policy).
+            break;
+        }
+      }
+    } finally {
+      // D-15: belt-and-suspenders cancel. The JS method is `stream.return()`
+      // — alias for what Rust calls `stream.return_()`. Drop on the Rust side
+      // also fires when the AdvanceStream is GC'd, so even if this throws
+      // (it shouldn't) the cancel flag will eventually flip.
+      try {
+        stream.return();
+      } catch {
+        /* swallow — Drop handles the GC path */
+      }
+      this.#advanceContext = null;
     }
   }
 
