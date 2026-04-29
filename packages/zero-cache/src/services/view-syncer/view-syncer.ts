@@ -2087,7 +2087,15 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   #processChanges(
     lc: LogContext,
     timer: TimeSliceTimer,
-    changes: Iterable<RowChange | 'yield'>,
+    // Phase 32 (MIGRATE-01/02): broadened to accept either AsyncIterable
+    // (from advanceStreaming/addQueriesStreaming) or Iterable (from the
+    // buffered fallback path advanceAsync/addQueriesAsync). `for await of`
+    // natively iterates either — sync Iterables yield non-Promise values
+    // which `await` treats as resolved no-ops. Keeps the buffered fallback
+    // type-clean per CONTEXT D-05.
+    changes:
+      | AsyncIterable<RowChange | 'yield'>
+      | Iterable<RowChange | 'yield'>,
     updater: CVRQueryDrivenUpdater,
     pokers: PokeHandler,
   ) {
@@ -2120,7 +2128,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         });
 
       await startAsyncSpan(tracer, 'loopingChanges', async span => {
-        for (const change of changes) {
+        for await (const change of changes) {
           if (change === 'yield') {
             await timer.yieldProcess('yield in processChanges');
             continue;
