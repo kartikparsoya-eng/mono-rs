@@ -46,8 +46,40 @@ import {
   decodeAdvanceResultBuf,
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
-import {materializeChanges} from './dual-executor.ts';
+import {compareChanges, materializeChanges} from './dual-executor.ts';
 import {createRustExistsWrapper} from './rust-exists.ts';
+import {
+  tsAdvance,
+  tsAddQueryAll,
+  type TsOracleContext,
+} from './pipeline-driver-ts-oracle.ts';
+
+// ===== HARDEN-01 (Phase 33-01): parity check shim (env-gated) =====
+//
+// Process-global counters for parity-check sampling. Single int per
+// counter is acceptable per CONTEXT D-06/D-07: tests reset between
+// scenarios via `resetParityDivergenceCount()`. The counter is
+// post-incremented inside `#shouldRunParityCheck()` so the FIRST call
+// fires when rate=1; tests rely on this.
+
+let parityDivergenceCount = 0;
+let parityCheckInvocationCount = 0;
+
+export function getParityDivergenceCount(): number {
+  return parityDivergenceCount;
+}
+
+export function resetParityDivergenceCount(): void {
+  parityDivergenceCount = 0;
+  parityCheckInvocationCount = 0;
+}
+
+type ParityCheckMode = 'off' | 'sample' | 'strict';
+
+function parseParityCheckMode(env: string | undefined): ParityCheckMode {
+  if (env === 'sample' || env === 'strict') return env;
+  return 'off';
+}
 
 let RustPipelineManagerClass:
   | {
@@ -393,6 +425,13 @@ export class PipelineDriver {
   #manager: RustPipelineManagerInstance | null = null;
   readonly #instanceId: string;
 
+  // HARDEN-01 parity-check fields. Read once per instance in the
+  // constructor (NOT module top-level — Phase 32 D-04..D-07 carry-forward;
+  // module-init reads lock the value at first import and break dual-mode
+  // tests that flip the env var in beforeEach).
+  readonly #parityCheckMode: ParityCheckMode;
+  readonly #parityCheckRate: number;
+
   constructor(
     lc: LogContext,
     logConfig: LogConfig,
@@ -416,6 +455,87 @@ export class PipelineDriver {
     this.#costModels = enablePlanner ? new WeakMap() : undefined;
     this.#yieldThresholdMs = yieldThresholdMs;
     this.#instanceId = clientGroupID;
+
+    // HARDEN-01: read parity-check env vars per-instance.
+    this.#parityCheckMode = parseParityCheckMode(
+      process.env['ZQLITE_RS_PARITY_CHECK'],
+    );
+    this.#parityCheckRate = Math.max(
+      1,
+      parseInt(process.env['ZQLITE_RS_PARITY_CHECK_RATE'] ?? '10', 10),
+    );
+  }
+
+  // ===== HARDEN-01: parity-check shim helpers =====
+
+  /**
+   * Returns true iff this invocation should run the TS oracle and call
+   * compareChanges. Increments `parityCheckInvocationCount` so test
+   * cadence assertions are deterministic.
+   */
+  #shouldRunParityCheck(): boolean {
+    if (this.#parityCheckMode === 'off') return false;
+    parityCheckInvocationCount++;
+    if (this.#parityCheckMode === 'strict') return true;
+    return parityCheckInvocationCount % this.#parityCheckRate === 0;
+  }
+
+  /**
+   * Run a parity-check comparison if sampling fires. The TS oracle is
+   * invoked via `runTsExpensive` so its cost is paid lazily (CONTEXT D-05).
+   *
+   * Production output is ALWAYS the Rust array — this method ignores
+   * (returns void) the TS array and never substitutes it (P-07
+   * anti-pattern avoided per CONTEXT/RESEARCH §5.4).
+   *
+   * Treats an empty TS oracle as "no comparison performed" (skip) — see
+   * pipeline-driver-ts-oracle.ts header for the mono-rs limitation.
+   */
+  async #maybeRunParityCheck(
+    label: 'advance' | 'hydrate',
+    rustChanges: RowChange[],
+    runTsExpensive: () => Promise<RowChange[]>,
+  ): Promise<void> {
+    if (!this.#shouldRunParityCheck()) return;
+    const tsChanges = await runTsExpensive();
+    // Empty TS oracle => skip comparison (see oracle file header).
+    // Strict mode still runs comparison even with empty TS, since the
+    // intent is to throw on any divergence.
+    if (tsChanges.length === 0 && this.#parityCheckMode !== 'strict') {
+      return;
+    }
+    const result = compareChanges(tsChanges, rustChanges);
+    if (result.match) return;
+    parityDivergenceCount += result.mismatches.length;
+    const detail =
+      `[parity] ${label}: ${result.mismatches.length} divergence(s) ` +
+      `(ts=${result.tsCount}, rust=${result.rustCount})`;
+    if (this.#parityCheckMode === 'strict') {
+      this.#lc.error?.(detail);
+      throw new Error(`Parity check failed: ${detail}`);
+    }
+    this.#lc.warn?.(detail);
+  }
+
+  /**
+   * Build the shared TsOracleContext on demand. Lazy: only built when
+   * `#shouldRunParityCheck()` returns true.
+   */
+  #oracleCtx(): TsOracleContext {
+    return {
+      lc: this.#lc,
+      primaryKeys: must(this.#primaryKeys),
+      tableSpecs: this.#tableSpecs,
+      tables: this.#tables,
+      pipelines: this.#pipelines as unknown as Map<string, {input: Input}>,
+      getSource: (n: string) => this.#getSource(n),
+      createStorage: () => this.#createStorage(),
+      inspectorDelegate: this.#inspectorDelegate,
+      costModel: this.#ensureCostModelExistsIfEnabled(
+        this.#snapshotter.current().db.db,
+      ),
+      shouldYieldHydrate: () => this.#shouldYield(),
+    };
   }
 
   /**
@@ -1085,6 +1205,37 @@ export class PipelineDriver {
       } finally {
         this.#hydrateContext = null;
       }
+    }
+
+    // HARDEN-01: sample-mode parity check on the hydrate path. We
+    // reconstruct (do NOT re-consume) the Rust-eligible RowChange[] for
+    // comparison and run a fresh TS hydrate via tsAddQueryAll. Companion
+    // queries are excluded from comparison (mirrors `rustEligible` gate
+    // — the Rust batch already excludes them).
+    if (this.#parityCheckMode !== 'off') {
+      const rustHydrateChanges: RowChange[] = [];
+      for (const c of allChanges) {
+        if (c !== 'yield') rustHydrateChanges.push(c);
+      }
+      await this.#maybeRunParityCheck(
+        'hydrate',
+        rustHydrateChanges,
+        async () => {
+          const out: RowChange[] = [];
+          const ctx = this.#oracleCtx();
+          const eligibleQueries = prepared
+            .filter(p => p.rustEligible)
+            .map(p => ({
+              transformationHash: p.transformationHash,
+              queryID: p.queryID,
+              resolvedQuery: p.resolvedQuery,
+            }));
+          for (const c of tsAddQueryAll(ctx, eligibleQueries, timer)) {
+            if (c !== 'yield') out.push(c);
+          }
+          return out;
+        },
+      );
     }
 
     return allChanges;
@@ -2070,6 +2221,15 @@ export class PipelineDriver {
 
     const changes = materializeChanges(
       this.#convertDispatchChanges(decoded.changes),
+    );
+
+    // HARDEN-01: sample-mode parity check on the advance hot path. Cost
+    // is paid only when shouldRunParityCheck() returns true (default
+    // every 10th invocation). Production output is the Rust array;
+    // #maybeRunParityCheck returns void by design so we never substitute
+    // TS output (P-07 anti-pattern avoided).
+    await this.#maybeRunParityCheck('advance', changes, async () =>
+      materializeChanges(tsAdvance(this.#oracleCtx(), diff, timer, numChanges)),
     );
 
     for (const table of this.#tables.values()) {
