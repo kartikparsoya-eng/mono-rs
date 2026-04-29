@@ -1908,14 +1908,21 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       await yieldProcess(lc);
 
       const batchTimer = timer.startWithoutYielding();
-      const rowChanges = await pipelines.addQueriesAsync(
-        addQueries.map(q => ({
-          transformationHash: q.transformationHash,
-          queryID: q.id,
-          ast: q.ast,
-        })),
-        batchTimer,
-      );
+      // Phase 32 migration: streaming hydrate under flag (default on),
+      // buffered fallback for emergency rollback. CONTEXT D-04..D-07.
+      // RESEARCH P-05: do NOT introduce throw points between this await
+      // and the `for await` consumption at the #processChanges call below
+      // — addQueriesStreaming registers Rust queries before its async
+      // generator drains, so any throw between here and consumption would
+      // leak registered queries.
+      const queryArgs = addQueries.map(q => ({
+        transformationHash: q.transformationHash,
+        queryID: q.id,
+        ast: q.ast,
+      }));
+      const rowChanges = this.#useStreamingConsumer
+        ? await pipelines.addQueriesStreaming(queryArgs, batchTimer)
+        : await pipelines.addQueriesAsync(queryArgs, batchTimer);
       const elapsed = timer.stop();
       totalProcessTime += elapsed;
 
