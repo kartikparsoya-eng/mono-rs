@@ -21,7 +21,7 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 
 - [x] **Phase 30: Audit Fixes** — Ship the 4 IVM port audit fixes on a known-correct baseline before building streaming on top. (4/5 plans complete; gap-closure plan 30-05 pending — closes AUDIT-02 end-to-end) (completed 2026-04-29)
 - [x] **Phase 31: Rust Streaming Primitives + TS Wrappers** — Additive Rust napi streaming methods + TS PipelineDriver wrappers + decoder; no consumer migrated yet. (completed 2026-04-29)
-- [ ] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete.
+- [x] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete. (completed 2026-04-29)
 - [ ] **Phase 33: Performance Tuning + Benchmarks** — Bounded channel, TTFB benchmark, memory peak measurement.
 
 ---
@@ -99,12 +99,12 @@ Plans:
 4. CVR commit happens exactly once at the end of `#advancePipelines` after the full stream is consumed; `pokers.end(finalVersion)` fires exactly once after CVR commit; `pokers.cancel()` fires correctly when `ResetPipelinesSignal` is thrown mid-stream (verified by an integration test that injects a companion-scalar change mid-batch and asserts no in-flight changes are committed client-side).
 5. Full view-syncer test suite passes; `pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts` (1k iterations), and `cargo test` continue to pass unchanged from Phase 31.
 
-**Plans:** 2 plans
+**Plans:** 2/2 plans complete
 
 Plans:
 
-- [ ] 32-01-PLAN.md — CR-01: i64 decoder safe-integer gate fix in decode-advance-buf.ts (Wave 1)
-- [ ] 32-02-PLAN.md — MIGRATE-01..04: view-syncer streaming migration with ZQLITE_RS_USE_STREAMING_CONSUMER feature flag, RustStreamError logging, mid-batch pokePart test, reset-cancel test (Wave 2, depends on 32-01)
+- [x] 32-01-PLAN.md — CR-01: i64 decoder safe-integer gate fix in decode-advance-buf.ts (Wave 1)
+- [x] 32-02-PLAN.md — MIGRATE-01..04: view-syncer streaming migration with ZQLITE_RS_USE_STREAMING_CONSUMER feature flag, RustStreamError logging, mid-batch pokePart test, reset-cancel test (Wave 2, depends on 32-01)
 
 ---
 
@@ -133,7 +133,7 @@ Plans:
 | ------------------------------------------- | -------------- | ----------- | ---------- |
 | 30. Audit Fixes                             | 5/5            | Complete    | 2026-04-29 |
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
-| 32. View-Syncer Streaming Migration         | 0/2            | Planned     | —          |
+| 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
 | 33. Performance Tuning + Benchmarks         | 0/0            | Not started | —          |
 
 ---
