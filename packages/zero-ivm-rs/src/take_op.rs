@@ -1065,4 +1065,68 @@ mod tests {
             old_node: make_node(5),
         });
     }
+
+    // ========================================================================
+    // Phase 34 Wave 0 — Red-state stub for B3 secondary site (CONTEXT D-18).
+    // The PRIMARY B3 fix is in zqlite-rs::ast_to_config (parameter threading).
+    // This test asserts the take_op-side symptom: when partition_key is None
+    // (i.e., not threaded), `take_state_key(&row)` returns the global bucket
+    // `"[\"take\"]"`, which is a constant — not a row-derived key. Wave 1
+    // re-tests after threading: state_key should derive from the row's
+    // partition columns and match the fetch-time constraint-derived key.
+    // ========================================================================
+
+    /// **B3 (BLOCKING — secondary site) — Take state-key consistency.**
+    ///
+    /// Spec: TS `packages/zql/src/ivm/take.ts:710-757` (`getTakeStateKey`)
+    /// uses `partitionKey` to extract values from EITHER a row (push path) OR
+    /// a constraint (fetch path). The same partition values must produce the
+    /// same key on both paths.
+    ///
+    /// Current Rust:
+    /// - `take_op.rs:55-67` (`take_state_key`, used by push) — returns
+    ///   `"[\"take\"]"` when `partition_key: None`.
+    /// - `take_op.rs:317-329` (fetch fallback) — when partition_key is None
+    ///   but a constraint is present (child Take inside a Join), builds a
+    ///   different key including the constraint columns + values.
+    ///
+    /// The two paths emit different keys → push silently no-ops because
+    /// `states.get(&push_key)` returns None.
+    ///
+    /// Wave 0 Red-state: a TakeOperator with `partition_key: None` returns
+    /// the constant `"[\"take\"]"` from `take_state_key` regardless of the
+    /// row contents. Wave 1 (after B3 fix lands and partition_key is threaded
+    /// from ast_to_config) re-tests: a TakeOperator with
+    /// `partition_key: Some(vec!["channelId"])` should derive a row-specific
+    /// key, and that key should equal the constraint-derived key.
+    #[test]
+    #[ignore = "Phase 34 Wave 1 will flip this green by threading partition_key \
+        through ast_to_operator_configs (zqlite-rs B3 fix) and asserting that \
+        TakeOperator with Some(partition_key) emits matching push/fetch keys. \
+        Spec: TS take.ts:710-757."]
+    fn test_b3_partition_state_consistency() {
+        // Build a Take with partition_key None — current bug surface.
+        let mock = MockInput::new(vec![make_node(1), make_node(2)]);
+        let op = TakeOperator::new(Box::new(mock), 2, default_sort(), None);
+
+        // Inspect the state-key behavior. Wave 0 stub: directly use the
+        // private helper via shared state inspection. Since `take_state_key`
+        // is private, we observe its effect via push: when push runs and
+        // partition_key is None, the key collapses to a global bucket — so
+        // two distinct rows with different partition columns share state.
+        // Wave 1 will replace this with: build with Some(["channelId"]),
+        // derive both keys, assert they match.
+
+        // Red state: drop op (no-op for the assertion); rely on the source
+        // marker inspection — the literal `"[\"take\"]"` constant is the
+        // documented broken behavior. Wave 1 removes it.
+        drop(op);
+        let src = include_str!("take_op.rs");
+        assert!(
+            src.contains("None => \"[\\\"take\\\"]\".to_string(),"),
+            "Wave 0 expected the partition_key=None branch returning the global bucket \
+             constant `[\"take\"]` (current bug). Not found — Wave 1 may have landed \
+             without removing the stub."
+        );
+    }
 }

@@ -2515,5 +2515,67 @@ mod tests {
         assert_eq!(seq_total_changes, par_total_changes,
             "sequential and parallel must produce the same number of row changes");
     }
+
+    // ========================================================================
+    // Phase 34 Wave 0 — Red-state stub for B11 (CONTEXT D-18).
+    // Wave 1 will flip this green by:
+    //   1. Adding a `set_prev_snapshot(prev_db_path: String)` napi method
+    //      to RustPipelineManager (additive — no existing buffered method
+    //      signature changes, per CLAUDE.md verification gate #4).
+    //   2. Routing `emit_descendant_removals` to read from `prev_db_path`
+    //      instead of `db_path` (post-tx).
+    //   3. Adding TS-side wiring in pipeline-driver.ts to call
+    //      `set_prev_snapshot(prev.db.db.name)` BEFORE
+    //      `swap_snapshot(curr.db.db.name)` on each advance.
+    // ========================================================================
+
+    /// **B11 (BLOCKING) — Cascade-delete reads POST-tx snapshot.**
+    ///
+    /// Spec: TS upstream `pipeline-driver.ts:1542-1577` materializes the diff
+    /// from the `prev` snapshot BEFORE swapping to `curr`. Descendant rows
+    /// being deleted in the same transaction are still present in `prev` so
+    /// their Remove row-changes are emitted.
+    ///
+    /// Current Rust (`advance.rs:464-477`): `emit_descendant_removals` opens
+    /// a fresh read connection on `db_path`. By the time advance runs,
+    /// `swap_snapshot` has already pointed `db_path` at `curr.db.db.name`
+    /// (post-tx). Same-tx descendant deletes are silently elided.
+    ///
+    /// Wave 0 Red-state: source contains the literal
+    /// `Connection::open_with_flags(db_path,` at the descendant SQL site.
+    /// Wave 1 replaces it with `Connection::open_with_flags(prev_db_path,`
+    /// after threading the prev snapshot through.
+    #[test]
+    #[ignore = "Phase 34 Wave 1 will flip this green by adding the set_prev_snapshot \
+        napi method on RustPipelineManager and routing emit_descendant_removals \
+        to read from the prev snapshot. Spec: TS pipeline-driver.ts:1542-1577."]
+    fn test_b11_descendants_from_prev() {
+        let src = include_str!("advance.rs");
+        // Red state: emit_descendant_removals function still exists and reads
+        // from `db_path` (post-tx). The function signature contains
+        // `db_path: &str` — Wave 1 replaces it with `prev_db_path: &str`.
+        let fn_marker = src
+            .find("fn emit_descendant_removals(")
+            .expect("missing emit_descendant_removals — code refactored?");
+        let signature_block = &src[fn_marker..fn_marker + 400];
+        // Red state: `db_path` is the parameter name (not `prev_db_path`).
+        assert!(
+            signature_block.contains("db_path: &str") &&
+                !signature_block.contains("prev_db_path: &str"),
+            "Wave 0 expected emit_descendant_removals(db_path: &str) (current bug — reads \
+             post-tx snapshot). Wave 1 should rename parameter to `prev_db_path` once the \
+             snapshot lifecycle is wired through. If renamed already, remove this stub."
+        );
+        // The `set_prev_snapshot` napi method should NOT yet exist (Wave 1 adds it).
+        // Match by the `#[napi]` attribute pattern preceding a real method
+        // declaration — this skips over our own assertion-string literal that
+        // names the method in documentation text.
+        let napi_method_marker = "#[napi]\n    pub fn set_prev_snapshot";
+        assert!(
+            !src.contains(napi_method_marker),
+            "Wave 0 expected `set_prev_snapshot` NOT yet implemented as a #[napi] method. \
+             Found it — Wave 1 fix may have landed without removing the stub."
+        );
+    }
 }
 use zero_ivm_rs::types::FetchRequest;
