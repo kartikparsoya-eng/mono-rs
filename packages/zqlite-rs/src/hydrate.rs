@@ -766,7 +766,7 @@ fn parse_predicate_json(value: &serde_json::Value) -> Result<zero_ivm_rs::filter
         }
         if let Some(val) = obj.get("like") {
             let pattern = val.as_str().ok_or("'like' value must be a string")?.to_string();
-            return Ok(Predicate::Like(field, pattern, true));
+            return Ok(Predicate::Like(field, pattern, false));
         }
         if let Some(val) = obj.get("ilike") {
             let pattern = val.as_str().ok_or("'ilike' value must be a string")?.to_string();
@@ -1776,5 +1776,112 @@ mod tests {
         // Bob and Carol have 0 matching posts
         assert_eq!(result[1].relationships["posts"].len(), 0);
         assert_eq!(result[2].relationships["posts"].len(), 0);
+    }
+
+    // ---- AUDIT-01 regression tests (Phase 30) ----
+    //
+    // Bug: `parse_predicate_json` constructed `Predicate::Like(_, _, true)` for the
+    // `like` key, making LIKE silently case-insensitive in Rust IVM. The parity reference
+    // (`packages/zero-ivm-rs/src/pipeline.rs` lines 128-135) uses `false` for `like` and
+    // `true` for `ilike`. These tests pin both behaviors.
+    //
+    // See: `.planning/phases/30-audit-fixes/30-01-PLAN.md`, decisions D-01 and D-02 in
+    // `.planning/phases/30-audit-fixes/30-CONTEXT.md`.
+
+    #[test]
+    fn test_parse_predicate_like_case_sensitive() {
+        use zero_ivm_rs::filter::{Predicate, evaluate_json_row};
+
+        let json_value = json!({"field": "name", "like": "Foo%"});
+        let pred = parse_predicate_json(&json_value).expect("parse like");
+
+        // Variant must be Like with case_insensitive=false.
+        assert!(
+            matches!(&pred, Predicate::Like(field, pattern, false) if field == "name" && pattern == "Foo%"),
+            "expected Predicate::Like(\"name\", \"Foo%\", false), got {:?}",
+            pred,
+        );
+
+        // Evaluation: case-sensitive prefix match.
+        let mut row_foo_bar = serde_json::Map::new();
+        row_foo_bar.insert("name".into(), serde_json::Value::String("Foo Bar".into()));
+        assert!(
+            evaluate_json_row(&pred, &row_foo_bar),
+            "LIKE 'Foo%' should match 'Foo Bar'",
+        );
+
+        let mut row_foo_lower = serde_json::Map::new();
+        row_foo_lower.insert("name".into(), serde_json::Value::String("foo bar".into()));
+        assert!(
+            !evaluate_json_row(&pred, &row_foo_lower),
+            "LIKE 'Foo%' must NOT match 'foo bar' (case-sensitive)",
+        );
+
+        let mut row_foo_upper = serde_json::Map::new();
+        row_foo_upper.insert("name".into(), serde_json::Value::String("FOO".into()));
+        assert!(
+            !evaluate_json_row(&pred, &row_foo_upper),
+            "LIKE 'Foo%' must NOT match 'FOO' (case-sensitive)",
+        );
+    }
+
+    #[test]
+    fn test_parse_predicate_ilike_case_insensitive() {
+        use zero_ivm_rs::filter::{Predicate, evaluate_json_row};
+
+        let json_value = json!({"field": "name", "ilike": "foo%"});
+        let pred = parse_predicate_json(&json_value).expect("parse ilike");
+
+        // Variant must be Like with case_insensitive=true.
+        assert!(
+            matches!(&pred, Predicate::Like(field, pattern, true) if field == "name" && pattern == "foo%"),
+            "expected Predicate::Like(\"name\", \"foo%\", true), got {:?}",
+            pred,
+        );
+
+        // Evaluation: case-insensitive prefix match.
+        let mut row_foo_bar = serde_json::Map::new();
+        row_foo_bar.insert("name".into(), serde_json::Value::String("Foo Bar".into()));
+        assert!(
+            evaluate_json_row(&pred, &row_foo_bar),
+            "ILIKE 'foo%' should match 'Foo Bar'",
+        );
+
+        let mut row_foo_lower = serde_json::Map::new();
+        row_foo_lower.insert("name".into(), serde_json::Value::String("foo bar".into()));
+        assert!(
+            evaluate_json_row(&pred, &row_foo_lower),
+            "ILIKE 'foo%' should match 'foo bar'",
+        );
+
+        let mut row_foo_upper = serde_json::Map::new();
+        row_foo_upper.insert("name".into(), serde_json::Value::String("FOO".into()));
+        assert!(
+            evaluate_json_row(&pred, &row_foo_upper),
+            "ILIKE 'foo%' should match 'FOO'",
+        );
+    }
+
+    #[test]
+    fn test_parse_predicate_like_distinguishes_from_ilike() {
+        use zero_ivm_rs::filter::evaluate_json_row;
+
+        // Same input row evaluated against LIKE 'foo%' and ILIKE 'foo%'.
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::Value::String("Foo Bar".into()));
+
+        let like_pred =
+            parse_predicate_json(&json!({"field": "name", "like": "foo%"})).expect("parse like");
+        let ilike_pred =
+            parse_predicate_json(&json!({"field": "name", "ilike": "foo%"})).expect("parse ilike");
+
+        assert!(
+            !evaluate_json_row(&like_pred, &row),
+            "LIKE 'foo%' must NOT match 'Foo Bar' (case-sensitive)",
+        );
+        assert!(
+            evaluate_json_row(&ilike_pred, &row),
+            "ILIKE 'foo%' MUST match 'Foo Bar' (case-insensitive)",
+        );
     }
 }
