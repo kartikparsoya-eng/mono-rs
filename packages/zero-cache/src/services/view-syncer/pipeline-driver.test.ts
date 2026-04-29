@@ -767,7 +767,7 @@ describe('view-syncer/pipeline-driver', () => {
             "_0_version": "134",
             "id": "41",
             "issueID": "4",
-            "upvotes": 9007199254740991n,
+            "upvotes": 9007199254740991,
           },
           "rowKey": {
             "id": "41",
