@@ -569,17 +569,29 @@ export async function nextPokeMerged(
   client: Queue<Downstream>,
 ): Promise<Downstream[]> {
   const pokes = await nextPoke(client);
-  const start = pokes.find(m => m[0] === 'pokeStart');
-  const end = pokes.find(m => m[0] === 'pokeEnd');
-  const partBodies = pokes
-    .filter((m: Downstream) => m[0] === 'pokePart')
-    .map(([, body]) => body as PokePartBody);
+  // Preserve non-poke messages (e.g., 'transformError', 'warning') in order;
+  // collapse a contiguous run of 'pokePart' messages into a single merged
+  // PokePartBody. Multiple pokePart runs (rare) each merge independently.
   const result: Downstream[] = [];
-  if (start) result.push(start);
-  if (partBodies.length > 0) {
-    result.push(['pokePart', mergePokePartsIntoOne(partBodies)] as Downstream);
+  let pendingParts: PokePartBody[] = [];
+  const flushPending = () => {
+    if (pendingParts.length > 0) {
+      result.push([
+        'pokePart',
+        mergePokePartsIntoOne(pendingParts),
+      ] as Downstream);
+      pendingParts = [];
+    }
+  };
+  for (const msg of pokes) {
+    if (msg[0] === 'pokePart') {
+      pendingParts.push(msg[1] as PokePartBody);
+    } else {
+      flushPending();
+      result.push(msg);
+    }
   }
-  if (end) result.push(end);
+  flushPending();
   return result;
 }
 

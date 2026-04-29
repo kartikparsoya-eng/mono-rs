@@ -16,6 +16,7 @@ import {
   COMMENTS_QUERY,
   ISSUES_QUERY,
   nextPoke,
+  nextPokeMerged,
   permissions,
   setup,
 } from './view-syncer-test-util.ts';
@@ -88,7 +89,7 @@ describe('permissions', () => {
     stateChanges.push({state: 'version-ready'});
     await nextPoke(client);
     // the user is not logged in as admin and so cannot see any issues.
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -141,7 +142,7 @@ describe('permissions', () => {
       [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY}],
     );
 
-    expect(await nextPoke(client2)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client2)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -247,7 +248,7 @@ describe('permissions', () => {
     stateChanges.push({state: 'version-ready'});
     await nextPoke(client);
     // the user is not logged in as admin and so cannot see any issues.
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -313,7 +314,7 @@ describe('permissions', () => {
     stateChanges.push({state: 'version-ready'});
 
     // Newly visible rows are poked.
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -396,7 +397,7 @@ describe('permissions', () => {
     stateChanges.push({state: 'version-ready'});
     await nextPoke(client);
     // Should not receive any comments b/c they cannot see any issues
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -449,7 +450,7 @@ describe('permissions', () => {
     // Should receive comments since they can see issues as the admin
     // but should not receive those issues since the query for them was added by
     // the auth system.
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",

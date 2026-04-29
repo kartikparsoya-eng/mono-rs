@@ -56,6 +56,7 @@ import {
   ISSUES_QUERY_WITH_RELATED,
   messages,
   nextPoke,
+  nextPokeMerged,
   nextPokeParts,
   ON_FAILURE,
   permissionsAll,
@@ -354,7 +355,7 @@ describe('view-syncer/service', () => {
     const client = connect(SYNC_CONTEXT, [
       {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
     ]);
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -388,7 +389,7 @@ describe('view-syncer/service', () => {
     `);
 
     stateChanges.push({state: 'version-ready'});
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -557,7 +558,7 @@ describe('view-syncer/service', () => {
       const client = connect(SYNC_CONTEXT, [
         {op: 'put', hash: 'custom-1', name: 'named-query', args: ['thing']},
       ]);
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -591,7 +592,7 @@ describe('view-syncer/service', () => {
     `);
 
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -809,7 +810,7 @@ describe('view-syncer/service', () => {
         {op: 'put', hash: 'custom-2', name: 'named-query-2', args: ['thing']},
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -847,7 +848,7 @@ describe('view-syncer/service', () => {
       `);
 
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -937,7 +938,7 @@ describe('view-syncer/service', () => {
 
       await inactivateQuery(vs, SYNC_CONTEXT, 'custom-1');
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -973,7 +974,7 @@ describe('view-syncer/service', () => {
       // Expire custom-1
       callNextSetTimeout(ttl);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1011,7 +1012,7 @@ describe('view-syncer/service', () => {
       );
       stateChanges.push({state: 'version-ready'});
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1069,7 +1070,7 @@ describe('view-syncer/service', () => {
         },
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1102,7 +1103,7 @@ describe('view-syncer/service', () => {
         ]
       `);
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1349,7 +1350,7 @@ describe('view-syncer/service', () => {
         },
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1381,7 +1382,7 @@ describe('view-syncer/service', () => {
           ],
         ]
       `);
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1636,7 +1637,7 @@ describe('view-syncer/service', () => {
         {op: 'put', hash: 'custom-2', name: 'named-query-2', args: ['thing']},
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1673,7 +1674,7 @@ describe('view-syncer/service', () => {
         ]
       `);
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
           [
             [
               "pokeStart",
@@ -1859,7 +1860,7 @@ describe('view-syncer/service', () => {
         },
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -1892,7 +1893,7 @@ describe('view-syncer/service', () => {
         ]
       `);
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -2061,7 +2062,7 @@ describe('view-syncer/service', () => {
         },
       ]);
 
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -2093,7 +2094,7 @@ describe('view-syncer/service', () => {
           ],
         ]
       `);
-      expect(await nextPoke(client)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -2339,7 +2340,7 @@ describe('view-syncer/service', () => {
       );
 
       // query should still transition to `got`
-      expect(await nextPoke(client2)).toMatchInlineSnapshot(`
+      expect(await nextPokeMerged(client2)).toMatchInlineSnapshot(`
         [
           [
             "pokeStart",
@@ -2908,7 +2909,7 @@ describe('view-syncer/service', () => {
 
       await nextPoke(client);
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(
         `
         [
           [
@@ -3003,7 +3004,7 @@ describe('view-syncer/service', () => {
 
       await nextPoke(client);
       stateChanges.push({state: 'version-ready'});
-      expect(await nextPoke(client)).toMatchInlineSnapshot(
+      expect(await nextPokeMerged(client)).toMatchInlineSnapshot(
         `
         [
           [
@@ -3140,9 +3141,11 @@ describe('view-syncer/service', () => {
           // Initial config poke
           await nextPoke(client1);
 
-          // Trigger hydration
+          // Trigger hydration. Use nextPokeMerged so the rowsPatch assertion
+          // below sees the unified pokePart shape regardless of streaming
+          // mode's per-chunk pokePart cadence (CONTEXT D-06).
           stateChanges.push({state: 'version-ready'});
-          const hydrateResponse = await nextPoke(client1);
+          const hydrateResponse = await nextPokeMerged(client1);
 
           // Verify first transformation was called
           expect(transformSpy).toHaveBeenCalledTimes(1);
@@ -3836,7 +3839,7 @@ describe('view-syncer/service', () => {
       {op: 'put', hash: 'query-hash1.1', ast: ISSUES_QUERY},
       {op: 'put', hash: 'query-hash2', ast: ISSUES_QUERY2},
     ]);
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -3878,7 +3881,7 @@ describe('view-syncer/service', () => {
     `);
 
     stateChanges.push({state: 'version-ready'});
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4088,7 +4091,7 @@ describe('view-syncer/service', () => {
       {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
       {op: 'put', hash: 'query-hash2', ast: ISSUES_QUERY2},
     ]);
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4162,7 +4165,7 @@ describe('view-syncer/service', () => {
     );
 
     stateChanges.push({state: 'version-ready'});
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4299,7 +4302,7 @@ describe('view-syncer/service', () => {
     stateChanges.push({state: 'version-ready'});
 
     // Then a poke that deletes issues rows in the CVR.
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4432,7 +4435,7 @@ describe('view-syncer/service', () => {
 
   test('process advancement with lmid change, client has no queries.  See https://bugs.rocicorp.dev/issue/3628', async () => {
     const client = connect(SYNC_CONTEXT, []);
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4452,7 +4455,7 @@ describe('view-syncer/service', () => {
     `);
 
     stateChanges.push({state: 'version-ready'});
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4491,7 +4494,7 @@ describe('view-syncer/service', () => {
     );
     stateChanges.push({state: 'version-ready'});
 
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4524,7 +4527,7 @@ describe('view-syncer/service', () => {
     const client1 = connect(SYNC_CONTEXT, [
       {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
     ]);
-    expect(await nextPoke(client1)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client1)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4681,7 +4684,7 @@ describe('view-syncer/service', () => {
 
     // client1 should be poked to get the new client2 config,
     // but no new entities.
-    expect(await nextPoke(client1)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client1)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4749,7 +4752,7 @@ describe('view-syncer/service', () => {
     ]);
 
     // Response should catch client2 from scratch.
-    expect(await nextPoke(client2)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client2)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -4896,7 +4899,7 @@ describe('view-syncer/service', () => {
     stateChanges.push({state: 'version-ready'});
 
     // The single poke should only contain issues {id='4', title='caught up'}
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -5185,7 +5188,7 @@ describe('view-syncer/service', () => {
     );
 
     stateChanges.push({state: 'version-ready'});
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
@@ -5258,7 +5261,7 @@ describe('view-syncer/service', () => {
 
     stateChanges.push({state: 'version-ready'});
 
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
             [
               [
                 "pokeStart",
@@ -5337,7 +5340,7 @@ describe('view-syncer/service', () => {
 
     stateChanges.push({state: 'version-ready'});
 
-    expect(await nextPoke(client)).toMatchInlineSnapshot(`
+    expect(await nextPokeMerged(client)).toMatchInlineSnapshot(`
       [
         [
           "pokeStart",
