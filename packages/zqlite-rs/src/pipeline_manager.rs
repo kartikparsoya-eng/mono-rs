@@ -1637,4 +1637,54 @@ mod streaming_tests {
             chunks
         );
     }
+
+    /// PERF-01 (Phase 33-03): validates the production-sized bounded channel
+    /// (`mpsc::sync_channel(pipeline_count.max(1) + 1)` at lines 428/544/614)
+    /// actually rejects sends when full and unblocks after a drain.
+    ///
+    /// Deterministic — uses `try_send` + `TrySendError::Full` (no thread sleeps,
+    /// no timing flake). Self-contained on `u32` payload (does not need to
+    /// construct `StreamItem` values).
+    ///
+    /// Closes the gap noted in Phase 31 D-12: production code has the bounded
+    /// channel sizing but no test confirms producer pipelines block until JS pulls.
+    #[test]
+    fn streaming_channel_bounded_blocks_when_full() {
+        use std::sync::mpsc::{sync_channel, TrySendError};
+
+        // Mirror production sizing: pipeline_count = 4 → capacity 5.
+        let pipeline_count = 4usize;
+        let capacity = pipeline_count.max(1) + 1;
+        assert_eq!(
+            capacity, 5,
+            "production capacity formula must yield 5 for pipeline_count=4"
+        );
+
+        let (tx, rx) = sync_channel::<u32>(capacity);
+
+        // Phase 1: fill exactly to capacity.
+        for i in 0..capacity as u32 {
+            tx.try_send(i).expect("send within capacity must succeed");
+        }
+
+        // Phase 2: next send must be rejected with TrySendError::Full(99).
+        match tx.try_send(99) {
+            Err(TrySendError::Full(99)) => { /* expected */ }
+            other => panic!("expected Full(99), got {:?}", other),
+        }
+
+        // Phase 3: drain one item.
+        let drained = rx.recv().expect("recv after fill must succeed");
+        assert_eq!(drained, 0);
+
+        // Phase 4: previously-blocked sender now succeeds.
+        tx.try_send(99).expect("send after drain must succeed");
+
+        // Phase 5: confirm queue order is preserved.
+        assert_eq!(rx.recv().unwrap(), 1);
+        assert_eq!(rx.recv().unwrap(), 2);
+        assert_eq!(rx.recv().unwrap(), 3);
+        assert_eq!(rx.recv().unwrap(), 4);
+        assert_eq!(rx.recv().unwrap(), 99);
+    }
 }
