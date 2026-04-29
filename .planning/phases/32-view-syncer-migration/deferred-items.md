@@ -34,14 +34,16 @@ issues being tracked separately and should be fixed in a dedicated phase.
 
 Same 5 failures, same 42 passes — Phase 32-02 introduces ZERO new failures.
 
-## Streaming-mode TTL clock test flake (NOT a production regression)
+## TTL clock test flake (NOT a production regression, NOT streaming-specific)
 
 **Test:** `view-syncer-ttl.pg.test.ts > ttl > ttlClock > two clients`
 
-**Status:** Flaky under `ZQLITE_RS_USE_STREAMING_CONSUMER=true`. Three sequential
-runs produced 1 pass + 2 fails. Stable pass under `=false`. The test asserts
-`ttlClock: 0` after `source1.cancel()` (because client2 is still active), but
-intermittently sees `ttlClock: 500`.
+**Status:** Flaky under both flag values. When run isolated under streaming, 3
+sequential runs produced 1 pass + 2 fails. When run as part of the full PG
+view-syncer glob, it failed under buffered mode too — confirming the race is
+not streaming-specific. The test asserts `ttlClock: 0` after `source1.cancel()`
+(because client2 is still active), but intermittently sees `ttlClock: 500`
+under either flag value depending on test ordering and CI timing.
 
 **Root cause (hypothesis):** The test relies on `vi.setSystemTime(+500)` then
 `source1.cancel()` then `await sleep(100)`. Under streaming, the cancel-to-
@@ -52,9 +54,9 @@ complete BEFORE `vi.setSystemTime(+500)` for client2's window also advances.
 **Why this is NOT a production regression:** TTL bookkeeping in production
 uses real wallclock time; the 100ms `sleep` is generous compared to the
 microtask boundary delta (sub-ms). The test's flakiness is an artifact of
-mocked time + tight sleep, not a real semantic change in TTL behavior.
-Buffered mode happens to land on the right side of the race deterministically
-because the cancel processes before any further pokes are flushed.
+mocked time + tight sleep, not a real semantic change in TTL behavior. The
+race is observable under either flag value when test ordering perturbs the
+event-loop schedule.
 
 **Why we are not fixing it in Phase 32-02:**
 
