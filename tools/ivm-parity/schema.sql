@@ -67,3 +67,53 @@ CREATE TABLE team_members (
 );
 
 CREATE INDEX team_members_org_dept_idx ON team_members("orgID", "deptID");
+
+-- ============================================================================
+-- FUZZ-02 (Phase 34) — production-shape rich-type tables.
+-- CONTEXT D-09/D-10/D-11/D-12. Density target: apps/zbugs/shared/schema.ts.
+--
+-- Zero replicates rich PG types (jsonb, timestamptz, numeric, bigint > 2^53)
+-- as TEXT in the wire protocol. PG carries the real semantics; the
+-- zero-schema.ts side declares matching primitives (string()).
+-- ============================================================================
+
+-- events: jsonb + timestamptz + numeric + nullable + boolean
+-- (relatedTicketId is intentionally NOT a foreign key — Phase 34 doesn't add a
+-- tickets table; the column is a NULL-allowed string for NULL-semantics fuzz.)
+CREATE TABLE events (
+  id                  TEXT PRIMARY KEY,
+  "occurredAt"        TIMESTAMPTZ NOT NULL,
+  "metadataJson"      JSONB NOT NULL DEFAULT '{}'::JSONB,
+  amount              NUMERIC(20,6) NOT NULL DEFAULT 0,
+  quantity            BIGINT NOT NULL,
+  "isProcessed"       BOOLEAN NOT NULL DEFAULT false,
+  "actorUserId"       TEXT NULL REFERENCES users(id),
+  notes               TEXT NULL,
+  "relatedTicketId"   TEXT NULL
+);
+CREATE INDEX events_occurredAt_idx     ON events ("occurredAt" DESC);
+CREATE INDEX events_actorUserId_idx    ON events ("actorUserId");
+CREATE INDEX events_metadataJson_gin   ON events USING GIN ("metadataJson");
+
+-- big_id_records: i64 > 2^53 organic surface for B8/B9 (CONTEXT D-12).
+-- IDs stored as TEXT in PG; the precision-boundary values live in
+-- seed-extras.sql. parentBigId is a self-referential nullable FK exercising
+-- NULL ≠ NULL in JOIN keys (CONTEXT D-11).
+CREATE TABLE big_id_records (
+  id              TEXT PRIMARY KEY,
+  label           TEXT NOT NULL,
+  "parentBigId"   TEXT NULL,
+  "createdAt"     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX big_id_records_parentBigId_idx ON big_id_records ("parentBigId");
+
+-- event_tags: compound key + jsonb for partition-Take coverage (B3 fuzz).
+CREATE TABLE event_tags (
+  "eventId"       TEXT NOT NULL REFERENCES events(id),
+  "tagKey"        TEXT NOT NULL,
+  "tagValue"      TEXT NOT NULL,
+  confidence      NUMERIC(5,4) NOT NULL,
+  "metadataJson"  JSONB NOT NULL DEFAULT '{}'::JSONB,
+  PRIMARY KEY ("eventId", "tagKey")
+);
+CREATE INDEX event_tags_eventId_idx ON event_tags ("eventId");

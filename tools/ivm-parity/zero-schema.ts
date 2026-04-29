@@ -8,6 +8,7 @@ import {
   createSchema,
   string,
   number,
+  boolean,
   table,
   relationships,
   ANYONE_CAN_DO_ANYTHING,
@@ -179,6 +180,78 @@ const teamMemberRelationships = relationships(teamMember, ({one}) => ({
   }),
 }));
 
+// ---------------------------------------------------------------------------
+// FUZZ-02 (Phase 34) — production-shape rich-type tables.
+// CONTEXT D-09/D-10/D-11/D-12.
+//
+// Zero only exposes string/number/boolean primitives at the schema level. Rich
+// PG types (jsonb, timestamptz, numeric, bigint > 2^53) replicate as TEXT in
+// the wire protocol. The `string()` declarations below carry the wire-format
+// representation; the schema.sql side declares the real PG type.
+// ---------------------------------------------------------------------------
+
+// `events` — exercises jsonb / timestamptz / numeric / nullable / boolean.
+const event = table('events')
+  .columns({
+    id: string(),
+    occurredAt: string(), // PG TIMESTAMPTZ — replicated as ISO 8601 string
+    metadataJson: string(), // PG JSONB — replicated as JSON-string
+    amount: string(), // PG NUMERIC(20,6) — replicated as string (preserve precision)
+    quantity: number(), // PG BIGINT — values stay within f64 safe range here
+    isProcessed: boolean(),
+    actorUserId: string().optional(), // FK to users; NULL allowed (NULL semantics)
+    notes: string().optional(), // nullable text
+    relatedTicketId: string().optional(), // self-referential dangling FK; ticket table not present (use NULL)
+  })
+  .primaryKey('id');
+
+// `big_id_records` — i64 > 2^53 organic surface for B8/B9 (CONTEXT D-12).
+// IDs stored as TEXT in PG; numeric semantics live in seed data.
+const bigIdRecord = table('big_id_records')
+  .columns({
+    id: string(),
+    label: string(),
+    parentBigId: string().optional(), // self-FK NULL allowed (NULL ≠ NULL in JOIN keys)
+    createdAt: string(),
+  })
+  .primaryKey('id');
+
+// `event_tags` — compound key + jsonb for partition-Take coverage (B3 fuzz).
+const eventTag = table('event_tags')
+  .columns({
+    eventId: string(),
+    tagKey: string(),
+    tagValue: string(),
+    confidence: number(), // PG NUMERIC(5,4); 0..1
+    metadataJson: string(), // PG JSONB
+  })
+  .primaryKey('eventId', 'tagKey');
+
+const eventRelationships = relationships(event, ({one, many}) => ({
+  actor: one({
+    sourceField: ['actorUserId'],
+    destField: ['id'],
+    destSchema: user,
+  }),
+  tags: many({
+    sourceField: ['id'],
+    destField: ['eventId'],
+    destSchema: eventTag,
+  }),
+}));
+
+const eventTagRelationships = relationships(eventTag, ({one}) => ({
+  event: one({sourceField: ['eventId'], destField: ['id'], destSchema: event}),
+}));
+
+const bigIdRecordRelationships = relationships(bigIdRecord, ({one}) => ({
+  parent: one({
+    sourceField: ['parentBigId'],
+    destField: ['id'],
+    destSchema: bigIdRecord,
+  }),
+}));
+
 export const schema = createSchema({
   tables: [
     channel,
@@ -189,6 +262,10 @@ export const schema = createSchema({
     attachment,
     department,
     teamMember,
+    // FUZZ-02 additions:
+    event,
+    bigIdRecord,
+    eventTag,
   ],
   relationships: [
     channelRelationships,
@@ -198,6 +275,10 @@ export const schema = createSchema({
     participantRelationships,
     departmentRelationships,
     teamMemberRelationships,
+    // FUZZ-02 additions:
+    eventRelationships,
+    eventTagRelationships,
+    bigIdRecordRelationships,
   ],
 });
 
@@ -221,5 +302,9 @@ export const permissions = definePermissions<AuthData, typeof schema>(
     attachments: ANYONE_CAN_DO_ANYTHING,
     departments: ANYONE_CAN_DO_ANYTHING,
     team_members: ANYONE_CAN_DO_ANYTHING,
+    // FUZZ-02 additions:
+    events: ANYONE_CAN_DO_ANYTHING,
+    big_id_records: ANYONE_CAN_DO_ANYTHING,
+    event_tags: ANYONE_CAN_DO_ANYTHING,
   }),
 );
