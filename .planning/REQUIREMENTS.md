@@ -29,10 +29,14 @@
 
 ### View-Syncer Migration
 
-- [ ] **MIGRATE-01**: `view-syncer.ts::#advancePipelines` uses `advanceStreaming` instead of `advanceAsync`. `#processChanges` accepts `AsyncIterable<RowChange | 'yield'>` and uses `for await of`.
-- [ ] **MIGRATE-02**: `view-syncer.ts::#hydrateUnchangedQueries` (and any other batch hydration callsite) uses `addQueriesStreaming` instead of `addQueriesAsync`.
-- [ ] **MIGRATE-03**: `pokers.pokePart` fires as fast pipelines complete (mid-batch), not only at the end. CVR commit still happens exactly once at the end after the full stream consumes; `pokers.end(finalVersion)` still fires once after CVR commit.
-- [ ] **MIGRATE-04**: `pokers.cancel()` correctly fires when `ResetPipelinesSignal` is thrown mid-stream — clients drop in-flight changes (existing behavior preserved).
+- [x] **MIGRATE-01
+      **: `view-syncer.ts::#advancePipelines` uses `advanceStreaming` instead of `advanceAsync`. `#processChanges` accepts `AsyncIterable<RowChange | 'yield'>` and uses `for await of`.
+- [x] **MIGRATE-02
+      **: `view-syncer.ts::#hydrateUnchangedQueries` (and any other batch hydration callsite) uses `addQueriesStreaming` instead of `addQueriesAsync`.
+- [x] **MIGRATE-03
+      **: `pokers.pokePart` fires as fast pipelines complete (mid-batch), not only at the end. CVR commit still happens exactly once at the end after the full stream consumes; `pokers.end(finalVersion)` still fires once after CVR commit.
+- [x] **MIGRATE-04
+      **: `pokers.cancel()` correctly fires when `ResetPipelinesSignal` is thrown mid-stream — clients drop in-flight changes (existing behavior preserved).
 
 ### Backwards Compatibility / Test Preservation
 
