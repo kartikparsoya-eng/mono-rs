@@ -1,0 +1,61 @@
+{
+  "fix_id": "B11",
+  "title": "emit_descendant_removals reads POST-tx snapshot — cascade delete on multi-table tx",
+  "description": "Trigger shape for B11: parent.related('child', q => q.related('grandchild')) where a single transaction deletes the parent. The grandchildren are deleted by FK cascade in the same tx. Rust's emit_descendant_removals opens a fresh read connection on `db_path` AFTER swap_snapshot has pointed it at curr — so descendants gone in the same tx are NOT in curr.db and are silently elided. TS pipeline-driver materializes the diff from `prev` BEFORE swapping, so the descendants ARE seen. Mutation: DELETE FROM channels WHERE id = 'b11-test' (with FK cascade DELETE configured); TS emits Remove rows for descendant conversations + messages, RS does not.",
+  "spec_source": {
+    "ts_file": "packages/zero-cache/src/services/view-syncer/pipeline-driver.ts",
+    "ts_lines": "1542-1577 (upstream ref) — diff iterator from prev BEFORE swapSnapshot(curr)",
+    "rust_file_primary": "packages/zqlite-rs/src/advance.rs",
+    "rust_lines_primary": "464-477 (emit_descendant_removals opens conn on db_path = curr post-swap)",
+    "rust_file_secondary": "packages/zqlite-rs/src/pipeline_manager.rs",
+    "rust_lines_secondary": "1856 (db_path lock cloned into advance — needs prev_db_path companion)"
+  },
+  "expected_status": "broken-pre-wave1",
+  "wave1_action": "After B11 fix lands (set_prev_snapshot napi method + descendant SQL routed to prev_db_path), re-run with cascade-delete mutation; assert TS and RS emit identical Remove rows for descendants.",
+  "wave1_setup_hint": "Phase 34 schema.sql does NOT enable ON DELETE CASCADE on the existing FKs (channels→conversations→messages). Wave 1 task: either add CASCADE constraints OR introduce a deeper cascade fixture in seed-extras.sql for this stub. The current AST and mutation block document the SHAPE; Wave 1 makes it executable.",
+  "ast": {
+    "table": "channels",
+    "where": {
+      "type": "simple",
+      "op": "=",
+      "left": {"type": "column", "name": "id"},
+      "right": {"type": "literal", "value": "b11-test"}
+    },
+    "related": [
+      {
+        "correlation": {
+          "parentField": ["id"],
+          "childField": ["channelId"]
+        },
+        "subquery": {
+          "table": "conversations",
+          "alias": "b11_conversations",
+          "related": [
+            {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["conversationId"]
+              },
+              "subquery": {
+                "table": "messages",
+                "alias": "b11_messages"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "mutation_block": [
+    {
+      "label": "Setup: insert a parent channel + child conversation + grandchild message in one tx",
+      "run": "INSERT INTO channels (id, name, visibility) VALUES ('b11-test', 'b11-cascade', 'public'); INSERT INTO conversations (id, \"channelId\", title, \"createdAt\") VALUES ('b11-co', 'b11-test', 'b11-conv', 9100); INSERT INTO messages (id, \"conversationId\", \"authorId\", body, \"createdAt\", \"visibleTo\") VALUES ('b11-m', 'b11-co', 'u1', 'b11-msg', 9200, NULL)",
+      "undo": "DELETE FROM messages WHERE id = 'b11-m'; DELETE FROM conversations WHERE id = 'b11-co'; DELETE FROM channels WHERE id = 'b11-test'"
+    },
+    {
+      "label": "B11 trigger: delete parent and all descendants in a single tx (manual cascade since FK CASCADE is not enabled)",
+      "run": "BEGIN; DELETE FROM messages WHERE \"conversationId\" = 'b11-co'; DELETE FROM conversations WHERE \"channelId\" = 'b11-test'; DELETE FROM channels WHERE id = 'b11-test'; COMMIT;",
+      "undo": ""
+    }
+  ]
+}
