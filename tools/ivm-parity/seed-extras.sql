@@ -56,3 +56,58 @@ INSERT INTO attachments (id, "messageId", "conversationId", filename, "createdAt
   ('x-a-2', 'x-m-1', 'x-co-1', 'monday-charts.png',   6102),
   ('x-a-3', 'x-m-3', 'x-co-2', 'planning-doc.pdf',    6601),
   ('x-a-4', 'x-m-7', 'x-co-5', 'wednesday-recap.pdf', 8101);
+
+-- ============================================================================
+-- FUZZ-02 (Phase 34) — production-shape fixtures.
+-- CONTEXT D-11/D-12. Strictly additive (SKILL.md hard rule #2). New IDs use
+-- prefixes ev- (events), eb- (big_id_records), et- (event_tags) so they're
+-- easy to grep and never collide with the base seed.
+-- ============================================================================
+
+-- events: NULL semantics + jsonb + timestamptz + numeric coverage.
+-- D-11: NULL ≠ NULL in equality (ev-null-1 vs ev-null-2 both with NULL FKs);
+--       NULL in OR three-valued logic (ev-or-mixed);
+--       NULL in JOIN keys (ev-no-actor — actorUserId is NULL).
+INSERT INTO events
+  (id, "occurredAt", "metadataJson", amount, quantity, "isProcessed",
+   "actorUserId", notes, "relatedTicketId")
+VALUES
+  ('ev-null-1', '2026-04-01T00:00:00Z', '{}', 0,    0,   false, NULL,  NULL,         NULL),
+  ('ev-null-2', '2026-04-01T01:00:00Z', '{}', 0,    0,   false, NULL,  NULL,         NULL),
+  ('ev-or-mixed', '2026-04-02T00:00:00Z', '{"k":"v"}', 1.500000, 100, true,
+   'u1',  'note-with-value',  't-1'),
+  ('ev-no-actor', '2026-04-03T00:00:00Z', '{}', 2.000000, 200, false,
+   NULL,  'pure null actor',   NULL),
+  -- DST round-trips (CONTEXT D-12). US Eastern 2026: spring 03-08 02→03,
+  -- fall 11-01 02→01.
+  ('ev-dst-spring', '2026-03-08T06:30:00Z', '{}', 0, 0, false, 'u1', 'spring forward', NULL),
+  ('ev-dst-fall',   '2026-11-01T05:30:00Z', '{}', 0, 0, false, 'u1', 'fall back', NULL),
+  -- jsonb fixtures (literal-equality vs whitespace-canonical-equality fuzz).
+  ('ev-jsonb-rich',
+   '2026-04-04T00:00:00Z',
+   '{"priority": "high", "tags": ["a", "b"]}',
+   0.000000, 0, false, 'u1', NULL, NULL),
+  ('ev-jsonb-empty', '2026-04-05T00:00:00Z', '{}', 0, 0, false, 'u2', NULL, NULL);
+
+-- big_id_records: i64 > 2^53 boundary fixtures (B8/B9 organic surface).
+-- 2^53 = 9007199254740992. Use values just below, at, above, far above.
+-- parentBigId chains create a one-table self-join exercising NULL ≠ NULL.
+INSERT INTO big_id_records (id, label, "parentBigId", "createdAt") VALUES
+  ('9007199254740991', 'safe-int-max',          NULL,                '2026-04-01T00:00:00Z'),
+  ('9007199254740992', '2^53-exact',            '9007199254740991',  '2026-04-01T01:00:00Z'),
+  ('9007199254740993', 'first-unsafe',          '9007199254740992',  '2026-04-01T02:00:00Z'),
+  ('9007199254740994', 'second-unsafe',         '9007199254740993',  '2026-04-01T03:00:00Z'),
+  ('9999999999999999', 'far-unsafe',            '9007199254740994',  '2026-04-01T04:00:00Z'),
+  -- Two NULL-parent rows so NULL ≠ NULL in JOIN keys is testable.
+  ('eb-orphan-1',      'orphan-no-parent',      NULL,                '2026-04-01T05:00:00Z'),
+  ('eb-orphan-2',      'another-orphan',        NULL,                '2026-04-01T06:00:00Z');
+
+-- event_tags: compound-key partition-Take coverage. Wave 0 supplies enough
+-- rows that a Take(limit=2) on the per-event partition has a meaningful window.
+INSERT INTO event_tags ("eventId", "tagKey", "tagValue", confidence, "metadataJson") VALUES
+  ('ev-or-mixed',   'priority',  'high',   0.9500, '{}'),
+  ('ev-or-mixed',   'category',  'bug',    0.8500, '{}'),
+  ('ev-or-mixed',   'severity',  'p1',     0.9000, '{}'),
+  ('ev-jsonb-rich', 'priority',  'low',    0.5000, '{}'),
+  ('ev-jsonb-rich', 'category',  'task',   0.7500, '{}'),
+  ('ev-jsonb-empty','priority',  'medium', 0.6000, '{}');
