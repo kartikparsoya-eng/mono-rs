@@ -88,7 +88,7 @@ import {
 import type {DrainCoordinator} from './drain-coordinator.ts';
 import {handleInspect} from './inspect-handler.ts';
 import type {PipelineDriver} from './pipeline-driver.ts';
-import {type RowChange} from './pipeline-driver.ts';
+import {RustStreamError, type RowChange} from './pipeline-driver.ts';
 import {
   cmpVersions,
   EMPTY_CVR_VERSION,
@@ -194,6 +194,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   readonly #drainCoordinator: DrainCoordinator;
   readonly #keepaliveMs: number;
   readonly #slowHydrateThreshold: number;
+  readonly #useStreamingConsumer: boolean;
 
   // The ViewSyncerService is only started in response to a connection,
   // so #lastConnectTime is always initialized to now(). This is necessary
@@ -350,6 +351,18 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     this.#drainCoordinator = drainCoordinator;
     this.#keepaliveMs = keepaliveMs;
     this.#slowHydrateThreshold = slowHydrateThreshold;
+    // Feature flag for Phase 32 streaming migration (CONTEXT D-04..D-07).
+    // Read once per ViewSyncerService instance (NOT module top-level —
+    // module-init read locks the value at first import, breaking dual-mode
+    // tests; per-instance read preserves "read once at boot" semantics at
+    // the granularity that matters and lets tests flip the flag in
+    // beforeEach. See RESEARCH P-03.)
+    //
+    // Default true (streaming on). Set ZQLITE_RS_USE_STREAMING_CONSUMER=false
+    // for emergency rollback to the buffered path. Removed in follow-up
+    // phase 32.1 per CONTEXT D-07.
+    this.#useStreamingConsumer =
+      process.env['ZQLITE_RS_USE_STREAMING_CONSUMER'] !== 'false';
     this.#inspectorDelegate = inspectorDelegate;
     this.#customQueryTransformer = customQueryTransformer;
     this.#cvrStore = new CVRStore(
