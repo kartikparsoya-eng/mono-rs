@@ -30,6 +30,20 @@ Pre-existing issues discovered during plan execution that are out of scope for t
 - **Severity:** AUDIT-02 (Bug #2) regression. Tests added by 30-02 to verify its own fix are failing on the post-merge base. Should be triaged as part of AUDIT-02 follow-up, not AUDIT-03.
 - **Suggested owner:** Re-open 30-02 verification or a dedicated 30-02-FOLLOWUP plan. Investigate whether the fix in `advance.rs::collect_split_edit_keys` is being reached by the test fixtures (TS-side persistent pipeline build), or whether the pipeline driver bypasses the split-edit path under certain configurations.
 - **Confirmation that AUDIT-03 is unaffected:** All 7 newly-promoted `assert!` sites pass their `#[should_panic]` regression tests under `cargo test --release`. The pipeline-driver.test.ts main suite (40/40) and fuzz-ivm.test.ts (6/6 with FUZZ_NUM_RUNS=1000) pass — confirming AUDIT-03 introduces no operator-semantics regressions.
+- **Resolution (30-05):** Closed by gap plan 30-05 — see
+  `.planning/phases/30-audit-fixes/30-05-PLAN.md` and
+  `.planning/phases/30-audit-fixes/30-05-SUMMARY.md`. The 3 integration
+  tests now pass per the verification gate. Root cause was a stale napi
+  build artifact at the parent monorepo path: vitest resolves `zqlite-rs`
+  through `node_modules/zqlite-rs -> packages/zqlite-rs`, and the parent
+  repo's `.node` binary had not been rebuilt after the 30-02 source fix
+  landed — so tests silently exercised pre-fix IVM logic. Fix: added a
+  build-freshness gate (`assertNapiBinaryFreshness`) at the napi load
+  site in `pipeline-driver.ts` that throws a clear error if the `.node`
+  is older than the Rust source, plus a Rust regression unit test
+  (`test_audit_02_production_ast_shape_does_not_regress`) that pins the
+  full runtime AST shape captured from the diagnostic log. The
+  AUDIT-02 source-code fix from 30-02 was already correct end-to-end.
 
 ### 4. `advance::tests::bench_persistent_pipeline_sequential_vs_parallel` still failing
 
