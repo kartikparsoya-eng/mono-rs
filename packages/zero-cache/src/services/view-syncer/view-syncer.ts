@@ -2185,10 +2185,14 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const start = performance.now();
 
       const timer = new TimeSliceTimer(lc);
-      const {version, numChanges, changes} = await this.#pipelines.advanceAsync(
-        timer,
-        this.id,
-      );
+      // Phase 32 migration: streaming under flag (default on), buffered
+      // fallback for emergency rollback. CONTEXT D-04..D-07. The two return
+      // shapes differ only in `changes` (Iterable vs AsyncIterable) —
+      // #processChanges (Task 7) accepts either via `for await of` which
+      // natively iterates both.
+      const {version, numChanges, changes} = this.#useStreamingConsumer
+        ? await this.#pipelines.advanceStreaming(timer, this.id)
+        : await this.#pipelines.advanceAsync(timer, this.id);
       lc = lc.withContext('newVersion', version);
 
       // Probably need a new updater type. CVRAdvancementUpdater?
@@ -2219,6 +2223,19 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         if (e instanceof ResetPipelinesSignal) {
           await pokers.cancel();
           return e;
+        }
+        if (e instanceof RustStreamError) {
+          // CONTEXT D-08..D-10: log structured kind/message/source, then bubble.
+          // No per-kind recovery — view-syncer crashes for this connection,
+          // client reconnects, fresh view-syncer spawned. Same recovery
+          // semantics as today's buffered advanceAsync errors. D-13 (Phase
+          // 31): branch on error.kind/instanceof, NOT on .message string.
+          lc.error?.('rust streaming error', {
+            kind: e.kind,
+            message: e.message,
+            source: e.source,
+          });
+          throw e;
         }
         throw e;
       }
