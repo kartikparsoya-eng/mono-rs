@@ -2063,25 +2063,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = create_bench_db(&dir, num_rows);
 
-        // Build persistent pipelines
         let mut schema_cache = SchemaCache::new(&db_path);
         let pool = ConnectionPool::new(&db_path, rayon::current_num_threads().max(4)).unwrap();
-        let mut pipelines: Vec<PipelineState> = Vec::new();
-        for i in 0..num_pipelines {
-            let query_json = make_bench_query(&format!("q{}", i), 10 + (i % 20));
-            let query: HydrateQuery = serde_json::from_str(&query_json).unwrap();
-            let state = build_pipeline_state(&db_path, &query, &mut schema_cache, &pool).unwrap();
-            pipelines.push(state);
-        }
-
         let changes = make_bench_changes(num_changes);
 
-        // Warm up
-        for pipeline in pipelines.iter_mut() {
-            let _ = advance_persistent_pipeline(pipeline, &changes, &db_path);
-        }
+        // Helper: build a fresh set of `num_pipelines` pipelines with one
+        // warm-up advance call each. Both sequential and parallel start
+        // from this identical state so their emitted-row-change totals
+        // are directly comparable (the per-iteration emit count converges
+        // to a steady state after several iterations; without resetting,
+        // whichever block runs second begins already at steady state and
+        // emits more rows than the first block, breaking the assertion).
+        let build_warmed_pipelines = |schema_cache: &mut SchemaCache,
+                                      pool: &ConnectionPool|
+         -> Vec<PipelineState> {
+            let mut ps: Vec<PipelineState> = Vec::new();
+            for i in 0..num_pipelines {
+                let query_json = make_bench_query(&format!("q{}", i), 10 + (i % 20));
+                let query: HydrateQuery = serde_json::from_str(&query_json).unwrap();
+                let state = build_pipeline_state(&db_path, &query, schema_cache, pool).unwrap();
+                ps.push(state);
+            }
+            // Warm-up: drive each pipeline through enough iterations to reach
+            // steady state so the measured block sees a stable emit rate.
+            // Empirically (debug logging), per-iteration totals converge by
+            // ~80 iters; use a generous margin.
+            for _ in 0..120 {
+                for pipeline in ps.iter_mut() {
+                    let _ = advance_persistent_pipeline(pipeline, &changes, &db_path);
+                }
+            }
+            ps
+        };
 
         // ── Sequential ──
+        let mut pipelines = build_warmed_pipelines(&mut schema_cache, &pool);
         let start = Instant::now();
         let mut seq_total_changes = 0;
         for _ in 0..iterations {
@@ -2091,9 +2107,13 @@ mod tests {
             }
         }
         let seq_elapsed = start.elapsed();
+        drop(pipelines);
 
         // ── Parallel (rayon) ──
-        // We need per-pipeline mutexes for par_iter since we need &mut access
+        // Fresh, warmed pipelines so parallel measures the same work as
+        // sequential. Per-pipeline mutexes are needed for par_iter to
+        // hand out &mut access.
+        let pipelines = build_warmed_pipelines(&mut schema_cache, &pool);
         let pipeline_mutexes: Vec<Mutex<PipelineState>> = pipelines
             .into_iter()
             .map(|p| Mutex::new(p))
