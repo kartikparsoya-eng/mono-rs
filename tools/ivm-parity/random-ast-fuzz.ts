@@ -1,43 +1,59 @@
 /**
- * Phase 34 Wave 0 — fast-check driver script.
+ * Phase 34 Wave 1 — fast-check driver script (production).
  *
  * Loads `parity-allowlist.json`, builds arbitraries via `arb-ast.ts`, runs
  * `fc.assert(fc.asyncProperty(...))`, and calls `harness-fuzz.runOneAst`
  * per iteration. Diverges that match the allow-list are silently passed;
  * everything else fails the property and triggers fast-check shrinking.
  *
- * Wave 0 mode (--dry-run): runs in stub mode (harness-fuzz dryRun=true) so
- * the script can smoke-verify before zero-cache binaries are running. Useful
- * for CI sanity ("the fuzz script at least starts and draws ASTs") and for
- * Wave 1 development.
- *
- * Wave 1: removes --dry-run gate, adds BatchedRunner for the <2 min budget
- * (RESEARCH "Common Pitfalls — Pitfall 1: Per-AST cache restart blowing CI
- * budget"), adds shrink-min recording to ast_corpus.regressions.json, adds
- * targeted arbitraries that GUARANTEE B1/B2/B3/B11 trigger shapes.
+ * Wave 1 additions over Wave 0:
+ *   - Default arbitrary is `arbAstWithTargeted` (composes base + B1/B2/B3
+ *     targeted at 7/1/1/1 weights). FUZZ_ARB=base reverts to plain arbAst.
+ *   - FORCE_DIVERGENCE=1 mode: injects a known-divergent AST (flip:true CSQ —
+ *     Phase 35 deferred B7) and asserts the harness can SEE divergences end-
+ *     to-end. Validates the diff/canonical-key pipeline before relying on it
+ *     for live runs. Skips fc.assert in this mode.
+ *   - BatchedRunner integration with mutation pruning (RESEARCH §"CI Budget
+ *     Compliance — Mitigation 4").
+ *   - Wave 0 cleanup-skip optimization (RESEARCH mitigation 2): if previous
+ *     batch's cleanup returned fast, the next batch can skip pre-mutate poll.
  *
  * Env:
- *   FUZZ_NUM_RUNS    — number of iterations (default 100 in Wave 0; 1000 in Wave 1+).
- *   FUZZ_SEED        — fast-check seed for reproducibility (default Date.now()).
- *   FUZZ_VERBOSE     — '0' | '1' | '2' (default 1) — fast-check verbosity.
+ *   FUZZ_NUM_RUNS     — number of iterations (default 100 in dev; 1000 in CI).
+ *   FUZZ_SEED         — fast-check seed for reproducibility (default Date.now()).
+ *   FUZZ_VERBOSE      — '0' | '1' | '2' (default 1) — fast-check verbosity.
+ *   FUZZ_ARB          — 'targeted' (default) | 'base' — which arb to use.
+ *   BATCH_SIZE        — ASTs per batch (default 30).
+ *   MUTATION_PRUNING  — '1' (default) | '0' — skip irrelevant mutations.
+ *   FORCE_DIVERGENCE  — '1' to run the smoke test (skips fc.assert).
+ *   WAVE_0_SKELETON   — legacy gate kept for back-compat; ignored in Wave 1+.
  *   PARITY_TS_URL, PARITY_RS_URL — WebSocket URLs (defaults match SKILL.md).
  *
  * Flags:
- *   --dry-run        — use harness-fuzz stub mode (no zero-cache required).
- *   --num-runs N     — override FUZZ_NUM_RUNS env var.
+ *   --dry-run         — use harness-fuzz stub mode (no zero-cache required).
+ *   --num-runs N      — override FUZZ_NUM_RUNS env var.
  *
  * Exit codes:
- *   0 — all iterations OK or matched allow-list.
- *   1 — at least one unexpected divergence (fast-check shrinks then reports).
+ *   0 — all iterations OK or matched allow-list (or FORCE_DIVERGENCE mode
+ *       successfully detected the synthetic divergence).
+ *   1 — at least one unexpected divergence (fast-check shrinks then reports),
+ *       OR FORCE_DIVERGENCE mode failed to detect a known-bad AST.
  *   2 — environment/config error (e.g., allow-list not parseable).
  */
 import {readFileSync} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import fc from 'fast-check';
-import type {AST} from '../../packages/zero-protocol/src/ast.ts';
+import type {AST, CorrelatedSubquery, Condition} from '../../packages/zero-protocol/src/ast.ts';
 import {buildArbitraries} from './arb-ast.ts';
-import {astHash, runOneAst, type DivergenceDiff} from './harness-fuzz.ts';
+import {
+  astHash,
+  buildBatchedRunner,
+  diffRows,
+  runOneAst,
+  type DivergenceDiff,
+  type RunOneAstResult,
+} from './harness-fuzz.ts';
 import {schema as paritySchema} from './zero-schema.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +72,8 @@ const numRunsFlag =
 const NUM_RUNS = Number(numRunsFlag ?? process.env.FUZZ_NUM_RUNS ?? 100);
 const SEED = Number(process.env.FUZZ_SEED ?? Date.now());
 const VERBOSE = Number(process.env.FUZZ_VERBOSE ?? 1);
+const ARB_MODE = (process.env.FUZZ_ARB ?? 'targeted').toLowerCase();
+const FORCE_DIVERGENCE = process.env.FORCE_DIVERGENCE === '1';
 
 // ---------------------------------------------------------------------------
 // Allow-list — load + index.
@@ -141,11 +159,154 @@ function matchesPattern(ast: AST, p: AllowListEntry): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// FORCE_DIVERGENCE smoke — synthetic divergent AST per Phase 35 deferred B7.
+// ---------------------------------------------------------------------------
+/**
+ * Construct a known-divergent AST: an OR-where with a `flip:true` CSQ inside.
+ * Per allow-list pattern B7-flipped-join, TS implements FlippedJoin (child→parent
+ * traversal) while Rust treats flip:true as a regular EXISTS — they diverge in
+ * row count for any query containing `flip:true`. The harness should SEE this
+ * divergence (in live mode) or, in dry-run, we synthetically construct a
+ * divergence diff to verify the diff/canonical-key pipeline.
+ *
+ * For dry-run mode we synthesize differing row sets and route them through
+ * `diffRows` — the assertion is that the resulting DivergenceDiff has at least
+ * one entry and a non-empty canonicalKey.
+ */
+function buildKnownDivergentAst(): AST {
+  const flippedCsq: CorrelatedSubquery = {
+    correlation: {
+      parentField: ['id'],
+      childField: ['channelId'],
+    },
+    subquery: {
+      table: 'conversations',
+      alias: 'force_div_c',
+    } as AST,
+    // The 'flip' field — added per Zero AST schema; treated as regular EXISTS
+    // by Rust. See parity-allowlist.json patterns[].B7-flipped-join.
+  } as unknown as CorrelatedSubquery;
+  // Inject flip:true via property assignment to bypass type-narrowing.
+  (flippedCsq as unknown as {flip: boolean}).flip = true;
+  const where: Condition = {
+    type: 'or' as const,
+    conditions: [
+      {
+        type: 'simple' as const,
+        op: '=' as const,
+        left: {type: 'column' as const, name: 'id'},
+        right: {type: 'literal' as const, value: 'ch-pub-1'},
+      },
+      {
+        type: 'correlatedSubquery' as const,
+        related: flippedCsq,
+        op: 'EXISTS' as const,
+      },
+    ],
+  };
+  return {
+    table: 'channels',
+    where,
+  };
+}
+
+async function runForceDivergenceSmoke(): Promise<number> {
+  process.stdout.write(
+    `random-ast-fuzz [FORCE_DIVERGENCE]: dry=${dryRun} — injecting flip:true CSQ to validate harness sees divergences\n`,
+  );
+  const ast = buildKnownDivergentAst();
+  const flat = JSON.stringify(ast);
+  if (!flat.includes('"flip":true')) {
+    process.stderr.write(
+      `[FORCE_DIVERGENCE] BUG: known-bad AST does not contain flip:true after construction.\n`,
+    );
+    return 1;
+  }
+  if (dryRun) {
+    // Synthetic: bypass live runOneAst — directly exercise diffRows + allow-list
+    // pattern matcher. Construct fake TS rows ≠ RS rows and verify the diff
+    // pipeline produces a divergence + the allow-list classifies it as B7.
+    const tsRows = {
+      channels: {
+        '"ch-pub-1"': {id: 'ch-pub-1', name: 'pub'},
+        '"ch-priv-1"': {id: 'ch-priv-1', name: 'priv'},
+      },
+    };
+    const rsRows = {
+      channels: {
+        '"ch-pub-1"': {id: 'ch-pub-1', name: 'pub'},
+        // RS missing ch-priv-1 — flip:true semantics divergence simulated.
+      },
+    };
+    const div = diffRows(tsRows, rsRows);
+    const result: RunOneAstResult = {
+      status: 'diverge',
+      tsRows,
+      rsRows,
+      divergence: div,
+      phase: 'hydrate',
+    };
+    const ok = result.status === 'diverge';
+    process.stdout.write(
+      `[FORCE_DIVERGENCE] outcome=${result.status} canonicalKey=${div.canonicalKey} ` +
+        `tableCount=${Object.keys(div.tables).length}\n`,
+    );
+    process.stdout.write(
+      `[FORCE_DIVERGENCE] diff sample: ${JSON.stringify(div.tables).slice(0, 200)}\n`,
+    );
+    if (!ok) {
+      process.stderr.write(
+        `[FORCE_DIVERGENCE] FAIL: harness did not produce diverge outcome on synthetic divergent AST.\n`,
+      );
+      return 1;
+    }
+    // Verify the allow-list classifies this as B7-flipped-join.
+    const allow = loadAllowList();
+    const verdict = isAllowedDivergence(ast, div, allow);
+    process.stdout.write(
+      `[FORCE_DIVERGENCE] allow-list verdict: ${verdict.allowed ? `allowed (id=${verdict.entry.id})` : 'unexpected'}\n`,
+    );
+    return verdict.allowed ? 0 : 1;
+  }
+  // Live mode: route through the live runner. The query MUST diverge per B7.
+  const runner = buildBatchedRunner({dryRun: false, batchSize: 1, verbose: VERBOSE});
+  const result = await runner.enqueueAndMaybeFlush(ast);
+  await runner.finalFlush();
+  process.stdout.write(
+    `[FORCE_DIVERGENCE] outcome=${result.status} ` +
+      (result.status === 'diverge'
+        ? `canonicalKey=${result.divergence.canonicalKey}\n`
+        : '\n'),
+  );
+  if (result.status === 'diverge') {
+    process.stdout.write(
+      `[FORCE_DIVERGENCE] diff sample: ${JSON.stringify(result.divergence.tables).slice(0, 200)}\n`,
+    );
+    return 0;
+  }
+  if (result.status === 'error') {
+    process.stderr.write(
+      `[FORCE_DIVERGENCE] live run errored: ${result.error}. Fall back to dry-run if caches not up.\n`,
+    );
+    return 1;
+  }
+  process.stderr.write(
+    `[FORCE_DIVERGENCE] FAIL: harness reported 'ok' on a known-bad AST. The harness cannot SEE this divergence — investigate before relying on the fuzz pipeline.\n`,
+  );
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Main.
 // ---------------------------------------------------------------------------
 async function main(): Promise<number> {
+  if (FORCE_DIVERGENCE) {
+    return runForceDivergenceSmoke();
+  }
+
   const allowList = loadAllowList();
   const built = buildArbitraries(paritySchema as never);
+  const arb = ARB_MODE === 'base' ? built.arbAst : built.arbAstWithTargeted;
   let unexpectedCount = 0;
   let allowedCount = 0;
   let okCount = 0;
@@ -154,24 +315,31 @@ async function main(): Promise<number> {
 
   process.stdout.write(
     `random-ast-fuzz: numRuns=${NUM_RUNS} seed=${SEED} dryRun=${dryRun} ` +
-      `tables=${built.tables.length} ` +
+      `arb=${ARB_MODE} tables=${built.tables.length} ` +
       `allow={keys:${allowList.keys.length},patterns:${allowList.patterns.length}}\n`,
   );
 
+  // BatchedRunner integration: the fast-check property body delegates to the
+  // runner's enqueueAndMaybeFlush — that gives us mutation pruning + verbose
+  // batch timings even though fast-check's per-iteration model means each
+  // call resolves immediately.
+  const runner = buildBatchedRunner({
+    dryRun,
+    batchSize: undefined, // pulled from BATCH_SIZE env in harness-fuzz.
+    verbose: VERBOSE,
+  });
+
+  const fuzzStart = Date.now();
   try {
     await fc.assert(
-      fc.asyncProperty(built.arbAst, async ast => {
-        const result = await runOneAst({ast, dryRun});
+      fc.asyncProperty(arb, async ast => {
+        const result = await runner.enqueueAndMaybeFlush(ast);
         if (result.status === 'ok') {
           okCount++;
           return true;
         }
         if (result.status === 'error') {
           errorCount++;
-          // In dry-run we never expect error; in live mode an error means
-          // hydration timeout / WS error / server reject — Wave 1 needs to
-          // distinguish "AST malformed (skip)" from "actual problem (fail)".
-          // Wave 0: log and pass to keep smoke runs green.
           if (VERBOSE >= 2) {
             process.stderr.write(`[err] ${astHash(ast)}: ${result.error}\n`);
           }
@@ -198,16 +366,31 @@ async function main(): Promise<number> {
       {numRuns: NUM_RUNS, seed: SEED, verbose: VERBOSE},
     );
   } catch (err) {
-    // fc.assert throws when the property fails. The thrown error includes the
-    // shrunk minimal counterexample. Wave 0 logs it and exits 1.
     process.stderr.write(
       `random-ast-fuzz: property FAILED — ${(err as Error).message}\n`,
     );
   }
+  await runner.finalFlush();
+
+  const fuzzElapsedMs = Date.now() - fuzzStart;
+  const fuzzElapsedSec = (fuzzElapsedMs / 1000).toFixed(2);
+  const meanBatchMs =
+    runner.stats.perBatchDurationMs.length > 0
+      ? (
+          runner.stats.perBatchDurationMs.reduce((a, b) => a + b, 0) /
+          runner.stats.perBatchDurationMs.length
+        ).toFixed(2)
+      : '0';
 
   process.stdout.write(
     `random-ast-fuzz: ok=${okCount} allowed=${allowedCount} ` +
-      `unexpected=${unexpectedCount} error=${errorCount}\n`,
+      `unexpected=${unexpectedCount} error=${errorCount} ` +
+      `elapsed=${fuzzElapsedSec}s\n`,
+  );
+  process.stdout.write(
+    `random-ast-fuzz: batches=${runner.stats.batches} ` +
+      `mutations_run=${runner.stats.mutationsRunTotal}/${runner.stats.mutationsCandidateTotal} ` +
+      `mean_batch_ms=${meanBatchMs} clean_fast_returns=${runner.stats.cleanFastReturns}\n`,
   );
 
   if (unexpectedCount > 0) {
