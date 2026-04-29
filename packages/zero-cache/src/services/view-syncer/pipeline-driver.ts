@@ -2496,7 +2496,7 @@ export class PipelineDriver {
   }
 }
 
-class Streamer {
+export class Streamer {
   readonly #primaryKeys: Map<string, PrimaryKey>;
   readonly #tableSpecs: Map<string, LiteAndZqlSpec>;
 
@@ -2636,7 +2636,7 @@ function* toAdds(nodes: Iterable<Node | 'yield'>): Iterable<Change | 'yield'> {
   }
 }
 
-function getRowKey(cols: PrimaryKey, row: Row): RowKey {
+export function getRowKey(cols: PrimaryKey, row: Row): RowKey {
   return Object.fromEntries(cols.map(col => [col, must(row[col])]));
 }
 
@@ -2684,7 +2684,7 @@ function buildPrimaryKeys(
   return primaryKeys;
 }
 
-function mustGetPrimaryKey(
+export function mustGetPrimaryKey(
   primaryKeys: Map<string, PrimaryKey> | null,
   table: string,
 ): PrimaryKey {
