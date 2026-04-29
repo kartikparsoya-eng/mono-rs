@@ -215,7 +215,7 @@ pub fn ast_to_operator_configs(
 
     let mut configs = Vec::new();
 
-    // 1. Source
+    // 1. Source — mirrors TS builder.ts:291-296 (`source.connect(...)` + decorators).
     configs.push(OperatorConfig::Source {
         table_name: table_name.clone(),
         columns,
@@ -223,12 +223,10 @@ pub fn ast_to_operator_configs(
         sort: sort.clone(),
     });
 
-    // 2. Where conditions -> Filter + Exists
-    if let Some(cond) = ast.where_cond.as_deref() {
-        append_condition_configs(schema, &mut configs, cond, primary_key)?;
-    }
-
-    // 3. Start -> Skip
+    // 2. Skip — moved here per B1 fix. Mirrors TS builder.ts:302-306 ordering:
+    //    Skip is placed immediately after Source, BEFORE CSQ-Exists and Filter.
+    //    Pre-Phase-34 Rust emitted Skip AFTER append_condition_configs, which
+    //    reversed pipeline observation order vs TS — see IVM-PORT-AUDIT-DEEP §B1.
     if let Some(start) = &ast.start {
         configs.push(OperatorConfig::Skip {
             bound_row: start.row.clone(),
@@ -237,7 +235,19 @@ pub fn ast_to_operator_configs(
         });
     }
 
-    // 4. Limit -> Take
+    // 3. Where conditions -> Filter + Exists. Mirrors TS builder.ts:308-333:
+    //    csqConditions (CSQ-Exists with EXISTS_LIMIT downgrade) at lines
+    //    308-329, then `applyWhere` (Filter) at lines 331-333. The Rust
+    //    `append_condition_configs` already splits Or branches with CSQs into
+    //    separate Exists configs, but for And-of-(simple, CSQ) the inner
+    //    relative ordering of CSQ vs Filter is order-of-appearance — see
+    //    test_b1_csq_then_filter_inside_and below for the documented caveat.
+    if let Some(cond) = ast.where_cond.as_deref() {
+        append_condition_configs(schema, &mut configs, cond, primary_key)?;
+    }
+
+    // 4. Limit -> Take. Mirrors TS builder.ts:335-345. partition_key threading
+    //    lands in B3 (plan 34-05) — currently `None` is preserved here.
     if let Some(limit) = ast.limit {
         configs.push(OperatorConfig::Take {
             limit,
@@ -246,7 +256,7 @@ pub fn ast_to_operator_configs(
         });
     }
 
-    // 5. Related -> Join
+    // 5. Related -> Join. Mirrors TS builder.ts:347-356.
     if let Some(related) = &ast.related {
         for rel in related {
             let child_pk = schema.get_primary_key(&rel.subquery.table)?;
@@ -925,43 +935,101 @@ mod tests {
     // with `cargo test -- --ignored` to exercise.
     // ========================================================================
 
-    /// **B1 (BLOCKING) — Skip placement order.**
+    /// **B1 (BLOCKING) — Skip placement order. (Phase 34 Wave 1 — GREEN)**
     ///
     /// Spec: TS `packages/zql/src/builder/builder.ts:302-345` orders the
     /// pipeline: Source → Skip → CSQ-Exists → Filter → Take → related Joins.
-    /// Skip lands BEFORE conditions (line 302-306).
+    /// Skip lands BEFORE conditions (line 302-306). Mirror enforced post-fix.
     ///
-    /// Current Rust (`ast_to_config.rs:226-238`): order is Source → Filter+Exists
-    /// → Skip → Take → Joins. Skip lands AFTER conditions, violating TS spec.
-    ///
-    /// Wave 0 Red-state assertion: the source code at line 232 (Skip emission)
-    /// is positioned AFTER the where-condition block (line 227). Wave 1 fixes
-    /// the source by moving Skip up, then deletes this stub and replaces it
-    /// with a proper config-ordering assertion against ast_to_operator_configs
-    /// output.
+    /// This was a Wave 0 red-state stub (commit b4b970719); Phase 34 plan 02
+    /// flipped it green by moving the Skip emission BEFORE the
+    /// `append_condition_configs` call in `ast_to_operator_configs`.
     #[test]
-    #[ignore = "Phase 34 Wave 1 will flip this green by moving Skip emission \
-        BEFORE append_condition_configs in ast_to_operator_configs. \
-        Spec: TS builder.ts:302-345."]
     fn test_b1_skip_before_conditions() {
-        // Source-level Red-state check: read this file and confirm the broken
-        // ordering still holds. Wave 1 inverts the indices.
+        // Source-level GREEN-state check: read this file and confirm Skip is
+        // emitted BEFORE the where-condition block, matching TS builder.ts:302.
         let src = include_str!("ast_to_config.rs");
-        // Find the position of the Skip-emission marker comment ("3. Start ->
-        // Skip") and the where-condition marker ("2. Where conditions").
-        let where_marker = src
-            .find("// 2. Where conditions -> Filter + Exists")
-            .expect("missing where-condition marker — code refactored?");
         let skip_marker = src
-            .find("// 3. Start -> Skip")
-            .expect("missing Skip marker — code refactored?");
-        // Red state: Skip comes AFTER conditions (current bug). Wave 1 inverts:
-        // assert!(skip_marker < where_marker, "Skip must precede conditions per TS builder.ts:302");
+            .find("// 2. Skip — moved here per B1 fix")
+            .expect("missing Skip marker — code refactored without preserving B1 fix?");
+        let where_marker = src
+            .find("// 3. Where conditions -> Filter + Exists")
+            .expect("missing where-condition marker — code refactored?");
         assert!(
-            skip_marker > where_marker,
-            "Wave 0 expected Skip-after-conditions broken state; got Skip BEFORE conditions \
-             — does this mean Wave 1 fix landed without removing the stub? Update the test."
+            skip_marker < where_marker,
+            "B1 (TS builder.ts:302-306): Skip must precede conditions in \
+             ast_to_operator_configs. Got skip_marker={} where_marker={}.",
+            skip_marker,
+            where_marker
         );
+    }
+
+    /// **B1 CAVEAT — CSQ vs Filter relative order inside an And.**
+    ///
+    /// Per TS `builder.ts:308-333`, when both csqConditions and a regular
+    /// where-clause exist (e.g., AST has `where: { type: 'and', conditions:
+    /// [{simple_pred}, { type: 'correlatedSubquery', op: 'EXISTS', ... }] }`),
+    /// TS emits CSQ-Exists FIRST, then `applyWhere` (Filter). Today's Rust
+    /// `append_condition_configs` walks an And in declaration order, so a
+    /// `[simple, csq]` payload yields `[Filter, Exists]` — the inverse of TS.
+    /// This test documents the caveat (per plan 34-02 Task 1 step 5) so a
+    /// follow-up plan can either reorder inside `append_condition_configs` or
+    /// confirm parity is preserved by the existing semantics.
+    ///
+    /// The behavior is currently order-of-appearance — see
+    /// `append_condition_configs::Condition::And` at lines ~327-330. This test
+    /// is `#[ignore]`d because it captures a documented follow-up, not a
+    /// failure of the B1 hot-fix.
+    #[test]
+    #[ignore = "B1 CAVEAT: CSQ vs Filter inner ordering inside And — \
+        documented for follow-up; ast_to_config currently emits in declaration \
+        order. TS spec: builder.ts:308-333 (CSQ first then applyWhere). \
+        Tracking: phase 34 deferred follow-up."]
+    fn test_b1_csq_then_filter_inside_and() {
+        // Build AST with And(simple, CSQ-EXISTS) and assert configs ordering.
+        // We construct directly rather than via JSON to avoid a SchemaCache
+        // db-path dependency; verification is structural via the source.
+        let json = r#"{
+            "table": "issues",
+            "where": {
+                "type": "and",
+                "conditions": [
+                    {
+                        "type": "simple",
+                        "op": "=",
+                        "left": {"type": "column", "name": "status"},
+                        "right": {"type": "literal", "value": "open"}
+                    },
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {
+                                "parentField": ["id"],
+                                "childField": ["issueId"]
+                            },
+                            "subquery": {
+                                "table": "comments"
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let ast: Ast = serde_json::from_str(json).unwrap();
+        // Walk the where condition without ast_to_operator_configs (avoids db).
+        // For an And, `append_condition_configs` recursively appends in
+        // conditions[] order. Confirm the simple comes first in the AST so
+        // the produced configs would be [Filter, Exists] — opposite of TS.
+        if let Some(Condition::And { conditions }) = ast.where_cond.as_deref() {
+            assert!(matches!(conditions[0], Condition::Simple { .. }));
+            assert!(matches!(conditions[1], Condition::CorrelatedSubquery { .. }));
+            // TS would emit Exists then Filter; Rust would emit Filter then Exists.
+            // This is the documented divergence — captured for the follow-up.
+            // assert!(false, "follow-up needed: reorder And-inner CSQ before simple");
+        } else {
+            panic!("expected And condition");
+        }
     }
 
     /// **B3 (BLOCKING) — Take partition_key threading.**
@@ -987,7 +1055,11 @@ mod tests {
         let take_block_start = src
             .find("// 4. Limit -> Take")
             .expect("missing Take marker — code refactored?");
-        let take_block = &src[take_block_start..take_block_start + 300];
+        // Window widened to 600 chars after Phase 34 Plan 02 added a multi-line
+        // doc comment to the Take section as part of the B1 fix. The
+        // `partition_key: None,` literal sits ~290-330 chars past the marker
+        // depending on comment formatting.
+        let take_block = &src[take_block_start..take_block_start + 600];
         // Red state: the literal `partition_key: None,` is present inside the
         // Take config branch. Wave 1 removes it (replaces with the parameter).
         assert!(

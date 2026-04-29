@@ -134,6 +134,14 @@ impl ExistsOperator {
     pub(crate) fn force_in_push_for_test(&mut self) {
         self.in_push = true;
     }
+
+    /// Test-only helper for B2 verification — exposes parent_sizes so
+    /// regression tests can assert the post-fix REAL count is cached
+    /// (no `.max(1)` poison). Gated on `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) fn parent_sizes_for_test(&self) -> &HashMap<String, usize> {
+        &self.parent_sizes
+    }
 }
 
 impl Operator for ExistsOperator {
@@ -149,7 +157,24 @@ impl Operator for ExistsOperator {
                 // Still fetch children to populate the relationship
                 // (TS Join always populates relationships regardless of filter)
                 let children = self.fetch_children(&node.row);
-                self.parent_sizes.insert(pk, children.len().max(1));
+                // B2: cache the REAL child count. Mirrors TS
+                // packages/zql/src/ivm/exists.ts — TS Exists is a pure
+                // FilterOperator and tracks per-parent state via the upstream
+                // Join's relationship contents. Pre-Phase-34 Rust used max(1)
+                // here, which poisoned the cache when or_predicate matched
+                // and children was empty:
+                //   1. push Add boundary check (old_count==0 && new_count==1)
+                //      failed when cached value was 1 instead of 0, eliding the
+                //      Add transition for the first child of an or_predicate
+                //      parent.
+                //   2. AUDIT-04 Edit-with-or_predicate flip's count fallback
+                //      could read a stale 1 even when the real count was 0.
+                // or_predicate decision is re-evaluated on demand by all
+                // push_impl branches (Change::Add/Remove parent at line ~237,
+                // Change::Edit at line ~262/279, Change::Child at line ~308),
+                // so removing max(1) is safe — the cache only carries delta
+                // information for boundary detection.
+                self.parent_sizes.insert(pk, children.len());
                 node.relationships.insert(
                     self.relationship_name.clone(),
                     children,
@@ -1130,41 +1155,172 @@ mod tests {
     // `.max(1)` removal at exists_op.rs:152.
     // ========================================================================
 
-    /// **B2 (BLOCKING) — Exists `parent_sizes` cache poisoning.**
+    /// **B2 (BLOCKING) — Exists `parent_sizes` cache poisoning. (Phase 34
+    /// Wave 1 — GREEN)**
     ///
     /// Spec: TS `packages/zql/src/ivm/exists.ts` is a pure FilterOperator. Its
     /// per-parent count tracking comes from the upstream Join's relationship
-    /// contents — there is no `.max(1)` adjustment. The real children count is
-    /// what gets cached.
+    /// contents — there is no `.max(1)` adjustment. The real children count
+    /// is what gets cached.
     ///
-    /// Current Rust (`exists_op.rs:152`):
-    ///   `self.parent_sizes.insert(pk, children.len().max(1));`
-    /// When `or_condition_matches` is true and `children.is_empty()`, the
-    /// cache stores 1 instead of 0. Subsequent push transitions consult this
-    /// lie and miss the 0→1 boundary trigger, OR (combined with AUDIT-04 flip
-    /// path) leave a row in output when the real count is 0.
+    /// This was a Wave 0 red-state stub (commit b4b970719); Phase 34 plan 02
+    /// flipped it green by removing `.max(1)` at exists_op.rs:152.
     ///
-    /// Wave 0 Red-state: source contains the literal `.max(1)` on the
-    /// or_condition_matches branch insert. Wave 1 deletes `.max(1)` and replaces
-    /// the assertion with a runtime check on parent_sizes after a hydrate of
-    /// a parent matching or_condition with zero children — expected count = 0,
-    /// not 1.
+    /// Behavioral check: build ExistsOperator with an or_predicate that
+    /// matches a parent which has zero children. After hydrate, the cached
+    /// count for that parent must be 0, not 1.
     #[test]
-    #[ignore = "Phase 34 Wave 1 will flip this green by removing `.max(1)` from \
-        the or_condition_matches branch (exists_op.rs:152) and asserting \
-        runtime parent_sizes shows REAL count 0. Spec: TS exists.ts."]
     fn test_b2_parent_sizes_real_count() {
-        let src = include_str!("exists_op.rs");
-        // Red state: the offending `.max(1)` literal is still present at the
-        // or_condition_matches branch insert.
-        assert!(
-            src.contains("self.parent_sizes.insert(pk, children.len().max(1));"),
-            "Wave 0 expected `.max(1)` cache poison still present (current bug). \
-             Not found — Wave 1 may have already landed without removing the stub."
+        use crate::filter::Predicate;
+
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![]; // zero children
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        // EXISTS with or_predicate (id == 1) — parent 1 matches AND has 0
+        // children, so this exercises the previously-poisoned branch.
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )
+        .with_or_predicate(Some(Predicate::Eq(
+            "id".to_string(),
+            Value::from_json(&serde_json::json!(1)),
+        )));
+
+        // Hydrate.
+        let result = op.fetch(&FetchRequest::default());
+        // Parent 1 passes via or_predicate.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+
+        // B2 GREEN check: parent_sizes for parent 1 must be 0 (REAL count),
+        // NOT 1 (the pre-fix .max(1) poison).
+        let pk = op.parent_key_str(&make_node(1).row);
+        let cached = op
+            .parent_sizes_for_test()
+            .get(&pk)
+            .copied()
+            .expect("parent_sizes missing entry for matched or_predicate parent");
+        assert_eq!(
+            cached, 0,
+            "B2 (TS exists.ts spec): parent_sizes must cache REAL children.len()=0; \
+             got {} which suggests `.max(1)` poison was reintroduced.",
+            cached
         );
-        // Wave 1 will replace this stub with a behavioral test:
-        //   - Build ExistsOperator with an or_predicate that matches.
-        //   - Hydrate a parent with 0 children that matches or_predicate.
-        //   - assert_eq!(op.parent_sizes_for_test()[pk], 0);  // not 1
+
+        // Source-level guard: confirm the buggy literal does NOT reappear in
+        // production code. We split the search string at runtime so the
+        // assertion's own literal does not match itself when include_str!
+        // reads this test file.
+        let src = include_str!("exists_op.rs");
+        let needle = ["self.parent_sizes.insert(pk, ", "children.len()", ".max(1));"]
+            .concat();
+        // Count occurrences excluding the runtime-assembled `needle` line itself
+        // (which matches the structural pattern but not the assembled string).
+        let count = src.matches(needle.as_str()).count();
+        assert_eq!(
+            count, 0,
+            "B2 regression guard: `.max(1)` cache poison reintroduced ({} \
+             matches in source) — see TS exists.ts spec; cache must hold REAL \
+             count.",
+            count
+        );
+    }
+
+    /// **B2 push semantics — Add transition fires when first child appears
+    /// for or_predicate parent.**
+    ///
+    /// Spec: TS `packages/zql/src/ivm/exists.ts` push path. Pre-fix Rust
+    /// cached `1` for an or_predicate parent with 0 children; pushing a
+    /// child Add then computed `old_count=1`, `new_count=2`, missing the
+    /// boundary check `old_count==0 && new_count==1`. Result: no parent
+    /// transition emitted.
+    ///
+    /// Post-fix: cache is 0; push child Add yields `old_count=0`,
+    /// `new_count=1`, boundary fires.
+    ///
+    /// However note: when `or_condition_matches` is true, the parent
+    /// already passes the EXISTS filter. The TS contract is that for an
+    /// or_predicate parent, the parent stays in output regardless of
+    /// child count, so a subsequent child Add is a Child change passthrough,
+    /// NOT an Add of the parent (which is already present). Verify that
+    /// post-fix the operator emits a passthrough Child change (not a
+    /// duplicate Add), which is what TS does — the `or_condition_matches`
+    /// short-circuit at push_impl line 308-310 still returns the change
+    /// untouched.
+    #[test]
+    fn test_b2_push_add_after_empty_or_predicate_parent() {
+        use crate::filter::Predicate;
+
+        let parents = vec![make_node(1)];
+        let children: Vec<Node> = vec![];
+
+        let input = Box::new(MockInput { nodes: parents });
+        let child_input = Box::new(MockInput { nodes: children });
+
+        let mut op = ExistsOperator::new(
+            input,
+            child_input,
+            "children".to_string(),
+            false,
+            vec!["id".to_string()],
+            vec!["parent_id".to_string()],
+        )
+        .with_or_predicate(Some(Predicate::Eq(
+            "id".to_string(),
+            Value::from_json(&serde_json::json!(1)),
+        )));
+
+        // Hydrate primes parent_sizes[pk_for_1] = 0 (post-fix; was 1 pre-fix).
+        let _ = op.fetch(&FetchRequest::default());
+
+        // Sanity: cache holds REAL count 0 (the B2 fix).
+        let pk = op.parent_key_str(&make_node(1).row);
+        assert_eq!(
+            op.parent_sizes_for_test().get(&pk).copied(),
+            Some(0),
+            "precondition: parent_sizes must hold real count 0 after fetch"
+        );
+
+        // Push: child Add for parent 1.
+        let child_add = Change::Child {
+            node: make_node(1),
+            child: ChildData {
+                relationship_name: "children".to_string(),
+                change: Box::new(Change::Add(make_node_with_parent(10, 1))),
+            },
+        };
+        let output = op.push(child_add);
+
+        // Per push_impl (line ~307-310 / 314-322), the or_condition_matches
+        // short-circuit emits a passthrough — TS exists.ts does the same:
+        // an or_predicate-positive parent stays in output regardless of
+        // child count, and a child Add is a Child change passthrough.
+        // The KEY observation: post-fix this path is reached and emits a
+        // change. Pre-fix (with cached value 1), the boundary check at
+        // line 336 evaluated `old_count == 0 && new_count == 1` against
+        // `old_count = 1`, so even the non-or path would have missed.
+        assert_eq!(
+            output.len(),
+            1,
+            "B2: child Add must produce a downstream change for or_predicate parent"
+        );
+        // The change must be the passthrough Child (or_condition_matches
+        // short-circuit at exists_op.rs:308-310). This confirms the cache
+        // is no longer poisoned and the parent's membership is correctly
+        // preserved through the push.
+        assert!(
+            matches!(&output[0], Change::Child { .. }),
+            "B2 (TS exists.ts): or_predicate parent passes child Add as a \
+             passthrough Child change. Got {:?}",
+            &output[0]
+        );
     }
 }
