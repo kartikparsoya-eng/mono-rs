@@ -19,7 +19,7 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 
 ## Phases
 
-- [ ] **Phase 30: Audit Fixes** — Ship the 4 IVM port audit fixes on a known-correct baseline before building streaming on top.
+- [ ] **Phase 30: Audit Fixes** — Ship the 4 IVM port audit fixes on a known-correct baseline before building streaming on top. (4/5 plans complete; gap-closure plan 30-05 pending — closes AUDIT-02 end-to-end)
 - [ ] **Phase 31: Rust Streaming Primitives + TS Wrappers** — Additive Rust napi streaming methods + TS PipelineDriver wrappers + decoder; no consumer migrated yet.
 - [ ] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete.
 - [ ] **Phase 33: Performance Tuning + Benchmarks** — Bounded channel, TTFB benchmark, memory peak measurement.
@@ -44,14 +44,15 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 4. `ExistsOperator` / `OrExistsOperator` Edit handling with `or_predicate` set emits `Remove` when old row passed via or_predicate but new row no longer matches and child count is 0; emits `Add` in the inverse case; passes through when both sides match the same way. Verified by a unit test with all 4 transitions.
 5. Full vitest suite (`pipeline-driver.*.test.ts` + `fuzz-ivm.test.ts` 1k iterations) and `cargo test` in both Rust crates pass after fixes are applied.
 
-**Plans:** 3/4 plans executed
+**Plans:** 4/5 plans complete (gap-closure plan 30-05 added 2026-04-29)
 
 Plans:
 
 - [x] 30-01-PLAN.md — AUDIT-01: LIKE case sensitivity fix in parse_predicate_json (Wave 1)
 - [x] 30-02-PLAN.md — AUDIT-02: EXISTS parent_field added to collect_split_edit_keys (Wave 1)
-- [ ] 30-03-PLAN.md — AUDIT-04: Exists/OrExists Edit-with-or_predicate 4-transition fix (Wave 2, depends on 30-02)
+- [x] 30-03-PLAN.md — AUDIT-04: Exists/OrExists Edit-with-or_predicate 4-transition fix (Wave 2, depends on 30-02)
 - [x] 30-04-PLAN.md — AUDIT-03: Promote 5 framework-invariant debug_assert sites to assert (Wave 2)
+- [ ] 30-05-PLAN.md — AUDIT-02 end-to-end gap closure: production-path TS→Rust split-edit wiring (Wave 3, depends on 30-02 + 30-03; gap_closure)
 
 ---
 
@@ -120,7 +121,7 @@ Plans:
 
 | Phase                                       | Plans Complete | Status      | Completed |
 | ------------------------------------------- | -------------- | ----------- | --------- |
-| 30. Audit Fixes                             | 3/4            | In Progress |           |
+| 30. Audit Fixes                             | 4/5            | Gap closure | —         |
 | 31. Rust Streaming Primitives + TS Wrappers | 0/0            | Not started | —         |
 | 32. View-Syncer Streaming Migration         | 0/0            | Not started | —         |
 | 33. Performance Tuning + Benchmarks         | 0/0            | Not started | —         |
