@@ -56,3 +56,78 @@ INSERT INTO attachments (id, "messageId", "conversationId", filename, "createdAt
   ('x-a-2', 'x-m-1', 'x-co-1', 'monday-charts.png',   6102),
   ('x-a-3', 'x-m-3', 'x-co-2', 'planning-doc.pdf',    6601),
   ('x-a-4', 'x-m-7', 'x-co-5', 'wednesday-recap.pdf', 8101);
+
+-- =============================================================================
+-- FUZZ-02 fixtures per CONTEXT D-10..D-12. Additive only per SKILL.md hard
+-- rule 2. -test- infix marks lifecycle as additive-test (Phase 34 namespace
+-- convention) — prevents collision with future seed.sql additions and lets
+-- harnesses spot which rows are safe to UPDATE/DELETE during a test cycle.
+-- =============================================================================
+
+-- D-11 NULL semantics: two rows with all-NULL FKs/notes/processedAt/
+-- auditTrail. NULL ≠ NULL in equi-join — the two rows must NOT match
+-- each other on actorUserId. Exercises both new D-09 NULL columns.
+INSERT INTO events (id, "occurredAt", "processedAt", "metadataJson", "auditTrail",
+                    amount, quantity, "isProcessed", "actorUserId", notes,
+                    "relatedTicketId") VALUES
+  ('ev-null-test-1',     '2026-04-01T00:00:00Z', NULL, '{}', NULL,
+   0, 0, false, NULL, NULL, NULL),
+  ('ev-null-test-2',     '2026-04-01T01:00:00Z', NULL, '{}', NULL,
+   0, 0, false, NULL, NULL, NULL),
+  ('ev-no-ticket-test',  '2026-04-03T00:00:00Z', NULL, '{}', NULL,
+   2.0, 200, false, 'u2', NULL, NULL),
+  -- ev-pure-or-test-1: simple-pred-matching row with non-NULL FKs and
+  -- non-NULL processedAt + auditTrail (exercises both D-09 prod-shape
+  -- columns in their populated state).
+  ('ev-pure-or-test-1',  '2026-04-02T00:00:00Z', '2026-04-02T00:30:00Z',
+   '{"k":"v"}', '{"reviewer":"u3","decision":"approved"}',
+   1.5, 100, true, 'u1', 'note', 'co-1');
+
+-- D-12 i64 > 2^53 boundary: 2^53 = 9007199254740992. Values just below,
+-- at, just above, and far above. parentBigId chained on most rows; first
+-- row has parentBigId=NULL for self-FK NULL semantics. f64 coercion in
+-- Rust compare_values (audit B8/B9) loses precision at the boundary.
+INSERT INTO big_id_records (id, label, "parentBigId", "createdAt") VALUES
+  ('9007199254740991', 'safe-int-max',    NULL,                '2026-04-01T00:00:00Z'),
+  ('9007199254740992', '2^53-exact',      '9007199254740991',  '2026-04-01T01:00:00Z'),
+  ('9007199254740993', 'first-unsafe',    '9007199254740992',  '2026-04-01T02:00:00Z'),
+  ('9007199254740994', 'second-unsafe',   '9007199254740993',  '2026-04-01T03:00:00Z'),
+  ('9999999999999999', 'far-unsafe',      '9007199254740994',  '2026-04-01T04:00:00Z');
+
+-- D-12 DST round-trip: US Eastern 2026 spring-forward (2026-03-08 02:00 →
+-- 03:00) and fall-back (2026-11-01 02:00 → 01:00). UTC values chosen so
+-- local-time conversion lands inside the gap / fold. Both processedAt and
+-- occurredAt set to exercise both timestamptz columns through the
+-- DST-affected window.
+INSERT INTO events (id, "occurredAt", "processedAt", "metadataJson", "auditTrail",
+                    amount, quantity, "isProcessed", "actorUserId", notes,
+                    "relatedTicketId") VALUES
+  ('ev-dst-spring-test', '2026-03-08T06:30:00Z', '2026-03-08T07:30:00Z',
+   '{}', NULL, 0, 0, false, 'u1', 'spring forward', NULL),
+  ('ev-dst-fall-test',   '2026-11-01T05:30:00Z', '2026-11-01T06:30:00Z',
+   '{}', NULL, 0, 0, false, 'u1', 'fall back', NULL);
+
+-- D-10/D-12 jsonb fixtures: non-trivial values exercise predicate paths
+-- on jsonb (silent-coercion surface per pitfall 8). The non-trivial
+-- auditTrail value populates the second jsonb column per D-09.
+INSERT INTO events (id, "occurredAt", "processedAt", "metadataJson", "auditTrail",
+                    amount, quantity, "isProcessed", "actorUserId", notes,
+                    "relatedTicketId") VALUES
+  ('ev-jsonb-test-1',     '2026-04-04T00:00:00Z', '2026-04-04T00:15:00Z',
+   '{"priority": "high", "tags": ["a", "b"]}',
+   '{"by":"u1","at":"2026-04-29T00:00:00Z"}',
+   0, 0, false, 'u1', NULL, NULL),
+  ('ev-jsonb-empty-test', '2026-04-05T00:00:00Z', NULL,
+   '{}', NULL,
+   0, 0, false, 'u2', NULL, NULL);
+
+-- D-09 compound-PK + jsonb child rows (event_tags). Bound to two parent
+-- events (ev-pure-or-test-1 and ev-jsonb-test-1) with mixed confidence
+-- values for partition-Take coverage. confidence as NUMERIC(5,4) tests
+-- numeric precision across the wire.
+INSERT INTO event_tags ("eventId", "tagKey", "tagValue", confidence,
+                        "metadataJson") VALUES
+  ('ev-pure-or-test-1', 'priority', 'high', 0.9500, '{}'),
+  ('ev-pure-or-test-1', 'category', 'bug',  0.8500, '{}'),
+  ('ev-jsonb-test-1',   'priority', 'low',  0.5000, '{}'),
+  ('ev-jsonb-test-1',   'category', 'task', 0.7500, '{}');
