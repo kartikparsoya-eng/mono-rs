@@ -44,7 +44,14 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 4. `ExistsOperator` / `OrExistsOperator` Edit handling with `or_predicate` set emits `Remove` when old row passed via or_predicate but new row no longer matches and child count is 0; emits `Add` in the inverse case; passes through when both sides match the same way. Verified by a unit test with all 4 transitions.
 5. Full vitest suite (`pipeline-driver.*.test.ts` + `fuzz-ivm.test.ts` 1k iterations) and `cargo test` in both Rust crates pass after fixes are applied.
 
-**Plans:** TBD
+**Plans:** 4 plans
+
+Plans:
+
+- [ ] 30-01-PLAN.md — AUDIT-01: LIKE case sensitivity fix in parse_predicate_json (Wave 1)
+- [ ] 30-02-PLAN.md — AUDIT-02: EXISTS parent_field added to collect_split_edit_keys (Wave 1)
+- [ ] 30-03-PLAN.md — AUDIT-04: Exists/OrExists Edit-with-or_predicate 4-transition fix (Wave 2, depends on 30-02)
+- [ ] 30-04-PLAN.md — AUDIT-03: Promote 5 framework-invariant debug_assert sites to assert (Wave 2)
 
 ---
 
@@ -113,7 +120,7 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 
 | Phase                                       | Plans Complete | Status      | Completed |
 | ------------------------------------------- | -------------- | ----------- | --------- |
-| 30. Audit Fixes                             | 0/0            | Not started | —         |
+| 30. Audit Fixes                             | 0/4            | Not started | —         |
 | 31. Rust Streaming Primitives + TS Wrappers | 0/0            | Not started | —         |
 | 32. View-Syncer Streaming Migration         | 0/0            | Not started | —         |
 | 33. Performance Tuning + Benchmarks         | 0/0            | Not started | —         |
