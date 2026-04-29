@@ -1,7 +1,7 @@
 /**
- * Phase 34 Plan 02 — Differential tests for Track 2 fixes B1 + B2.
+ * Phase 34 Plans 02 + 05 — Differential tests for Track 2 fixes B1 + B2 + B3.
  *
- * Runs three focused AST shapes through the TS (port 4858) and RS (port 4868)
+ * Runs four focused AST shapes through the TS (port 4858) and RS (port 4868)
  * zero-cache instances and asserts byte-equal hydration payloads.
  *
  * Shapes:
@@ -15,6 +15,12 @@
  *     that previously had zero children; both caches must emit identical row
  *     deltas. (TS contract: parent stays in output via or_predicate; child
  *     Add is a passthrough Child change.)
+ *   - **B3 (related-with-limit + child mutation):**
+ *     `conversations.related(messages.orderBy(id asc).limit(5))` — verifies
+ *     child Take's partition_key threading. Pre-fix Rust silently no-oped on
+ *     child mutations because fetch and push state keys differed. Post-fix
+ *     plan 34-05 threads `correlation.childField` so both paths agree
+ *     (TS builder.ts:626-632 + take.ts:710-757).
  *
  * Per CONTEXT D-17 (TS-as-spec) and D-18 (no regressions): this script is the
  * second leg of the no-regressions mandate alongside the Rust unit tests in
@@ -340,6 +346,38 @@ const b1Ast: AST = {
   },
 } as unknown as AST;
 
+// B3 differential test — verifies child Take with partition_key threaded
+// produces correct push behavior on child mutation. Pre-fix Rust silently
+// no-oped on these shapes (push state-key mismatch — fetch wrote state under
+// `["take","conversationId","co-2"]`, push queried `["take"]`). Post-fix
+// matches TS exactly: child Take uses parent's correlation.childField as
+// partition key, so fetch and push state keys agree.
+//
+// See .planning/phases/34-differential-fuzz-schema-extension/34-RESEARCH.md §B3
+// and the corresponding Rust unit tests:
+//   packages/zqlite-rs/src/ast_to_config.rs::tests::test_b3_partition_key_threading
+//   packages/zero-ivm-rs/src/take_op.rs::tests::test_b3_partition_state_consistency
+//   packages/zero-ivm-rs/src/take_op.rs::tests::test_b3_push_emits_change_for_constrained_child_take
+//
+// Shape: `conversations.related(messages.orderBy(id asc).limit(5))` — exactly
+// the canonical TS-spec partition_key shape (TS builder.ts:626-632).
+// Seed precondition: co-2 has at least one message in its top-5 by id ascending.
+const b3Ast: AST = {
+  table: 'conversations',
+  orderBy: [['id', 'asc']],
+  related: [
+    {
+      correlation: {parentField: ['id'], childField: ['conversationId']},
+      subquery: {
+        table: 'messages',
+        alias: 'b3_thread',
+        orderBy: [['id', 'asc']],
+        limit: 5,
+      },
+    },
+  ],
+} as unknown as AST;
+
 const b2Ast: AST = {
   // B2 shape — OR(simple, EXISTS) — TS spec: exists.ts.
   table: 'channels',
@@ -375,7 +413,7 @@ async function main() {
   const failures: string[] = [];
   const clientSchema = buildClientSchema();
 
-  process.stdout.write('Track 2 differential tests — B1 + B2\n');
+  process.stdout.write('Track 2 differential tests — B1 + B2 + B3\n');
   process.stdout.write(`  TS_URL: ${TS_URL}\n`);
   process.stdout.write(`  RS_URL: ${RS_URL}\n`);
   process.stdout.write(`  PG_URL: ${PG_URL}\n\n`);
@@ -383,7 +421,7 @@ async function main() {
   // -------------------------------------------------------------------------
   // B1: Skip + EXISTS — verifies post-fix ordering matches TS.
   // -------------------------------------------------------------------------
-  process.stdout.write('[1/3] B1 (b1-skip-exists): hydrate ');
+  process.stdout.write('[1/4] B1 (b1-skip-exists): hydrate ');
   try {
     const r = await diffTest('b1-skip-exists', b1Ast, clientSchema);
     if (!r.ok) {
@@ -405,7 +443,7 @@ async function main() {
   // B2: OR(simple, EXISTS) hydrate — verifies parent_sizes cache holds REAL
   // count for or_predicate-positive empty-children parents.
   // -------------------------------------------------------------------------
-  process.stdout.write('[2/3] B2 (b2-or-exists-hydrate): hydrate ');
+  process.stdout.write('[2/4] B2 (b2-or-exists-hydrate): hydrate ');
   try {
     const r = await diffTest('b2-or-exists-hydrate', b2Ast, clientSchema);
     if (!r.ok) {
@@ -436,9 +474,9 @@ async function main() {
   // that extends this script.
   // -------------------------------------------------------------------------
   if (skipMutation) {
-    process.stdout.write('[3/3] B2 push: SKIPPED (--skip-mutation)\n');
+    process.stdout.write('[3/4] B2 push: SKIPPED (--skip-mutation)\n');
   } else {
-    process.stdout.write('[3/3] B2 push (b2-or-exists-mutation): ');
+    process.stdout.write('[3/4] B2 push (b2-or-exists-mutation): ');
     let sql: ReturnType<typeof postgres> | undefined;
     try {
       sql = postgres(PG_URL);
@@ -481,10 +519,147 @@ async function main() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // B3: related-with-limit + child mutation — headline Track 2 fix
+  // (plan 34-05). Verifies child Take's partition_key threading: pre-fix
+  // Rust silently no-oped on child mutations because fetch and push state
+  // keys differed; post-fix both paths use parent's correlation.childField
+  // and agree. Spec source: TS builder.ts:626-632 + take.ts:710-757.
+  //
+  // Same hash-equality-after-mutation pattern as B2 push (a per-poke
+  // row-changes capture is a follow-up extension). The key signal: pre-fix
+  // RS would NOT reflect the body change (push-as-no-op for child Take),
+  // post-fix RS converges to the TS payload byte-equal.
+  //
+  // Mutation: UPDATE messages SET body = 'b3-track2-edited' WHERE id = 'm-3'.
+  //   - m-3 is in seed.sql:41 (conversationId='co-2', body='standup notes').
+  //   - co-2 has 2 messages (m-3, m-4) — both well within limit=5.
+  //   - The hydrated payload includes m-3.body, so the post-mutation hash
+  //     differs from pre-mutation — and TS↔RS must produce the same hash.
+  // Restored in finally{} regardless of test outcome.
+  // -------------------------------------------------------------------------
+  if (skipMutation) {
+    process.stdout.write('[4/4] B3 push: SKIPPED (--skip-mutation)\n');
+  } else {
+    process.stdout.write(
+      '[4/4] B3 push (b3-related-limit-child-mutation): ',
+    );
+    let sql: ReturnType<typeof postgres> | undefined;
+    let originalBody: string | null = null;
+    const mutationTargetId = 'm-3';
+    const editedBody = `b3-track2-edited-${Date.now()}`;
+    try {
+      sql = postgres(PG_URL);
+
+      // Precondition: confirm the target row exists in PG (else the test
+      // can't run meaningfully — fail loudly per threat model T-34-14).
+      const existing = await sql<{id: string; body: string}[]>`
+        SELECT id, body FROM messages WHERE id = ${mutationTargetId} LIMIT 1
+      `;
+      if (existing.length === 0) {
+        process.stdout.write('SKIPPED\n');
+        failures.push(
+          `B3 precondition failed: messages.${mutationTargetId} not in PG. ` +
+            `Was seed.sql modified? See seed.sql:41 — m-3 should exist with ` +
+            `conversationId='co-2', body='standup notes'.`,
+        );
+      } else {
+        originalBody = existing[0]!.body;
+
+        // Hydrate baseline (pre-mutation) so we can compare TS↔RS at this
+        // step and also distinguish from the post-mutation hash. (The diff
+        // helper compares only TS↔RS, not pre↔post — which is what we want.)
+        const before = await diffTest(
+          'b3-related-limit-pre-mutation',
+          b3Ast,
+          clientSchema,
+        );
+        if (!before.ok) {
+          process.stdout.write('FAIL (pre-mutation diverges)\n');
+          failures.push(`B3 pre-mutation diverges:\n${before.diff}`);
+          if (verbose) {
+            process.stdout.write(`  ts: ${JSON.stringify(before.tsRows)}\n`);
+            process.stdout.write(`  rs: ${JSON.stringify(before.rsRows)}\n`);
+          }
+        } else {
+          // Apply the child mutation.
+          await sql`
+            UPDATE messages SET body = ${editedBody} WHERE id = ${mutationTargetId}
+          `;
+          await new Promise(r => setTimeout(r, POKE_QUIESCE_MS));
+
+          // Re-hydrate with a fresh hash to avoid CVR cache reuse — both
+          // caches must observe the edited body. summarizeDiff uses
+          // multiset-aware comparison (per-table key+value diff).
+          const after = await diffTest(
+            'b3-related-limit-post-mutation',
+            b3Ast,
+            clientSchema,
+          );
+          if (!after.ok) {
+            process.stdout.write('FAIL\n');
+            failures.push(`B3 push diverges:\n${after.diff}`);
+            if (verbose) {
+              process.stdout.write(`  ts: ${JSON.stringify(after.tsRows)}\n`);
+              process.stdout.write(`  rs: ${JSON.stringify(after.rsRows)}\n`);
+            }
+          } else {
+            // Sanity: confirm the body actually changed in the hydrated
+            // payload. If it did NOT, the mutation didn't propagate and the
+            // diff result is meaningless (false positive on parity).
+            const tsMessages = (after.tsRows.messages ??
+              {}) as Record<string, Record<string, unknown>>;
+            const editedRow = Object.values(tsMessages).find(
+              row => row.id === mutationTargetId,
+            );
+            if (!editedRow) {
+              process.stdout.write('FAIL (no row in payload)\n');
+              failures.push(
+                `B3 sanity: ${mutationTargetId} not in TS post-mutation payload — ` +
+                  `did the AST not yield this row? Inspect b3Ast subquery limit.`,
+              );
+            } else if (editedRow.body !== editedBody) {
+              process.stdout.write('FAIL (mutation not propagated)\n');
+              failures.push(
+                `B3 sanity: ${mutationTargetId}.body = ${JSON.stringify(
+                  editedRow.body,
+                )} (expected ${JSON.stringify(editedBody)}). ` +
+                  `Replicator may not be in sync; bump POKE_QUIESCE_MS.`,
+              );
+            } else {
+              process.stdout.write(
+                `OK (${rowCount(after.tsRows)} rows, body propagated)\n`,
+              );
+            }
+          }
+        }
+      }
+    } catch (e) {
+      process.stdout.write('ERROR\n');
+      failures.push(`B3 push threw: ${(e as Error).message}`);
+    } finally {
+      // Restore original body regardless of outcome.
+      if (sql && originalBody !== null) {
+        try {
+          await sql`UPDATE messages SET body = ${originalBody} WHERE id = ${mutationTargetId}`;
+          await new Promise(r => setTimeout(r, POKE_QUIESCE_MS));
+        } catch (e) {
+          process.stderr.write(
+            `WARNING: B3 cleanup failed restoring messages.${mutationTargetId}.body — ` +
+              `manual fix needed: UPDATE messages SET body = ${JSON.stringify(
+                originalBody,
+              )} WHERE id = '${mutationTargetId}'. (${(e as Error).message})\n`,
+          );
+        }
+      }
+      if (sql) await sql.end({timeout: 2});
+    }
+  }
+
   process.stdout.write('\n');
   if (failures.length === 0) {
     process.stdout.write(
-      'OK: Track 2 differential tests pass (B1 + B2 hydrate + B2 push)\n',
+      'OK: Track 2 differential tests pass (B1 + B2 hydrate + B2 push + B3 push)\n',
     );
     process.exit(0);
   }
