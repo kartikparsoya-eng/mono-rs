@@ -74,11 +74,20 @@ export function resetParityDivergenceCount(): void {
   parityCheckInvocationCount = 0;
 }
 
-type ParityCheckMode = 'off' | 'sample' | 'strict';
+export type ParityCheckMode = 'off' | 'sample' | 'strict';
 
-function parseParityCheckMode(env: string | undefined): ParityCheckMode {
+export function parseParityCheckMode(env: string | undefined): ParityCheckMode {
   if (env === 'sample' || env === 'strict') return env;
   return 'off';
+}
+
+/**
+ * Test-only accessor for the per-process invocation counter. NOT part
+ * of the production API. Exposed so parity-check.test.ts can assert
+ * cadence semantics directly.
+ */
+export function getParityCheckInvocationCountForTesting(): number {
+  return parityCheckInvocationCount;
 }
 
 let RustPipelineManagerClass:
@@ -1212,6 +1221,13 @@ export class PipelineDriver {
     // comparison and run a fresh TS hydrate via tsAddQueryAll. Companion
     // queries are excluded from comparison (mirrors `rustEligible` gate
     // — the Rust batch already excludes them).
+    //
+    // NOTE: the TS oracle's hydrateInternal eventually calls
+    // tableSource.#fetch which yields via this.#shouldYield(). That
+    // shouldYield throws if no hydrateContext / advanceContext is set,
+    // so the shim re-establishes a synthetic hydrate context for the
+    // duration of the oracle run. (Rule 3 auto-fix discovered during
+    // Task 3 testing — see SUMMARY.)
     if (this.#parityCheckMode !== 'off') {
       const rustHydrateChanges: RowChange[] = [];
       for (const c of allChanges) {
@@ -1230,8 +1246,15 @@ export class PipelineDriver {
               queryID: p.queryID,
               resolvedQuery: p.resolvedQuery,
             }));
-          for (const c of tsAddQueryAll(ctx, eligibleQueries, timer)) {
-            if (c !== 'yield') out.push(c);
+          // Re-establish hydrate context for the TS oracle's #fetch
+          // path (cleared at end of Phase 3 above).
+          this.#hydrateContext = {timer};
+          try {
+            for (const c of tsAddQueryAll(ctx, eligibleQueries, timer)) {
+              if (c !== 'yield') out.push(c);
+            }
+          } finally {
+            this.#hydrateContext = null;
           }
           return out;
         },
