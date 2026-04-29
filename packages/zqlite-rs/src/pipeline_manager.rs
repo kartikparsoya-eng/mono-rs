@@ -11,9 +11,11 @@
 //! - Companion row change emission (sync companion table rows to client)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::{panic, thread};
 
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{AsyncTask, Buffer};
 use napi::{Env, Task};
 use napi_derive::napi;
 use rayon::prelude::*;
@@ -23,6 +25,7 @@ use crate::advance::{
     advance_persistent_pipeline, build_pipeline_state, encode_advance_result_buf,
     encode_json_value, flatten_nodes_to_row_changes, AdvanceResult, PipelineState, RowChange,
 };
+use crate::chunk_encoder::StreamItem;
 use crate::connection_pool::ConnectionPool;
 use crate::diff::{Change, TableAndZqlSpec};
 use zero_ivm_rs::types::FetchRequest;
@@ -532,6 +535,177 @@ impl Task for HydrateQueryTask {
     }
 }
 
+// ─── Streaming napi types (Phase 31) ────────────────────────────────────────
+
+/// JS-facing shape of one chunk pulled from a stream.
+/// `done=true` means the channel closed (no more items).
+/// Otherwise `kind ∈ {"chunk","reset","error"}` discriminates the variant.
+#[napi(object)]
+pub struct NextChunkValue {
+    pub done: bool,
+    pub kind: Option<String>,
+    pub chunk: Option<Buffer>,
+    pub reason: Option<String>,
+    pub error_msg: Option<String>,
+    pub error_kind: Option<String>,
+}
+
+/// AsyncTask that blocks on `rx.recv()` to fetch the next StreamItem.
+/// One AsyncTask per `next()` call; runs on a libuv worker thread
+/// (blocking is fine — that's exactly what worker threads are for).
+pub struct NextChunkTask {
+    rx: Arc<Mutex<mpsc::Receiver<StreamItem>>>,
+}
+unsafe impl Send for NextChunkTask {}
+
+impl Task for NextChunkTask {
+    type Output = Option<StreamItem>; // None == channel closed == done
+    type JsValue = NextChunkValue;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let rx = self.rx.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Stream rx mutex poisoned: {e}")))?;
+        match rx.recv() {
+            Ok(item) => Ok(Some(item)),
+            Err(_) => Ok(None), // SendError means coordinator dropped tx — done
+        }
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        match output {
+            None => Ok(NextChunkValue {
+                done: true, kind: None, chunk: None,
+                reason: None, error_msg: None, error_kind: None,
+            }),
+            Some(StreamItem::Chunk(buf)) => Ok(NextChunkValue {
+                done: false, kind: Some("chunk".to_string()),
+                chunk: Some(Buffer::from(buf)),
+                reason: None, error_msg: None, error_kind: None,
+            }),
+            Some(StreamItem::ResetSignal(reason)) => Ok(NextChunkValue {
+                done: false, kind: Some("reset".to_string()),
+                chunk: None, reason: Some(reason),
+                error_msg: None, error_kind: None,
+            }),
+            Some(StreamItem::Error(msg, kind)) => Ok(NextChunkValue {
+                done: false, kind: Some("error".to_string()),
+                chunk: None, reason: None,
+                error_msg: Some(msg), error_kind: Some(kind),
+            }),
+        }
+    }
+}
+
+/// Streaming handle returned by `advance_streaming`. JS calls
+/// `await stream.next()` repeatedly until `done=true`. Calling
+/// `stream.return_()` flips the cancel flag (D-14/D-15).
+///
+/// Lifecycle note: callers SHOULD call `return_()` explicitly on graceful
+/// shutdown. `Drop` is a safety net for GC, not a guarantee for process
+/// exit (Pitfall 2 in 31-RESEARCH.md).
+#[napi]
+pub struct AdvanceStream {
+    rx: Arc<Mutex<mpsc::Receiver<StreamItem>>>,
+    cancel: Arc<AtomicBool>,
+    // Coordinator JoinHandle — kept so the thread isn't detached at
+    // construction time; never explicitly joined (would block JS GC).
+    _coordinator: Option<thread::JoinHandle<()>>,
+}
+
+unsafe impl Send for AdvanceStream {}
+unsafe impl Sync for AdvanceStream {}
+
+impl AdvanceStream {
+    /// Test-only constructor used by Rust unit tests. Production code
+    /// receives an AdvanceStream from `advance_streaming` (Task 4).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        rx: mpsc::Receiver<StreamItem>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            rx: Arc::new(Mutex::new(rx)),
+            cancel,
+            _coordinator: None,
+        }
+    }
+
+    /// Test-only accessor for the underlying receiver. Tests need to
+    /// call `recv()` directly to avoid the napi AsyncTask path which
+    /// is awkward to drive from pure Rust.
+    #[cfg(test)]
+    pub(crate) fn rx_for_test(&self) -> Arc<Mutex<mpsc::Receiver<StreamItem>>> {
+        self.rx.clone()
+    }
+}
+
+#[napi]
+impl AdvanceStream {
+    /// Pull the next StreamItem from the channel.
+    /// Returns Promise<NextChunkValue> on the JS side.
+    #[napi(ts_return_type = "Promise<NextChunkValue>")]
+    pub fn next(&self) -> AsyncTask<NextChunkTask> {
+        AsyncTask::new(NextChunkTask { rx: self.rx.clone() })
+    }
+
+    /// Cancel the stream. Synchronous; flips the cancel flag.
+    /// Per D-15, the TS wrapper MUST call this in `finally`.
+    ///
+    /// Note: name is `return_` because `return` is a Rust keyword.
+    /// Mapped to JS `return_` automatically by napi-rs.
+    #[napi]
+    pub fn return_(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for AdvanceStream {
+    fn drop(&mut self) {
+        // D-14: belt-and-suspenders cancel on GC. Do NOT join the
+        // coordinator thread here — that would block JS GC. The
+        // coordinator notices the cancel flag at scope.spawn entry
+        // and at change boundaries, then drops tx normally.
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Symmetric to AdvanceStream — separate type for clarity in JS API.
+#[napi]
+pub struct HydrateStream {
+    rx: Arc<Mutex<mpsc::Receiver<StreamItem>>>,
+    cancel: Arc<AtomicBool>,
+    _coordinator: Option<thread::JoinHandle<()>>,
+}
+
+unsafe impl Send for HydrateStream {}
+unsafe impl Sync for HydrateStream {}
+
+impl HydrateStream {
+    #[cfg(test)]
+    pub(crate) fn rx_for_test(&self) -> Arc<Mutex<mpsc::Receiver<StreamItem>>> {
+        self.rx.clone()
+    }
+}
+
+#[napi]
+impl HydrateStream {
+    #[napi(ts_return_type = "Promise<NextChunkValue>")]
+    pub fn next(&self) -> AsyncTask<NextChunkTask> {
+        AsyncTask::new(NextChunkTask { rx: self.rx.clone() })
+    }
+
+    #[napi]
+    pub fn return_(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for HydrateStream {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Hydrate a single pipeline (fetch all rows from operator tree).
@@ -860,4 +1034,31 @@ fn extract_pk_as_json(
         }
     }
     serde_json::Value::Object(obj)
+}
+
+// ─── Streaming tests (Phase 31) ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    #[test]
+    fn advance_stream_drop_sets_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_observer = cancel.clone();
+        let (_tx, rx) = mpsc::channel::<StreamItem>();
+        {
+            let _stream = AdvanceStream::new_for_test(rx, cancel);
+            assert!(
+                !cancel_observer.load(Ordering::SeqCst),
+                "cancel must be false before drop"
+            );
+        } // _stream dropped here
+        assert!(
+            cancel_observer.load(Ordering::SeqCst),
+            "AdvanceStream::drop must set cancel flag (D-14)"
+        );
+    }
 }
