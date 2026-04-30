@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use serde::Deserialize;
 
 use zero_ivm_rs::operator::Operator;
 use zero_ivm_rs::pipeline::OperatorConfig;
@@ -653,43 +652,7 @@ impl Operator for ParallelOrExistsOperator {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct HydratePipelineConfig {
-    pub pipeline_id: String,
-    pub operator_config: Vec<OperatorConfig>,
-}
-
-#[derive(Debug)]
-pub struct HydrateResult {
-    pub pipeline_id: String,
-    pub nodes: Result<Vec<Node>, String>,
-}
-
-/// Hydrate multiple pipelines in parallel using Rayon.
-pub fn hydrate_pipelines(
-    source: Arc<RustTableSource>,
-    configs: Vec<HydratePipelineConfig>,
-) -> Vec<HydrateResult> {
-    let profile = std::env::var("RUST_HYDRATE_PROFILE").unwrap_or_default() == "1";
-    configs
-        .into_par_iter()
-        .map(|config| {
-            let pid = config.pipeline_id.clone();
-            let t0 = std::time::Instant::now();
-            let result = hydrate_single_pipeline(source.clone(), config.operator_config);
-            if profile {
-                let us = t0.elapsed().as_micros();
-                let node_count = result.as_ref().map(|n| n.len()).unwrap_or(0);
-                eprintln!("  [pipeline {}] {}us  nodes={}", pid, us, node_count);
-            }
-            HydrateResult {
-                pipeline_id: pid,
-                nodes: result,
-            }
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn hydrate_single_pipeline(
     source: Arc<RustTableSource>,
     configs: Vec<OperatorConfig>,
@@ -1333,144 +1296,6 @@ mod tests {
         assert_eq!(nodes[1].row.get("id").unwrap(), &json!("2"));
     }
 
-    #[test]
-    fn test_hydrate_multiple_pipelines_parallel() {
-        let db = setup_test_db();
-        let mut src = make_source(&db, 8);
-        for _ in 0..5 {
-            src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
-        }
-        let arc_src = Arc::new(src);
-
-        let configs: Vec<HydratePipelineConfig> = (0..5)
-            .map(|i| HydratePipelineConfig {
-                pipeline_id: format!("pipeline_{i}"),
-                operator_config: vec![OperatorConfig::Source {
-                    table_name: "users".into(),
-                    columns: vec!["id".into(), "name".into(), "age".into()],
-                    primary_key: vec!["id".into()],
-                    sort: vec![("id".into(), "asc".into())],
-                }],
-            })
-            .collect();
-
-        let results = hydrate_pipelines(arc_src, configs);
-        assert_eq!(results.len(), 5);
-        for r in &results {
-            assert!(r.nodes.is_ok());
-            assert_eq!(r.nodes.as_ref().unwrap().len(), 5);
-        }
-    }
-
-    #[test]
-    fn test_hydrate_mixed_pipelines() {
-        let db = setup_test_db();
-        let mut src = make_source(&db, 8);
-        for _ in 0..3 {
-            src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
-        }
-        let arc_src = Arc::new(src);
-
-        let configs = vec![
-            HydratePipelineConfig {
-                pipeline_id: "all".into(),
-                operator_config: vec![OperatorConfig::Source {
-                    table_name: "users".into(),
-                    columns: vec!["id".into(), "name".into(), "age".into()],
-                    primary_key: vec!["id".into()],
-                    sort: vec![("id".into(), "asc".into())],
-                }],
-            },
-            HydratePipelineConfig {
-                pipeline_id: "filtered".into(),
-                operator_config: vec![
-                    OperatorConfig::Source {
-                        table_name: "users".into(),
-                        columns: vec!["id".into(), "name".into(), "age".into()],
-                        primary_key: vec!["id".into()],
-                        sort: vec![("id".into(), "asc".into())],
-                    },
-                    OperatorConfig::Filter {
-                        predicate: json!({"field": "name", "eq": "Bob"}),
-                    },
-                ],
-            },
-            HydratePipelineConfig {
-                pipeline_id: "limited".into(),
-                operator_config: vec![
-                    OperatorConfig::Source {
-                        table_name: "users".into(),
-                        columns: vec!["id".into(), "name".into(), "age".into()],
-                        primary_key: vec!["id".into()],
-                        sort: vec![("id".into(), "asc".into())],
-                    },
-                    OperatorConfig::Take {
-                        limit: 3,
-                        sort: vec![("id".into(), "asc".into())],
-                        partition_key: None,
-                    },
-                ],
-            },
-        ];
-
-        let results = hydrate_pipelines(arc_src, configs);
-        let by_id: HashMap<&str, &HydrateResult> = results
-            .iter()
-            .map(|r| (r.pipeline_id.as_str(), r))
-            .collect();
-
-        assert_eq!(by_id["all"].nodes.as_ref().unwrap().len(), 5);
-        assert_eq!(by_id["filtered"].nodes.as_ref().unwrap().len(), 1);
-        assert_eq!(by_id["limited"].nodes.as_ref().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_hydrate_same_snapshot() {
-        let db = setup_test_db();
-        let mut src = make_source(&db, 4);
-        for _ in 0..3 {
-            src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
-        }
-        let arc_src = Arc::new(src);
-
-        let configs: Vec<HydratePipelineConfig> = (0..3)
-            .map(|i| HydratePipelineConfig {
-                pipeline_id: format!("p{i}"),
-                operator_config: vec![OperatorConfig::Source {
-                    table_name: "users".into(),
-                    columns: vec!["id".into(), "name".into(), "age".into()],
-                    primary_key: vec!["id".into()],
-                    sort: vec![("id".into(), "asc".into())],
-                }],
-            })
-            .collect();
-
-        let results = hydrate_pipelines(arc_src, configs);
-        let first = results[0].nodes.as_ref().unwrap();
-        for r in &results[1..] {
-            let nodes = r.nodes.as_ref().unwrap();
-            assert_eq!(nodes.len(), first.len());
-            for (a, b) in first.iter().zip(nodes.iter()) {
-                assert_eq!(a.row, b.row);
-            }
-        }
-    }
-
-    #[test]
-    fn test_hydrate_empty_config_errors() {
-        let db = setup_test_db();
-        let src = make_source(&db, 2);
-        let arc_src = Arc::new(src);
-
-        let configs = vec![HydratePipelineConfig {
-            pipeline_id: "bad".into(),
-            operator_config: vec![],
-        }];
-
-        let results = hydrate_pipelines(arc_src, configs);
-        assert!(results[0].nodes.is_err());
-    }
-
     fn setup_join_test_db() -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         let conn = rusqlite::Connection::open(file.path()).expect("open");
@@ -1604,50 +1429,6 @@ mod tests {
         let nobody = result.iter().find(|n| n.row.get("name").unwrap() == &json!("Nobody"));
         assert!(nobody.is_some());
         assert_eq!(nobody.unwrap().relationships["posts"].len(), 0);
-    }
-
-    #[test]
-    fn test_parallel_join_multiple_pipelines() {
-        let db = setup_join_test_db();
-        let mut src = make_join_source(&db, "users", vec!["id", "name"], "id", 8);
-        src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
-        let arc_src = Arc::new(src);
-
-        let join_config = vec![
-            OperatorConfig::Source {
-                table_name: "users".into(),
-                columns: vec!["id".into(), "name".into()],
-                primary_key: vec!["id".into()],
-                sort: vec![("id".into(), "asc".into())],
-            },
-            OperatorConfig::Join {
-                parent_key: vec!["id".into()],
-                child_key: vec!["user_id".into()],
-                relationship_name: "posts".into(),
-                child: vec![OperatorConfig::Source {
-                    table_name: "posts".into(),
-                    columns: vec!["id".into(), "user_id".into(), "title".into()],
-                    primary_key: vec!["id".into()],
-                    sort: vec![("id".into(), "asc".into())],
-                }],
-            },
-        ];
-
-        let configs: Vec<HydratePipelineConfig> = (0..4)
-            .map(|i| HydratePipelineConfig {
-                pipeline_id: format!("p{i}"),
-                operator_config: join_config.clone(),
-            })
-            .collect();
-
-        let results = hydrate_pipelines(arc_src, configs);
-        assert_eq!(results.len(), 4);
-        for r in &results {
-            let nodes = r.nodes.as_ref().unwrap();
-            assert_eq!(nodes.len(), 3);
-            assert_eq!(nodes[0].relationships["posts"].len(), 2);
-            assert_eq!(nodes[2].relationships["posts"].len(), 3);
-        }
     }
 
     #[test]

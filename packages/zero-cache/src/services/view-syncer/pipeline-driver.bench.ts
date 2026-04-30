@@ -1,14 +1,16 @@
 /**
- * Benchmark: Rust IVM (RustPipeline with per-core Rayon parallelism)
+ * Benchmark: Rust IVM (RustPipelineManager — production NAPI surface)
  *            vs TypeScript IVM (PipelineDriver with TS operator trees)
  *
  * Strategy:
  * - ZERO_DISABLE_RUST_IVM=1 is set in vitest.config.bench.ts so PipelineDriver
  *   uses pure TypeScript operators for hydrate AND advance.
- * - RustPipeline NAPI class is used directly for Rust benchmarks — this is the
- *   real per-core Rayon IVM with RwLock<Vec<Mutex<PipelineState>>> and par_iter().
+ * - RustPipelineManager NAPI class is used directly for Rust benchmarks —
+ *   the same class production view-syncer uses via PipelineDriver. Bench
+ *   numbers therefore reflect production behaviour (sequential operator
+ *   chain via build_operator_chain), not the deprecated RustPipeline path.
  *
- * The Change format for RustPipeline.advance() matches diff.rs:
+ * The Change format for RustPipelineManager.advance() matches diff.rs:
  *   { table, prevValues: Row[], nextValue: Row | null, rowKey: JsonValue }
  */
 
@@ -44,25 +46,31 @@ import {decodeAdvanceResultBuf} from './decode-advance-buf.ts';
 import {PipelineDriver, type Timer} from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
 
-// Load Rust NAPI bindings directly (bypassing PipelineDriver's env check)
+// Load Rust NAPI bindings directly (bypassing PipelineDriver's env check).
+// Mirrors production pipeline-driver.ts:637-639 which does:
+//   manager = new RustPipelineManagerClass();
+//   manager.createInstance(instanceId, dbPath);
+// Per index.d.ts:223 createInstance is an INSTANCE method (id first, dbPath
+// second) — verified against the generated .d.ts before coding.
 const esmRequire = createRequire(import.meta.url);
-let RustPipelineClass:
-  | (new (
-      dbPath: string,
-      queriesJson: string,
-    ) => {
-      hydrate(): Buffer;
-      advance(changesJson: string): Buffer;
-      swapSnapshot(newDbPath: string): void;
-      addQuery(queryJson: string): void;
-      removeQuery(queryId: string): void;
-      pipelineCount(): number;
+let RustPipelineManagerClass:
+  | (new () => {
+      createInstance(id: string, dbPath: string): void;
+      removeInstance(id: string): void;
+      addQuery(id: string, queryJson: string): void;
+      removeQuery(id: string, queryId: string): void;
+      hydrate(id: string): Buffer;
+      advance(id: string, changesJson: string): Buffer;
+      swapSnapshot(id: string, newDbPath: string): void;
+      setPrevSnapshot(id: string, prevDbPath: string): void;
+      setPermissionTables(id: string, tablesJson: string): void;
+      pipelineCount(id: string): number;
     })
   | undefined;
 
 try {
   const bindings = esmRequire('zqlite-rs');
-  RustPipelineClass = bindings?.RustPipeline;
+  RustPipelineManagerClass = bindings?.RustPipelineManager;
 } catch {
   // Rust bindings not available — Rust benchmarks will be skipped
 }
@@ -331,12 +339,16 @@ describe('hydrate: simple issues (3 rows)', () => {
     if (r.length === 0) throw new Error('no results');
   });
 
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
-    bench('Rust (RustPipeline)', () => {
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    let instanceCounter = 0;
+    bench('Rust (Manager)', () => {
+      const instanceId = `bench-h-simple-${Date.now()}-${instanceCounter++}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
       const cfg = buildHydrateQuery('q1', SIMPLE_ISSUES);
-      const rp = new RPC(dbFile.path, JSON.stringify([cfg]));
-      const buf = rp.hydrate();
+      mgr.addQuery(instanceId, JSON.stringify(cfg));
+      const buf = mgr.hydrate(instanceId);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length === 0) throw new Error('no results');
     });
@@ -353,12 +365,16 @@ describe('hydrate: issues + comments join (7 rows)', () => {
     if (r.length === 0) throw new Error('no results');
   });
 
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
-    bench('Rust (RustPipeline)', () => {
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    let instanceCounter = 0;
+    bench('Rust (Manager)', () => {
+      const instanceId = `bench-h-join-${Date.now()}-${instanceCounter++}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
       const cfg = buildHydrateQuery('q1', ISSUES_AND_COMMENTS);
-      const rp = new RPC(dbFile.path, JSON.stringify([cfg]));
-      const buf = rp.hydrate();
+      mgr.addQuery(instanceId, JSON.stringify(cfg));
+      const buf = mgr.hydrate(instanceId);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length === 0) throw new Error('no results');
     });
@@ -375,12 +391,16 @@ describe('hydrate: issues with EXISTS filter', () => {
     if (r.length === 0) throw new Error('no results');
   });
 
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
-    bench('Rust (RustPipeline)', () => {
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    let instanceCounter = 0;
+    bench('Rust (Manager)', () => {
+      const instanceId = `bench-h-exists-${Date.now()}-${instanceCounter++}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
       const cfg = buildHydrateQuery('q1', ISSUES_WITH_EXISTS);
-      const rp = new RPC(dbFile.path, JSON.stringify([cfg]));
-      const buf = rp.hydrate();
+      mgr.addQuery(instanceId, JSON.stringify(cfg));
+      const buf = mgr.hydrate(instanceId);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length === 0) throw new Error('no results');
     });
@@ -397,12 +417,16 @@ describe('hydrate: bulk 1000 rows (issues + comments)', () => {
     if (r.length < 100) throw new Error('too few results');
   });
 
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
-    bench('Rust (RustPipeline)', () => {
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    let instanceCounter = 0;
+    bench('Rust (Manager)', () => {
+      const instanceId = `bench-h-bulk-${Date.now()}-${instanceCounter++}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
       const cfg = buildHydrateQuery('q1', ISSUES_AND_COMMENTS);
-      const rp = new RPC(dbFile.path, JSON.stringify([cfg]));
-      const buf = rp.hydrate();
+      mgr.addQuery(instanceId, JSON.stringify(cfg));
+      const buf = mgr.hydrate(instanceId);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length < 100) throw new Error('too few results');
     });
@@ -426,15 +450,21 @@ for (const queryCount of [10, 50]) {
       }
     });
 
-    if (RustPipelineClass) {
-      const RPC = RustPipelineClass;
-      bench('Rust (RustPipeline)', () => {
-        const {queriesJson} = buildMultiQueries(
-          queryCount,
-          ISSUES_AND_COMMENTS,
-        );
-        const rp = new RPC(dbFile.path, queriesJson);
-        const buf = rp.hydrate();
+    if (RustPipelineManagerClass) {
+      const Mgr = RustPipelineManagerClass;
+      let instanceCounter = 0;
+      bench('Rust (Manager)', () => {
+        const instanceId = `bench-h-multi-${queryCount}-${Date.now()}-${instanceCounter++}`;
+        const mgr = new Mgr();
+        mgr.createInstance(instanceId, dbFile.path);
+        // Production multi-pipeline shape: one Manager instance, N
+        // addQuery() calls — same as PipelineDriver.addQueriesAsync's
+        // Phase 2 loop (pipeline-driver.ts:1451-1456 in production).
+        const {queries} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
+        for (const q of queries) {
+          mgr.addQuery(instanceId, JSON.stringify(q));
+        }
+        const buf = mgr.hydrate(instanceId);
         const d = decodeAdvanceResultBuf(buf);
         if (d.changes.length === 0) throw new Error('no results');
       });
@@ -478,24 +508,34 @@ describe('advance: single insert (small DB)', () => {
     void result;
   });
 
-  // --- Rust: pre-hydrate via RustPipeline, then benchmark advance ---
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
+  // --- Rust: pre-hydrate via RustPipelineManager, then benchmark advance ---
+  // Simplification: bench has only one DB file, so prev and curr snapshots
+  // share the same path. Production view-syncer.ts:2317-2318 calls
+  // setPrevSnapshot(prev.db.db.name) + swapSnapshot(curr.db.db.name) with
+  // distinct paths via the snapshotter; the bench uses one path because
+  // we're driving Rust directly without the snapshotter. Effect on numbers
+  // is conservative (skips an extra connection-pool open).
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    const instanceId = `bench-adv-small-${Date.now()}`;
+    const mgr = new Mgr();
+    mgr.createInstance(instanceId, dbFile.path);
     const cfg = buildHydrateQuery('q1', ISSUES_AND_COMMENTS);
-    const rustPipeline = new RPC(dbFile.path, JSON.stringify([cfg]));
-    rustPipeline.hydrate();
+    mgr.addQuery(instanceId, JSON.stringify(cfg));
+    mgr.hydrate(instanceId);
     let rustVersion = 10000;
 
-    bench('Rust (RustPipeline)', () => {
+    bench('Rust (Manager)', () => {
       const v = ver(rustVersion++);
       const id = `radv-${v}`;
       // Insert into DB so snapshot has it
       tsReplicator.processTransaction(v, messages.insert('issues', {id}));
-      rustPipeline.swapSnapshot(dbFile.path);
+      mgr.setPrevSnapshot(instanceId, dbFile.path);
+      mgr.swapSnapshot(instanceId, dbFile.path);
       const changesJson = JSON.stringify([
         makeInsertChange('issues', {id}, {id, closed: false}),
       ]);
-      const buf = rustPipeline.advance(changesJson);
+      const buf = mgr.advance(instanceId, changesJson);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length === 0) throw new Error('no advance results');
     });
@@ -539,22 +579,26 @@ describe('advance: single insert (1000-row DB)', () => {
   });
 
   // --- Rust ---
-  if (RustPipelineClass) {
-    const RPC = RustPipelineClass;
+  if (RustPipelineManagerClass) {
+    const Mgr = RustPipelineManagerClass;
+    const instanceId = `bench-adv-bulk-${Date.now()}`;
+    const mgr = new Mgr();
+    mgr.createInstance(instanceId, dbFile.path);
     const cfg = buildHydrateQuery('q1', ISSUES_AND_COMMENTS);
-    const rustPipeline = new RPC(dbFile.path, JSON.stringify([cfg]));
-    rustPipeline.hydrate();
+    mgr.addQuery(instanceId, JSON.stringify(cfg));
+    mgr.hydrate(instanceId);
     let rustVersion = 20000;
 
-    bench('Rust (RustPipeline)', () => {
+    bench('Rust (Manager)', () => {
       const v = ver(rustVersion++);
       const id = `rbulk-${v}`;
       tsReplicator.processTransaction(v, messages.insert('issues', {id}));
-      rustPipeline.swapSnapshot(dbFile.path);
+      mgr.setPrevSnapshot(instanceId, dbFile.path);
+      mgr.swapSnapshot(instanceId, dbFile.path);
       const changesJson = JSON.stringify([
         makeInsertChange('issues', {id}, {id, closed: false}),
       ]);
-      const buf = rustPipeline.advance(changesJson);
+      const buf = mgr.advance(instanceId, changesJson);
       const d = decodeAdvanceResultBuf(buf);
       if (d.changes.length === 0) throw new Error('no advance results');
     });
@@ -565,17 +609,22 @@ describe('advance: single insert (1000-row DB)', () => {
 
 // ========== PROFILING: Where is time spent in Rust advance? ==========
 
-if (RustPipelineClass) {
+if (RustPipelineManagerClass) {
   for (const queryCount of [1, 10, 50]) {
     describe(`PROFILE advance breakdown: ${queryCount} pipelines`, () => {
       const {dbFile, db} = makeBulkDB(`prof_${queryCount}`, 500);
       const lc = createSilentLogContext();
       const tsReplicator = fakeReplicator(lc, db);
 
-      const RPC = RustPipelineClass!;
-      const {queriesJson} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
-      const rustPipeline = new RPC(dbFile.path, queriesJson);
-      rustPipeline.hydrate();
+      const Mgr = RustPipelineManagerClass!;
+      const instanceId = `bench-prof-${queryCount}-${Date.now()}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
+      const {queries} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
+      for (const q of queries) {
+        mgr.addQuery(instanceId, JSON.stringify(q));
+      }
+      mgr.hydrate(instanceId);
       let profVersion = 80000 + queryCount * 1000;
 
       // Accumulators for timing (in ms)
@@ -600,7 +649,10 @@ if (RustPipelineClass) {
           timings.processTransaction += t1 - t0;
 
           t0 = performance.now();
-          rustPipeline.swapSnapshot(dbFile.path);
+          // Mirror production: setPrevSnapshot before swapSnapshot per
+          // pipeline-driver.ts:2317-2318.
+          mgr.setPrevSnapshot(instanceId, dbFile.path);
+          mgr.swapSnapshot(instanceId, dbFile.path);
           t1 = performance.now();
           timings.swapSnapshot += t1 - t0;
 
@@ -612,7 +664,7 @@ if (RustPipelineClass) {
           timings.jsonStringify += t1 - t0;
 
           t0 = performance.now();
-          const buf = rustPipeline.advance(changesJson);
+          const buf = mgr.advance(instanceId, changesJson);
           t1 = performance.now();
           timings.rustAdvance += t1 - t0;
 
@@ -712,23 +764,29 @@ for (const queryCount of [2, 10, 50]) {
       void result;
     });
 
-    // --- Rust: N pipelines via RustPipeline, then advance ---
-    if (RustPipelineClass) {
-      const RPC = RustPipelineClass;
-      const {queriesJson} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
-      const rustPipeline = new RPC(dbFile.path, queriesJson);
-      rustPipeline.hydrate();
+    // --- Rust: N pipelines via RustPipelineManager, then advance ---
+    if (RustPipelineManagerClass) {
+      const Mgr = RustPipelineManagerClass;
+      const instanceId = `bench-adv-multi-${queryCount}-${Date.now()}`;
+      const mgr = new Mgr();
+      mgr.createInstance(instanceId, dbFile.path);
+      const {queries} = buildMultiQueries(queryCount, ISSUES_AND_COMMENTS);
+      for (const q of queries) {
+        mgr.addQuery(instanceId, JSON.stringify(q));
+      }
+      mgr.hydrate(instanceId);
       let rustVersion = 50000 + queryCount * 1000;
 
-      bench('Rust (RustPipeline)', () => {
+      bench('Rust (Manager)', () => {
         const v = ver(rustVersion++);
         const id = `rmulti-${v}`;
         tsReplicator.processTransaction(v, messages.insert('issues', {id}));
-        rustPipeline.swapSnapshot(dbFile.path);
+        mgr.setPrevSnapshot(instanceId, dbFile.path);
+        mgr.swapSnapshot(instanceId, dbFile.path);
         const changesJson = JSON.stringify([
           makeInsertChange('issues', {id}, {id, closed: false}),
         ]);
-        const buf = rustPipeline.advance(changesJson);
+        const buf = mgr.advance(instanceId, changesJson);
         const d = decodeAdvanceResultBuf(buf);
         if (d.changes.length === 0) throw new Error('no advance results');
       });
