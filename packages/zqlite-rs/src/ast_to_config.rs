@@ -249,7 +249,20 @@ pub fn ast_to_operator_configs(
     //    separate Exists configs, but for And-of-(simple, CSQ) the inner
     //    relative ordering of CSQ vs Filter is order-of-appearance — see
     //    test_b1_csq_then_filter_inside_and below for the documented caveat.
-    if let Some(cond) = ast.where_cond.as_deref() {
+    // Phase: Bug 2 (alias-uniquification) — mirrors TS
+    // `uniquifyCorrelatedSubqueryConditionAliases` at builder.ts:267 + 723-765.
+    // TS rewrites every CSQ's `subquery.alias` to `<alias>_<count>` with a
+    // per-buildPipelineInternal counter so that when two EXISTS share the same
+    // alias (user-supplied or hash-collision), their downstream
+    // `relationship_name` (and therefore the `node.relationships` HashMap key
+    // emitted in change-output on advance) does not collide.
+    //
+    // Pre-fix Rust skipped this entirely (the prior `NOTE` block below);
+    // duplicate aliases caused the second EXISTS's child Changes to overwrite
+    // the first under the shared HashMap key, manifesting as the "alias-leak"
+    // / "tableName=zsubq_<hash>" parity divergence on advance.
+    let uniquified_where = ast.where_cond.as_deref().map(uniquify_top_level_csq_aliases);
+    if let Some(cond) = uniquified_where.as_ref() {
         append_condition_configs(schema, &mut configs, cond, primary_key)?;
     }
 
@@ -341,6 +354,60 @@ fn relationship_name(rel: &CorrelatedSubquery) -> String {
         }
     }
     rel.subquery.table.clone()
+}
+
+/// Mirrors TS `uniquifyCorrelatedSubqueryConditionAliases`
+/// (packages/zql/src/builder/builder.ts:723-765, called from line 267 at
+/// every `buildPipelineInternal` entry). Walks ONLY the top-level WHERE tree
+/// (recursing through and/or branches but NOT into nested subquery WHEREs)
+/// and rewrites each CorrelatedSubquery's `subquery.alias` to
+/// `<alias>_<count>` with a per-call counter starting at 0. This guarantees
+/// that two EXISTS subqueries sharing an alias get distinct
+/// `relationship_name`s in the resulting `OperatorConfig::Exists` configs,
+/// matching TS behavior.
+///
+/// TS bails out if the where root is not `and`/`or` (single CSQ at top
+/// keeps its alias verbatim). We mirror that exactly.
+pub(crate) fn uniquify_top_level_csq_aliases(cond: &Condition) -> Condition {
+    match cond {
+        // TS line 728-730: only walk if root is and/or — otherwise
+        // return the condition unchanged (single top-level CSQ stays as-is).
+        Condition::And { .. } | Condition::Or { .. } => {
+            let mut count: usize = 0;
+            uniquify_walk(cond, &mut count)
+        }
+        _ => cond.clone(),
+    }
+}
+
+fn uniquify_walk(cond: &Condition, count: &mut usize) -> Condition {
+    match cond {
+        Condition::Simple { .. } => cond.clone(),
+        Condition::CorrelatedSubquery {
+            related,
+            op,
+            flip,
+            scalar,
+        } => {
+            // TS line 739: alias = (subquery.alias ?? '') + '_' + count++
+            let prev = related.subquery.alias.clone().unwrap_or_default();
+            let mut new_related: CorrelatedSubquery = (**related).clone();
+            new_related.subquery.alias = Some(format!("{}_{}", prev, *count));
+            *count += 1;
+            Condition::CorrelatedSubquery {
+                related: Box::new(new_related),
+                op: op.clone(),
+                flip: *flip,
+                scalar: *scalar,
+            }
+        }
+        Condition::And { conditions } => Condition::And {
+            conditions: conditions.iter().map(|c| uniquify_walk(c, count)).collect(),
+        },
+        Condition::Or { conditions } => Condition::Or {
+            conditions: conditions.iter().map(|c| uniquify_walk(c, count)).collect(),
+        },
+    }
 }
 
 fn append_condition_configs(
@@ -673,10 +740,13 @@ fn collect_exists_branches(
     }
 }
 
-// NOTE: Alias uniquification (matching TS `uniquifyCorrelatedSubqueryConditionAliases`)
-// is NOT done in Rust. In production, the TS builder already uniquifies CSQ aliases
-// before sending ASTs to Rust. For the parity test, 1 divergence exists for ASTs
-// with duplicate CSQ aliases (e.g., seed_18) — this is a known limitation.
+// NOTE: Alias uniquification is now performed by `uniquify_top_level_csq_aliases`,
+// applied at every `ast_to_operator_configs` entry (top-level + recursive subquery
+// sites) — see the WHERE-conditions block in `ast_to_operator_configs`.
+// This mirrors TS `uniquifyCorrelatedSubqueryConditionAliases`
+// (packages/zql/src/builder/builder.ts:267 + 723-765) at parity. Closes the
+// "alias-leak" / "duplicate CSQ alias overwrite" parity divergence
+// (IVM-PORT-AUDIT-DEEP §"alias uniquification" / catalog seed_18).
 
 /// Apply EXISTS_LIMIT to child configs if no Take is already present.
 /// Matches TS behavior where EXISTS subqueries always have a limit applied.
@@ -872,6 +942,331 @@ fn extract_literal_value(cv: &ConditionValue) -> Result<serde_json::Value, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: extract the alias from a CorrelatedSubquery condition.
+    fn alias_of(c: &Condition) -> Option<String> {
+        if let Condition::CorrelatedSubquery { related, .. } = c {
+            related.subquery.alias.clone()
+        } else {
+            None
+        }
+    }
+
+    /// **Bug 2 (alias-uniquification) — RED-BEFORE-FIX, GREEN-AFTER.**
+    ///
+    /// Spec: TS `packages/zql/src/builder/builder.ts:267 + 723-765` rewrites
+    /// every CorrelatedSubquery's `subquery.alias` to `<alias>_<count>` with
+    /// a per-buildPipelineInternal counter. Without this step, two EXISTS
+    /// sharing an alias produce identical `relationship_name`s in
+    /// `OperatorConfig::Exists`, causing the second EXISTS's child changes
+    /// to overwrite the first under the shared `node.relationships` HashMap
+    /// key on advance — the "alias-leak" parity divergence.
+    ///
+    /// This test calls `uniquify_top_level_csq_aliases` directly on a hand-
+    /// constructed AND of two CSQs sharing alias `zsubq_participants` and
+    /// asserts the two CSQs end up with `zsubq_participants_0` and
+    /// `zsubq_participants_1` respectively. Pre-fix this function did not
+    /// exist; post-fix it produces the per-TS suffixed aliases.
+    #[test]
+    fn test_bug2_uniquify_csq_aliases_in_and() {
+        let json = r#"{
+            "type": "and",
+            "conditions": [
+                {
+                    "type": "correlatedSubquery",
+                    "op": "EXISTS",
+                    "related": {
+                        "correlation": {
+                            "parentField": ["id"],
+                            "childField": ["channel_id"]
+                        },
+                        "subquery": {
+                            "table": "participants",
+                            "alias": "zsubq_participants"
+                        }
+                    }
+                },
+                {
+                    "type": "correlatedSubquery",
+                    "op": "EXISTS",
+                    "related": {
+                        "correlation": {
+                            "parentField": ["id"],
+                            "childField": ["channel_id"]
+                        },
+                        "subquery": {
+                            "table": "participants",
+                            "alias": "zsubq_participants"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let cond: Condition = serde_json::from_str(json).unwrap();
+
+        // Pre-fix sanity: both CSQs share the alias 'zsubq_participants'.
+        if let Condition::And { conditions } = &cond {
+            assert_eq!(alias_of(&conditions[0]).as_deref(), Some("zsubq_participants"));
+            assert_eq!(alias_of(&conditions[1]).as_deref(), Some("zsubq_participants"));
+        } else {
+            panic!("expected And");
+        }
+
+        // Apply the uniquify step.
+        let uniq = uniquify_top_level_csq_aliases(&cond);
+
+        // Post-fix expectation: aliases are suffixed _0 and _1.
+        if let Condition::And { conditions } = &uniq {
+            assert_eq!(
+                alias_of(&conditions[0]).as_deref(),
+                Some("zsubq_participants_0"),
+                "first CSQ must be suffixed _0 (TS builder.ts:739: alias + '_' + count++)",
+            );
+            assert_eq!(
+                alias_of(&conditions[1]).as_deref(),
+                Some("zsubq_participants_1"),
+                "second CSQ must be suffixed _1 (TS builder.ts:739: alias + '_' + count++)",
+            );
+        } else {
+            panic!("uniquify must preserve And structure");
+        }
+    }
+
+    /// **Bug 2 — uniquify must NOT recurse into nested subquery WHEREs.**
+    ///
+    /// Per TS `builder.ts:723-758`, the uniquify pass walks only the current
+    /// AST's `where` tree. Nested subquery WHEREs are uniquified later when
+    /// their own `buildPipelineInternal` recursion fires. Mirroring this
+    /// boundary in Rust is what makes per-level counters reset to 0 — the
+    /// recursive `ast_to_operator_configs` calls handle nested cases.
+    #[test]
+    fn test_bug2_uniquify_does_not_recurse_into_subquery_where() {
+        let json = r#"{
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "related": {
+                "correlation": {"parentField": ["id"], "childField": ["pid"]},
+                "subquery": {
+                    "table": "outer_table",
+                    "alias": "outer_alias",
+                    "where": {
+                        "type": "and",
+                        "conditions": [
+                            {
+                                "type": "correlatedSubquery",
+                                "op": "EXISTS",
+                                "related": {
+                                    "correlation": {"parentField": ["id"], "childField": ["x"]},
+                                    "subquery": {"table": "inner1", "alias": "inner_dup"}
+                                }
+                            },
+                            {
+                                "type": "correlatedSubquery",
+                                "op": "EXISTS",
+                                "related": {
+                                    "correlation": {"parentField": ["id"], "childField": ["y"]},
+                                    "subquery": {"table": "inner2", "alias": "inner_dup"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let cond: Condition = serde_json::from_str(json).unwrap();
+
+        // TS line 728-730: top-level non-and/or returns ast unchanged.
+        // The single top-level correlatedSubquery's alias must NOT be
+        // mutated, AND the nested CSQs in its subquery.where must NOT be
+        // touched at this level (they'll be handled by the recursive
+        // ast_to_operator_configs call for that subquery).
+        let uniq = uniquify_top_level_csq_aliases(&cond);
+        assert_eq!(
+            alias_of(&uniq).as_deref(),
+            Some("outer_alias"),
+            "top-level single CSQ must keep its alias verbatim (TS line 728-730)"
+        );
+
+        // Confirm nested subquery WHEREs are untouched at this level.
+        if let Condition::CorrelatedSubquery { related, .. } = &uniq {
+            if let Some(inner_where) = &related.subquery.where_cond {
+                if let Condition::And { conditions } = inner_where.as_ref() {
+                    assert_eq!(
+                        alias_of(&conditions[0]).as_deref(),
+                        Some("inner_dup"),
+                        "nested CSQ alias must be untouched by top-level uniquify"
+                    );
+                    assert_eq!(
+                        alias_of(&conditions[1]).as_deref(),
+                        Some("inner_dup"),
+                        "nested CSQ alias must be untouched by top-level uniquify"
+                    );
+                } else {
+                    panic!("expected nested And");
+                }
+            }
+        }
+    }
+
+    /// **Bug 2 — uniquify counts CSQs across nested and/or branches.**
+    ///
+    /// Per TS line 744-758, the counter increments for every CSQ found in
+    /// the WHERE tree, regardless of and/or nesting. Two CSQs sharing an
+    /// alias under an Or-of-And construct must still get distinct suffixes.
+    #[test]
+    fn test_bug2_uniquify_counts_across_or_branches() {
+        let json = r#"{
+            "type": "or",
+            "conditions": [
+                {
+                    "type": "and",
+                    "conditions": [
+                        {
+                            "type": "correlatedSubquery",
+                            "op": "EXISTS",
+                            "related": {
+                                "correlation": {"parentField": ["id"], "childField": ["a"]},
+                                "subquery": {"table": "t1", "alias": "shared"}
+                            }
+                        }
+                    ]
+                },
+                {
+                    "type": "correlatedSubquery",
+                    "op": "EXISTS",
+                    "related": {
+                        "correlation": {"parentField": ["id"], "childField": ["b"]},
+                        "subquery": {"table": "t2", "alias": "shared"}
+                    }
+                }
+            ]
+        }"#;
+        let cond: Condition = serde_json::from_str(json).unwrap();
+        let uniq = uniquify_top_level_csq_aliases(&cond);
+
+        if let Condition::Or { conditions } = &uniq {
+            // Inside the And: first CSQ → count=0
+            if let Condition::And { conditions: inner } = &conditions[0] {
+                assert_eq!(alias_of(&inner[0]).as_deref(), Some("shared_0"));
+            } else {
+                panic!("expected And in first Or branch");
+            }
+            // Top-level Or's second branch CSQ → count=1
+            assert_eq!(alias_of(&conditions[1]).as_deref(), Some("shared_1"));
+        } else {
+            panic!("expected Or");
+        }
+    }
+
+    /// **Bug 2 — integration test: full ast_to_operator_configs pipeline.**
+    ///
+    /// Hand-builds an AST with two EXISTS subqueries sharing alias
+    /// `zsubq_participants` inside an `and`, then runs the full
+    /// `ast_to_operator_configs` pass against a real (temp) SQLite DB.
+    /// Asserts that the two emitted `OperatorConfig::Exists` configs have
+    /// distinct `relationship_name`s (`zsubq_participants_0` and
+    /// `zsubq_participants_1`).
+    ///
+    /// Pre-fix: both Exists configs would share `zsubq_participants` →
+    /// downstream IVM emits Change::Child{relationship_name="zsubq_participants"}
+    /// for both, the second overwrites the first in `node.relationships`
+    /// HashMap on advance — the alias-leak parity divergence.
+    /// Post-fix: distinct names → no collision.
+    #[test]
+    fn test_bug2_integration_distinct_relationship_names() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let conn = rusqlite::Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE channels (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE participants (
+                 id TEXT PRIMARY KEY,
+                 channel_id TEXT,
+                 user_id TEXT
+             );",
+        )
+        .expect("schema setup");
+        drop(conn);
+
+        let ast_json = r#"{
+            "table": "channels",
+            "where": {
+                "type": "and",
+                "conditions": [
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {
+                                "parentField": ["id"],
+                                "childField": ["channel_id"]
+                            },
+                            "subquery": {
+                                "table": "participants",
+                                "alias": "zsubq_participants"
+                            }
+                        }
+                    },
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {
+                                "parentField": ["id"],
+                                "childField": ["channel_id"]
+                            },
+                            "subquery": {
+                                "table": "participants",
+                                "alias": "zsubq_participants"
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let ast: Ast = serde_json::from_str(ast_json).expect("parse ast");
+        let mut schema = SchemaCache::new(tmp.path().to_str().unwrap());
+        // Seed PKs (mirrors what build_pipeline_state does).
+        let mut pks = HashMap::new();
+        pks.insert("channels".to_string(), vec!["id".to_string()]);
+        pks.insert("participants".to_string(), vec!["id".to_string()]);
+        schema.seed_primary_keys(&pks);
+
+        let configs = ast_to_operator_configs(&mut schema, &ast, &["id".to_string()], None)
+            .expect("ast_to_operator_configs");
+
+        // Collect the relationship_names from emitted Exists configs.
+        let mut rels: Vec<String> = Vec::new();
+        for c in &configs {
+            if let zero_ivm_rs::pipeline::OperatorConfig::Exists { relationship_name, .. } = c {
+                rels.push(relationship_name.clone());
+            }
+        }
+        assert_eq!(
+            rels.len(),
+            2,
+            "expected 2 Exists configs, got {} (configs: {:?})",
+            rels.len(),
+            configs
+        );
+        assert_ne!(
+            rels[0], rels[1],
+            "Bug 2: two Exists with the same source alias must have DISTINCT \
+             relationship_names after uniquify (pre-fix they collide as \
+             'zsubq_participants'). Got: {:?}",
+            rels
+        );
+        // Stronger: assert exact TS-spec suffixes.
+        assert!(
+            rels.contains(&"zsubq_participants_0".to_string()),
+            "expected zsubq_participants_0 in {:?}",
+            rels
+        );
+        assert!(
+            rels.contains(&"zsubq_participants_1".to_string()),
+            "expected zsubq_participants_1 in {:?}",
+            rels
+        );
+    }
 
     #[test]
     fn test_parse_simple_ast() {
