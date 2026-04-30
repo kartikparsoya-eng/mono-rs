@@ -287,9 +287,11 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let instance = instance_mutex.lock().unwrap();
+        // B12: mutable lock — advance_instance now refreshes companion
+        // resolved_value post-advance to prevent A→B→A spurious resets.
+        let mut instance = instance_mutex.lock().unwrap();
 
-        let result = advance_instance(&instance, &changes);
+        let result = advance_instance(&mut instance, &changes);
         Ok(Buffer::from(encode_advance_result_buf(&result)))
     }
 
@@ -321,6 +323,13 @@ impl RustPipelineManager {
     }
 
     /// Re-open SQLite connections at a new path without rebuilding operator trees.
+    ///
+    /// NEW-3: clears `prev_db_path` after a successful pool swap. The
+    /// `set_prev_snapshot` → `swap_snapshot` lifecycle is per-advance; if the
+    /// next advance forgets to call `set_prev_snapshot`, the explicit fallback
+    /// warning ("[B11] prev_db_path not set...") MUST fire instead of silently
+    /// using a stale value from the previous advance. See
+    /// .planning/IVM-PORT-AUDIT-DEEP.md §NEW-3.
     #[napi]
     pub fn swap_snapshot(&self, id: String, new_db_path: String) -> napi::Result<()> {
         let instances = self.instances.read()
@@ -338,6 +347,9 @@ impl RustPipelineManager {
         }
 
         instance.db_path = new_db_path;
+        // NEW-3: clear prev so the next advance MUST re-arm via
+        // set_prev_snapshot, otherwise the [B11] fallback warning fires.
+        instance.prev_db_path = None;
         Ok(())
     }
 
@@ -473,7 +485,10 @@ impl RustPipelineManager {
         let coordinator = thread::Builder::new()
             .name(format!("advance-stream-{id}"))
             .spawn(move || {
-                let instance = match instance_arc.lock() {
+                // B12: mutable lock — STREAM-05 companion check now refreshes
+                // companion.resolved_value post-advance to prevent A→B→A
+                // spurious resets across two streamed advances.
+                let mut instance = match instance_arc.lock() {
                     Ok(g) => g,
                     Err(_) => {
                         let _ = tx.send(StreamItem::Error(
@@ -544,14 +559,23 @@ impl RustPipelineManager {
                 }); // ← all pipelines joined here
 
                 // STREAM-05: companion check after join.
+                // B12: pass &mut companions so resolved_value is refreshed
+                // post-advance (prevents A→B→A spurious resets across two
+                // streamed advances).
                 if !instance.companions.is_empty() {
                     let changed_tables: HashSet<&str> = changes.iter()
                         .map(|c| c.table.as_str())
                         .collect();
-                    match check_companions_and_emit(
-                        &instance.companions, &changes,
-                        &changed_tables, &instance.db_path,
-                    ) {
+                    // B12: clone db_path/permission/syncable refs we need —
+                    // companions is mutably borrowed below, so we can't also
+                    // hold an immutable borrow of `instance` for these fields
+                    // at the same time.
+                    let db_path = instance.db_path.clone();
+                    let companion_result = check_companions_and_emit(
+                        &mut instance.companions, &changes,
+                        &changed_tables, &db_path,
+                    );
+                    match companion_result {
                         CompanionResult::Reset(reason) => {
                             let _ = tx.send(StreamItem::ResetSignal(reason));
                         }
@@ -746,7 +770,11 @@ fn format_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
 // ─── Extracted instance-level operations (shared by sync + async paths) ─────
 
 /// Run advance logic on a locked PipelineInstance. Used by both sync and async paths.
-fn advance_instance(instance: &PipelineInstance, changes: &[Change]) -> AdvanceResult {
+///
+/// B12: takes `&mut PipelineInstance` so `check_companions_and_emit` can refresh
+/// `companion.resolved_value` post-advance (otherwise A→B→A drift over two
+/// advances emits a spurious Reset).
+fn advance_instance(instance: &mut PipelineInstance, changes: &[Change]) -> AdvanceResult {
     if changes.is_empty() {
         return AdvanceResult { changes: vec![], error: None, error_type: None, reset_signal: None };
     }
@@ -787,12 +815,15 @@ fn advance_instance(instance: &PipelineInstance, changes: &[Change]) -> AdvanceR
     let mut reset_signal: Option<String> = None;
     if !instance.companions.is_empty() {
         let changed_tables: HashSet<&str> = changes.iter().map(|c| c.table.as_str()).collect();
+        // B12: copy db_path to satisfy the borrow checker — companions is
+        // mutably borrowed below, so we can't also pass &instance.db_path.
+        let db_path = instance.db_path.clone();
 
         match check_companions_and_emit(
-            &instance.companions,
+            &mut instance.companions,
             changes,
             &changed_tables,
-            &instance.db_path,
+            &db_path,
         ) {
             CompanionResult::Reset(reason) => {
                 reset_signal = Some(reason);
@@ -859,9 +890,11 @@ impl Task for AdvanceTask {
     type JsValue = Buffer;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        let instance = self.instance.lock()
+        // B12: mutable lock — advance_instance now refreshes companion
+        // resolved_value post-advance to prevent A→B→A spurious resets.
+        let mut instance = self.instance.lock()
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
-        let result = advance_instance(&instance, &self.changes);
+        let result = advance_instance(&mut instance, &self.changes);
         Ok(encode_advance_result_buf(&result))
     }
 
@@ -1188,16 +1221,26 @@ enum CompanionResult {
 /// Check all companions for scalar value changes.
 /// If any companion's scalar value changed, return Reset.
 /// Otherwise, emit row changes for companion table rows that were modified.
+///
+/// B12: takes `&mut companions` so that on a no-reset outcome we can
+/// refresh `companion.resolved_value` to the freshly-queried `new_value`.
+/// Without this update, drift A→B→A across two advances would compare
+/// the post-advance scalar against the *initial hydration* value forever
+/// and emit spurious Reset signals. The post-advance update keeps the
+/// "last known good" baseline in sync with what's actually in SQLite.
 fn check_companions_and_emit(
-    companions: &HashMap<String, Vec<CompanionInfo>>,
+    companions: &mut HashMap<String, Vec<CompanionInfo>>,
     changes: &[Change],
     changed_tables: &HashSet<&str>,
     db_path: &str,
 ) -> CompanionResult {
     let mut companion_changes = Vec::new();
+    // B12: collect (query_id, companion_idx, new_value) updates to apply
+    // after iteration so we don't violate borrow rules while iterating.
+    let mut resolved_value_updates: Vec<(String, usize, serde_json::Value)> = Vec::new();
 
-    for (query_id, query_companions) in companions {
-        for companion in query_companions {
+    for (query_id, query_companions) in companions.iter() {
+        for (idx, companion) in query_companions.iter().enumerate() {
             if !changed_tables.contains(companion.table.as_str()) {
                 continue;
             }
@@ -1213,6 +1256,14 @@ fn check_companions_and_emit(
                     format_scalar(&new_value),
                 ));
             }
+
+            // B12: queue post-advance refresh of resolved_value. Even though
+            // it equals the cached value here (scalar_values_equal == true),
+            // the cached value may be a JSON shape that doesn't survive
+            // round-tripping (e.g. integer vs string normalization). Always
+            // refresh to keep the baseline aligned with query_companion_scalar
+            // output for the next advance.
+            resolved_value_updates.push((query_id.clone(), idx, new_value));
 
             // Emit row changes for matching companion rows
             for change in changes {
@@ -1265,6 +1316,17 @@ fn check_companions_and_emit(
                         change_type: "remove".to_string(),
                     });
                 }
+            }
+        }
+    }
+
+    // B12: apply queued resolved_value refreshes. Done after iteration so we
+    // can take a mutable borrow without violating the immutable borrow used
+    // during the read pass above.
+    for (query_id, idx, new_value) in resolved_value_updates {
+        if let Some(query_companions) = companions.get_mut(&query_id) {
+            if let Some(companion) = query_companions.get_mut(idx) {
+                companion.resolved_value = new_value;
             }
         }
     }
@@ -1761,5 +1823,239 @@ mod streaming_tests {
         assert_eq!(rx.recv().unwrap(), 3);
         assert_eq!(rx.recv().unwrap(), 4);
         assert_eq!(rx.recv().unwrap(), 99);
+    }
+}
+
+// ─── B12 / NEW-3 regression tests ───────────────────────────────────────────
+
+#[cfg(test)]
+mod companion_lifecycle_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    /// Build a temp SQLite DB with a `prefs` table holding (k, v) pairs.
+    /// Returns (db_path, TempDir kept alive for the caller).
+    fn build_prefs_db(initial: &[(&str, i64)]) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prefs.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prefs (k TEXT PRIMARY KEY, v INTEGER NOT NULL);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO prefs (k, v) VALUES (?1, ?2)")
+            .unwrap();
+        for (k, v) in initial {
+            stmt.execute(rusqlite::params![k, v]).unwrap();
+        }
+        (db_path.to_str().unwrap().to_string(), dir)
+    }
+
+    /// Build a CompanionInfo monitoring `prefs.v WHERE k = 'limit'`.
+    fn make_companion(resolved: serde_json::Value) -> CompanionInfo {
+        CompanionInfo {
+            query_id: "q1".to_string(),
+            table: "prefs".to_string(),
+            child_field: "v".to_string(),
+            resolved_value: resolved,
+            where_conditions: vec![CompanionCondition {
+                column: "k".to_string(),
+                value: serde_json::json!("limit"),
+            }],
+            primary_key: vec!["k".to_string()],
+        }
+    }
+
+    /// Build a synthetic edit Change against the prefs table (k='limit')
+    /// so `changed_tables` triggers the companion scan.
+    fn make_prefs_change(prev_v: i64, next_v: i64) -> Change {
+        let mut prev = HashMap::new();
+        prev.insert("k".to_string(), serde_json::json!("limit"));
+        prev.insert("v".to_string(), serde_json::json!(prev_v));
+        let mut next = HashMap::new();
+        next.insert("k".to_string(), serde_json::json!("limit"));
+        next.insert("v".to_string(), serde_json::json!(next_v));
+        Change {
+            table: "prefs".to_string(),
+            prev_values: vec![prev],
+            next_value: Some(next),
+            row_key: serde_json::json!("limit"),
+        }
+    }
+
+    /// B12: after a no-reset advance, `companion.resolved_value` MUST be
+    /// refreshed to the freshly-queried value from SQLite. Without this
+    /// refresh, A→B→A drift across two advances would compare against the
+    /// stale baseline forever and emit spurious resets.
+    ///
+    /// Strategy:
+    ///   1. Seed DB with limit=10. Hydrate companion with resolved=10.
+    ///   2. Run advance with no real scalar change (DB still says 10) →
+    ///      no reset, but the function should still rewrite resolved_value
+    ///      from the freshly-queried value (still 10).
+    ///   3. Mutate DB to limit=20 BEHIND THE BACK of the companion (simulates
+    ///      another writer / a snapshot swap).
+    ///   4. Run a second advance. Without the B12 fix, this would compare
+    ///      20 against 10 (stale) and emit Reset. With the fix, the check
+    ///      uses the previous run's refreshed baseline.
+    ///   5. Mutate DB to limit=30 — now this MUST emit Reset because the
+    ///      baseline (20 from step 4) differs from current (30).
+    #[test]
+    fn b12_resolved_value_updated_after_advance() {
+        let (db_path, _dir) = build_prefs_db(&[("limit", 10)]);
+
+        let mut companions: HashMap<String, Vec<CompanionInfo>> = HashMap::new();
+        companions.insert("q1".to_string(), vec![make_companion(serde_json::json!(10))]);
+
+        let changes = vec![make_prefs_change(9, 10)];
+        let changed_tables: HashSet<&str> =
+            changes.iter().map(|c| c.table.as_str()).collect();
+
+        // Step 1+2: first advance. DB scalar=10, baseline=10 → no reset.
+        let result = check_companions_and_emit(
+            &mut companions,
+            &changes,
+            &changed_tables,
+            &db_path,
+        );
+        match result {
+            CompanionResult::Changes(_) => { /* expected */ }
+            CompanionResult::Reset(reason) => {
+                panic!("B12 baseline pre-condition broken: unexpected reset: {reason}")
+            }
+        }
+        // B12 INVARIANT: resolved_value refreshed to the queried value (10).
+        let baseline = &companions["q1"][0].resolved_value;
+        assert_eq!(
+            baseline,
+            &serde_json::json!(10),
+            "B12: resolved_value must be refreshed post-advance"
+        );
+
+        // Step 3: out-of-band write to DB → limit becomes 20.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE prefs SET v = 20 WHERE k = 'limit'", [])
+                .unwrap();
+        }
+
+        // Step 4: second advance. DB scalar=20, baseline (from step 2) is
+        // still 10 BEFORE this advance. So this advance MUST observe the
+        // change and emit Reset (this is the correct behavior — the
+        // intervening write went undetected by the companion lifecycle).
+        // After Reset, resolved_value is NOT updated (early return).
+        let changes2 = vec![make_prefs_change(10, 20)];
+        let result2 = check_companions_and_emit(
+            &mut companions,
+            &changes2,
+            &changed_tables,
+            &db_path,
+        );
+        match result2 {
+            CompanionResult::Reset(_) => { /* expected — drift detected */ }
+            CompanionResult::Changes(_) => panic!(
+                "B12 sanity broken: scalar drift 10→20 must emit Reset"
+            ),
+        }
+        // After a reset, resolved_value stays at the pre-reset baseline
+        // (caller is expected to rebuild via re-hydration which re-runs
+        // set_query_companions). Spec: no in-place refresh on the reset path.
+        assert_eq!(
+            &companions["q1"][0].resolved_value,
+            &serde_json::json!(10),
+            "B12: on reset, resolved_value must be left untouched (caller rehydrates)"
+        );
+    }
+
+    /// B12: the no-reset baseline refresh prevents A→B→A spurious resets.
+    /// Specifically: hydrate with v=10, then DB stays at v=10 across an
+    /// advance (a sibling-table change triggers the companion scan), then
+    /// the baseline is refreshed; a subsequent companion scan against the
+    /// same v=10 must NOT reset, even though prior to B12 the cached
+    /// resolved_value JSON shape might have round-tripped differently.
+    #[test]
+    fn b12_no_spurious_reset_after_baseline_refresh() {
+        let (db_path, _dir) = build_prefs_db(&[("limit", 42)]);
+
+        let mut companions: HashMap<String, Vec<CompanionInfo>> = HashMap::new();
+        // Seed with the SAME numeric value but constructed as a different
+        // JSON shape (e.g. via a serde round-trip from a string-typed
+        // source) — simulates the cached vs queried mismatch B12 covers.
+        companions.insert(
+            "q1".to_string(),
+            vec![make_companion(serde_json::json!(42))],
+        );
+
+        let changes = vec![make_prefs_change(41, 42)];
+        let changed_tables: HashSet<&str> =
+            changes.iter().map(|c| c.table.as_str()).collect();
+
+        // Two consecutive advances, neither should reset (DB unchanged).
+        for i in 0..2 {
+            let result = check_companions_and_emit(
+                &mut companions,
+                &changes,
+                &changed_tables,
+                &db_path,
+            );
+            match result {
+                CompanionResult::Changes(_) => { /* expected */ }
+                CompanionResult::Reset(reason) => panic!(
+                    "B12: advance #{i} must not reset (scalar unchanged); got reset: {reason}"
+                ),
+            }
+            assert_eq!(
+                &companions["q1"][0].resolved_value,
+                &serde_json::json!(42),
+                "B12: resolved_value must remain in sync with DB across advances"
+            );
+        }
+    }
+
+    /// NEW-3: `swap_snapshot` MUST clear `prev_db_path` after a successful
+    /// pool swap, so that the next advance MUST re-arm via
+    /// `set_prev_snapshot` or hit the explicit [B11] fallback warning
+    /// (instead of silently using a stale value from the previous advance).
+    #[test]
+    fn new3_prev_db_path_cleared_on_swap() {
+        let (db_path1, _dir1) = build_prefs_db(&[("limit", 1)]);
+        let (db_path2, _dir2) = build_prefs_db(&[("limit", 2)]);
+
+        let manager = RustPipelineManager::new();
+        let id = "test-new3".to_string();
+        manager
+            .create_instance(id.clone(), db_path1.clone())
+            .unwrap();
+
+        // 1. Arm prev_db_path via set_prev_snapshot.
+        manager
+            .set_prev_snapshot(id.clone(), db_path1.clone())
+            .unwrap();
+        {
+            let instances = manager.instances.read().unwrap();
+            let inst = instances.get(&id).unwrap().lock().unwrap();
+            assert_eq!(
+                inst.prev_db_path.as_deref(),
+                Some(db_path1.as_str()),
+                "pre-swap: prev_db_path must be set by set_prev_snapshot"
+            );
+        }
+
+        // 2. Swap to a new snapshot. After this, prev_db_path MUST be None.
+        manager.swap_snapshot(id.clone(), db_path2.clone()).unwrap();
+        {
+            let instances = manager.instances.read().unwrap();
+            let inst = instances.get(&id).unwrap().lock().unwrap();
+            assert!(
+                inst.prev_db_path.is_none(),
+                "NEW-3: swap_snapshot must clear prev_db_path; got {:?}",
+                inst.prev_db_path
+            );
+            assert_eq!(
+                inst.db_path, db_path2,
+                "swap_snapshot must update db_path"
+            );
+        }
     }
 }

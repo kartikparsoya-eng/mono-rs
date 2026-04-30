@@ -2185,11 +2185,78 @@ export class PipelineDriver {
         ? this.#streamChangesWithParity(innerStream, timer, numChanges, diff)
         : innerStream;
 
+    // B12 ordering window (option A): we already swapped the Rust pool to
+    // `curr` and pointed TS table-sources at `curr.db.db` BEFORE the
+    // companion scalar check fires inside the stream. If Rust emits
+    // `StreamItem::ResetSignal` (translated to `ResetPipelinesSignal` by
+    // #streamChanges), the advance is being rolled back logically — but
+    // both the Rust pool and the TS table-sources are still pointed at
+    // `curr`, leaving an inconsistency window.
+    //
+    // Wrap the consumer-facing AsyncIterable so a ResetPipelinesSignal
+    // unwinds the swap before re-throwing: re-point the Rust pool back to
+    // `prev` and reset TS table-sources to `prev.db.db`. The reset signal
+    // itself triggers a full rehydrate up the stack, which in turn calls
+    // setQueryCompanions fresh — so this is purely about leaving the
+    // pipeline-driver state consistent with `prev` until the rehydrate
+    // re-establishes `curr` cleanly.
     return {
       version: curr.version,
       numChanges,
-      changes: teedChanges,
+      changes: this.#rollbackSwapOnReset(teedChanges, prev),
     };
+  }
+
+  /**
+   * B12 ordering-window rollback (option A): catches `ResetPipelinesSignal`
+   * from the streaming companion check and rolls the Rust pool + TS
+   * table-source DB pointers back to `prev` before rethrowing. Other
+   * errors and natural completion propagate verbatim.
+   *
+   * Why option A (rollback) and not option B (lazy swap):
+   *   - Option B would require querying companion scalars against
+   *     `prev_db_path` BEFORE swapping the pool — Rust would need a
+   *     one-shot read API on prev plus a "swap or no-op" decision after
+   *     the streamed advance. That's a deeper Rust API change. Option A
+   *     reuses the existing `swap_snapshot` and `setPrevSnapshot` calls
+   *     and is the cheaper fix.
+   *   - The reset path triggers a full rehydrate anyway, so any per-
+   *     advance state becomes irrelevant downstream. Option A's job is
+   *     only to keep pipeline-driver state coherent in the brief window
+   *     between the throw and the rehydrate.
+   */
+  async *#rollbackSwapOnReset(
+    inner: AsyncIterable<RowChange | 'yield' | 'chunk-end'>,
+    prev: SnapshotDiff['prev'],
+  ): AsyncIterable<RowChange | 'yield' | 'chunk-end'> {
+    try {
+      yield* inner;
+    } catch (e) {
+      if (e instanceof ResetPipelinesSignal) {
+        // Restore Rust pool to prev. setPrevSnapshot is harmless here
+        // (next advance will set it again before the next swap).
+        try {
+          this.#manager?.swapSnapshot(this.#instanceId, prev.db.db.name);
+        } catch (rollbackErr) {
+          this.#lc.warn?.(
+            'pipeline-driver: failed to roll back Rust pool on companion reset',
+            rollbackErr,
+          );
+        }
+        // Restore TS table-source DB pointers to prev.
+        for (const table of this.#tables.values()) {
+          try {
+            table.setDB(prev.db.db);
+          } catch (rollbackErr) {
+            this.#lc.warn?.(
+              'pipeline-driver: failed to roll back TS table-source DB on companion reset',
+              rollbackErr,
+            );
+          }
+        }
+      }
+      throw e;
+    }
   }
 
   /**
