@@ -459,6 +459,62 @@ fn append_condition_configs(
             if csq_conds.is_empty() {
                 let pred = condition_to_predicate_json(cond)?;
                 configs.push(OperatorConfig::Filter { predicate: pred });
+            } else if any_compound_branch(&csq_conds) {
+                // **B5 fix — compound OR with AND-of-CSQ branches.**
+                //
+                // TS reference: `applyOr` at packages/zql/src/builder/builder.ts:514-557
+                // builds `FanOut → per-OR-branch sub-pipeline → FanIn`. Each OR
+                // branch can contain `applyAnd` which produces a chained
+                // `Filter + Exists + Exists + ...` sub-pipeline. Pre-fix Rust
+                // flattened `AND(simple_gates, CSQ1, CSQ2)` by dropping gate
+                // conditions in `collect_exists_branches` (the TODO at
+                // ast_to_config.rs:732-737) — over-permissive matching.
+                //
+                // Fix: when ANY OR branch is compound (AND containing a CSQ),
+                // emit `OperatorConfig::FanOut` with one self-contained sub-
+                // pipeline per branch:
+                //   - bare CSQ branch       → `[Source, Exists(csq)]`
+                //   - AND(gates..., csq+)   → `[Source, Filter(AND(gates)), Exists(csq1), Exists(csq2), ...]`
+                //   - simple non-CSQ        → folded into one extra Filter branch
+                //                             `[Source, Filter(OR of simples)]`
+                //                             (mirrors TS line 540-549)
+                //
+                // The simple flat case (`OR(csq1, csq2, simples)` without any
+                // AND-with-CSQ) keeps using `OrExists` / `Exists+or_condition`
+                // below to minimise diff and stay parity-compatible with
+                // existing tests.
+                let parent_source = configs.first()
+                    .ok_or("FanOut OR-branch: parent Source missing from configs")?
+                    .clone();
+                if !matches!(parent_source, OperatorConfig::Source { .. }) {
+                    return Err(format!(
+                        "FanOut OR-branch expected configs[0]=Source, got {:?}",
+                        parent_source
+                    ));
+                }
+                let mut branches: Vec<Vec<OperatorConfig>> = Vec::new();
+                for csq_cond in &csq_conds {
+                    let branch = build_or_branch_subpipeline(
+                        schema,
+                        &parent_source,
+                        csq_cond,
+                        primary_key,
+                    )?;
+                    branches.push(branch);
+                }
+                if !simple_conds.is_empty() {
+                    let or_simples_pred = if simple_conds.len() == 1 {
+                        condition_to_predicate_json(simple_conds[0])?
+                    } else {
+                        let preds: Result<Vec<serde_json::Value>, String> =
+                            simple_conds.iter().map(|c| condition_to_predicate_json(c)).collect();
+                        serde_json::json!({ "or": preds? })
+                    };
+                    let mut simple_branch = vec![parent_source.clone()];
+                    simple_branch.push(OperatorConfig::Filter { predicate: or_simples_pred });
+                    branches.push(simple_branch);
+                }
+                configs.push(OperatorConfig::FanOut { branches });
             } else {
                 let or_cond_json = if simple_conds.is_empty() {
                     None
@@ -530,6 +586,152 @@ fn has_csq(cond: &Condition) -> bool {
         }
         Condition::Simple { .. } => false,
     }
+}
+
+/// Returns true if any of these CSQ-bearing OR-branches is "compound" — i.e.
+/// an `And`/`Or` containing a CSQ alongside gate conditions, rather than a
+/// bare `CorrelatedSubquery`. The compound case requires the FanOut topology
+/// (one self-contained sub-pipeline per OR-branch) because the existing
+/// `OrExists` flat-branch model cannot preserve gate conditions inside an
+/// AND-with-CSQ branch.
+fn any_compound_branch(csq_conds: &[&Condition]) -> bool {
+    csq_conds.iter().any(|c| !matches!(c, Condition::CorrelatedSubquery { .. }))
+}
+
+/// Build a self-contained sub-pipeline for one OR-branch of a compound OR.
+///
+/// **Mirrors TS `applyFilter` recursion inside `applyOr`** (builder.ts:514-557):
+/// each OR-branch goes through `applyFilter(fanOut, subCondition, ...)` which
+/// dispatches by condition type:
+///   - bare `CorrelatedSubquery` → `applyCorrelatedSubqueryCondition` → produces an Exists
+///   - `And` → `applyAnd` → chains Filter+Exists across the branch's children
+///   - `Or` (nested CSQ-bearing) → recursive `applyOr` → nested FanOut/FanIn
+///   - `Simple` → `applySimpleCondition` → Filter
+///
+/// The Rust port produces a `Vec<OperatorConfig>` starting with a clone of
+/// the parent Source so the branch is self-contained when wrapped in
+/// `OperatorConfig::FanOut { branches }` — required because
+/// `pipeline.rs::build_operator` drops `current` on FanOut (each branch
+/// brings its own Source) and `hydrate.rs::ParallelFanOutOperator` builds
+/// each branch via `build_operator_with_live_source` which expects a Source
+/// at index 0.
+///
+/// This function handles the catalog-shape cases (bare CSQ, AND-with-CSQ,
+/// pure simple/non-CSQ AND tree, nested OR-with-no-CSQ). Nested CSQ-bearing
+/// OR within an AND-with-CSQ branch is a future extension (no catalog shape
+/// currently exercises it — see all-divergences.json).
+fn build_or_branch_subpipeline(
+    schema: &mut SchemaCache,
+    parent_source: &OperatorConfig,
+    branch_cond: &Condition,
+    primary_key: &[String],
+) -> Result<Vec<OperatorConfig>, String> {
+    let mut sub: Vec<OperatorConfig> = vec![parent_source.clone()];
+    match branch_cond {
+        Condition::CorrelatedSubquery { .. } => {
+            // Bare CSQ branch → Exists.
+            append_csq_as_exists(schema, &mut sub, branch_cond, primary_key, None)?;
+        }
+        Condition::And { conditions } => {
+            // Walk the AND tree (recursing through nested AND nodes only) and
+            // partition into:
+            //   - gates: simple/AND-of-simple/OR-of-simple conditions with no CSQ
+            //   - csqs:  bare CSQ leaves (and CSQ-bearing inner ORs/ANDs are
+            //            flattened — see flatten note below)
+            //
+            // For the catalog shapes, each AND-branch contains:
+            //   AND(AND(simple,simple,simple), AND(or(simple,simple), csq), simple_>)
+            //
+            // The inner `AND(or(simple,simple), csq)` is itself a compound:
+            // we recurse into it, treating `or(simple,simple)` as a gate and
+            // `csq` as a leaf CSQ. This collapses into a flat:
+            //   gates = [AND(s,s,s), or(s,s), s_>]
+            //   csqs  = [csq]
+            //
+            // Note: a CSQ-bearing inner OR would require a NESTED FanOut at
+            // this point. Catalog shapes never trigger that case (verified
+            // via tools/ivm-parity/all-divergences.json scan). For safety we
+            // explicitly error if encountered so a future fuzz hit is loud.
+            let mut gates: Vec<&Condition> = Vec::new();
+            let mut csqs: Vec<&Condition> = Vec::new();
+            partition_and_branch(conditions, &mut gates, &mut csqs)?;
+            if !gates.is_empty() {
+                let gate_pred = if gates.len() == 1 {
+                    condition_to_predicate_json(gates[0])?
+                } else {
+                    let preds: Result<Vec<serde_json::Value>, String> =
+                        gates.iter().map(|c| condition_to_predicate_json(c)).collect();
+                    serde_json::json!({ "and": preds? })
+                };
+                sub.push(OperatorConfig::Filter { predicate: gate_pred });
+            }
+            // Chained Exists ops give AND semantics within the branch (TS
+            // applyAnd at builder.ts:502-512 chains applyFilter sequentially).
+            for csq in &csqs {
+                append_csq_as_exists(schema, &mut sub, csq, primary_key, None)?;
+            }
+            if csqs.is_empty() {
+                return Err(
+                    "build_or_branch_subpipeline: AND branch with no CSQ — \
+                     should have been routed to gate-only Filter branch"
+                        .to_string(),
+                );
+            }
+        }
+        Condition::Or { .. } | Condition::Simple { .. } => {
+            // Pure-simple/non-CSQ OR or Simple branches are folded into the
+            // shared "OR of simples" Filter branch by the caller; we should
+            // never reach this arm for a CSQ-bearing branch.
+            return Err(format!(
+                "build_or_branch_subpipeline: unexpected non-CSQ branch \
+                 reached the per-branch builder: {:?}",
+                branch_cond
+            ));
+        }
+    }
+    Ok(sub)
+}
+
+/// Walk an AND-tree (recursing through nested AND nodes) and partition the
+/// leaf conditions into gates (no CSQ) and CSQs (bare CorrelatedSubquery).
+/// CSQ-bearing inner OR/AND nodes that aren't pure-CSQ-leaves are an error —
+/// they would require a nested FanOut at this point, and no catalog shape
+/// exercises that case yet.
+fn partition_and_branch<'a>(
+    conditions: &'a [Condition],
+    gates: &mut Vec<&'a Condition>,
+    csqs: &mut Vec<&'a Condition>,
+) -> Result<(), String> {
+    for c in conditions {
+        match c {
+            Condition::CorrelatedSubquery { .. } => csqs.push(c),
+            Condition::And { conditions: inner } => {
+                if has_csq(c) {
+                    // Inner AND with CSQ — recurse and merge into this level
+                    // (AND associativity).
+                    partition_and_branch(inner, gates, csqs)?;
+                } else {
+                    // Pure-gate inner AND — keep whole as a single gate
+                    // (preserves AND-grouping in the predicate JSON).
+                    gates.push(c);
+                }
+            }
+            Condition::Or { .. } => {
+                if has_csq(c) {
+                    return Err(
+                        "build_or_branch_subpipeline: nested CSQ-bearing OR \
+                         inside an AND-with-CSQ branch is not yet supported — \
+                         would require a nested FanOut. No catalog shape \
+                         exercises this case (see ivm-parity all-divergences.json)."
+                            .to_string(),
+                    );
+                }
+                gates.push(c);
+            }
+            Condition::Simple { .. } => gates.push(c),
+        }
+    }
+    Ok(())
 }
 
 fn append_csq_as_exists(
@@ -1265,6 +1467,244 @@ mod tests {
             rels.contains(&"zsubq_participants_1".to_string()),
             "expected zsubq_participants_1 in {:?}",
             rels
+        );
+    }
+
+    /// **B5 — compound OR with AND-of-CSQ branches → FanOut topology.**
+    ///
+    /// Spec: TS `applyOr` at packages/zql/src/builder/builder.ts:514-557
+    /// builds `FanOut → per-OR-branch sub-pipeline → FanIn` for any OR with
+    /// CSQ-bearing branches. Each AND-with-CSQ branch becomes a self-
+    /// contained sub-pipeline `[Source, Filter(gates), Exists(csq)]`.
+    ///
+    /// Pre-fix Rust at ast_to_config.rs:732-737 (collect_exists_branches)
+    /// flattened compound branches by dropping gate conditions — over-
+    /// permissive matching.
+    ///
+    /// This test mirrors the canonical catalog shape from
+    /// tools/ivm-parity/all-divergences.json (A-nested-OR-with-EXISTS):
+    /// `OR(AND(simple_gate, csq_with_filter), bare_csq)` and asserts:
+    ///   1. The emitted top-level config is `OperatorConfig::FanOut` (NOT
+    ///      OrExists or Exists+or_condition).
+    ///   2. Branch 0 (AND-with-CSQ) is `[Source, Filter, Exists]` —
+    ///      gate condition is preserved as a Filter.
+    ///   3. Branch 1 (bare CSQ) is `[Source, Exists]`.
+    #[test]
+    fn test_b5_compound_or_emits_fan_out_with_preserved_gates() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let conn = rusqlite::Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 channel_id TEXT,
+                 createdAt INTEGER
+             );
+             CREATE TABLE channels (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE attachments (id TEXT PRIMARY KEY, conv_id TEXT);",
+        )
+        .expect("schema setup");
+        drop(conn);
+
+        // Catalog-shape AST: OR(AND(simple_>, csq_channels), csq_attachments).
+        let ast_json = r#"{
+            "table": "conversations",
+            "where": {
+                "type": "or",
+                "conditions": [
+                    {
+                        "type": "and",
+                        "conditions": [
+                            {
+                                "type": "simple",
+                                "op": ">",
+                                "left": {"type": "column", "name": "createdAt"},
+                                "right": {"type": "literal", "value": 100}
+                            },
+                            {
+                                "type": "correlatedSubquery",
+                                "op": "EXISTS",
+                                "related": {
+                                    "correlation": {
+                                        "parentField": ["channel_id"],
+                                        "childField": ["id"]
+                                    },
+                                    "subquery": {
+                                        "table": "channels",
+                                        "alias": "arb_conversations_channel"
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {
+                                "parentField": ["id"],
+                                "childField": ["conv_id"]
+                            },
+                            "subquery": {
+                                "table": "attachments",
+                                "alias": "arb_conversations_attachments"
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let ast: Ast = serde_json::from_str(ast_json).expect("parse ast");
+        let mut schema = SchemaCache::new(tmp.path().to_str().unwrap());
+        let mut pks = HashMap::new();
+        pks.insert("conversations".to_string(), vec!["id".to_string()]);
+        pks.insert("channels".to_string(), vec!["id".to_string()]);
+        pks.insert("attachments".to_string(), vec!["id".to_string()]);
+        schema.seed_primary_keys(&pks);
+
+        let configs = ast_to_operator_configs(&mut schema, &ast, &["id".to_string()], None)
+            .expect("ast_to_operator_configs");
+
+        // Find the FanOut config — must exist after the Source.
+        let fan_out_idx = configs.iter().position(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::FanOut { .. })
+        ).expect(&format!(
+            "B5: expected OperatorConfig::FanOut in emitted configs, got {:?}",
+            configs.iter().map(|c| match c {
+                zero_ivm_rs::pipeline::OperatorConfig::Source { .. } => "Source",
+                zero_ivm_rs::pipeline::OperatorConfig::Filter { .. } => "Filter",
+                zero_ivm_rs::pipeline::OperatorConfig::Exists { .. } => "Exists",
+                zero_ivm_rs::pipeline::OperatorConfig::OrExists { .. } => "OrExists",
+                zero_ivm_rs::pipeline::OperatorConfig::FanOut { .. } => "FanOut",
+                _ => "Other",
+            }).collect::<Vec<_>>()
+        ));
+        // Source must come first.
+        assert!(fan_out_idx >= 1, "FanOut must come after Source");
+
+        let branches = match &configs[fan_out_idx] {
+            zero_ivm_rs::pipeline::OperatorConfig::FanOut { branches } => branches,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            branches.len(), 2,
+            "expected 2 OR branches, got {}",
+            branches.len()
+        );
+
+        // Branch 0: AND(simple_>, csq_channels) → [Source, Filter, Exists]
+        let b0 = &branches[0];
+        assert!(
+            matches!(b0.first(), Some(zero_ivm_rs::pipeline::OperatorConfig::Source { .. })),
+            "branch 0 must start with Source, got {:?}", b0.first()
+        );
+        let has_filter = b0.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::Filter { .. })
+        );
+        assert!(
+            has_filter,
+            "branch 0 (AND-with-CSQ) MUST contain a Filter for the preserved \
+             gate condition (createdAt > 100). Pre-fix this gate was dropped."
+        );
+        let has_exists = b0.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::Exists { .. })
+        );
+        assert!(has_exists, "branch 0 must contain an Exists for the CSQ");
+
+        // Branch 1: bare CSQ → [Source, Exists]
+        let b1 = &branches[1];
+        assert!(
+            matches!(b1.first(), Some(zero_ivm_rs::pipeline::OperatorConfig::Source { .. })),
+            "branch 1 must start with Source"
+        );
+        let b1_has_exists = b1.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::Exists { .. })
+        );
+        assert!(b1_has_exists, "branch 1 must contain an Exists for the bare CSQ");
+        // A bare-CSQ branch should have NO Filter (no gates to preserve).
+        let b1_has_filter = b1.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::Filter { .. })
+        );
+        assert!(
+            !b1_has_filter,
+            "branch 1 (bare CSQ) should not contain a Filter, got {:?}", b1
+        );
+    }
+
+    /// **B5 — flat OR-of-CSQs (no AND wrappers) keeps using OrExists.**
+    ///
+    /// Negative regression test: `OR(csq1, csq2)` without any compound
+    /// AND-with-CSQ branches must NOT trigger the FanOut path. It stays on
+    /// the existing OrExists path so we don't regress catalog shape #6
+    /// (D-simple-OR-with-EXISTS) or any pre-fix passing OR-of-CSQ test.
+    #[test]
+    fn test_b5_flat_or_of_csqs_keeps_or_exists_path() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let conn = rusqlite::Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE events (id TEXT PRIMARY KEY, processedAt INTEGER);
+             CREATE TABLE event_tags (id TEXT PRIMARY KEY, eventId TEXT);
+             CREATE TABLE event_owners (id TEXT PRIMARY KEY, eventId TEXT);",
+        )
+        .expect("schema setup");
+        drop(conn);
+
+        let ast_json = r#"{
+            "table": "events",
+            "where": {
+                "type": "or",
+                "conditions": [
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {"parentField": ["id"], "childField": ["eventId"]},
+                            "subquery": {"table": "event_tags", "alias": "tags"}
+                        }
+                    },
+                    {
+                        "type": "correlatedSubquery",
+                        "op": "EXISTS",
+                        "related": {
+                            "correlation": {"parentField": ["id"], "childField": ["eventId"]},
+                            "subquery": {"table": "event_owners", "alias": "owners"}
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let ast: Ast = serde_json::from_str(ast_json).expect("parse ast");
+        let mut schema = SchemaCache::new(tmp.path().to_str().unwrap());
+        let mut pks = HashMap::new();
+        pks.insert("events".to_string(), vec!["id".to_string()]);
+        pks.insert("event_tags".to_string(), vec!["id".to_string()]);
+        pks.insert("event_owners".to_string(), vec!["id".to_string()]);
+        schema.seed_primary_keys(&pks);
+
+        let configs = ast_to_operator_configs(&mut schema, &ast, &["id".to_string()], None)
+            .expect("ast_to_operator_configs");
+
+        // Must NOT contain FanOut.
+        let has_fan_out = configs.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::FanOut { .. })
+        );
+        assert!(
+            !has_fan_out,
+            "flat OR-of-CSQs must NOT trigger FanOut path (would break catalog shape #6)"
+        );
+        // SHOULD contain OrExists.
+        let has_or_exists = configs.iter().any(|c|
+            matches!(c, zero_ivm_rs::pipeline::OperatorConfig::OrExists { .. })
+        );
+        assert!(
+            has_or_exists,
+            "flat OR-of-CSQs must produce OrExists, got {:?}",
+            configs.iter().map(|c| match c {
+                zero_ivm_rs::pipeline::OperatorConfig::Source { .. } => "Source",
+                zero_ivm_rs::pipeline::OperatorConfig::OrExists { .. } => "OrExists",
+                zero_ivm_rs::pipeline::OperatorConfig::Exists { .. } => "Exists",
+                zero_ivm_rs::pipeline::OperatorConfig::Filter { .. } => "Filter",
+                _ => "Other",
+            }).collect::<Vec<_>>()
         );
     }
 
