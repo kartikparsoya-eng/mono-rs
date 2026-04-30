@@ -34,7 +34,11 @@
  * the Wave 0 plan's verification step has a concrete check.
  */
 import {createHash} from 'node:crypto';
-import type {AST, CorrelatedSubquery, Condition} from '../../packages/zero-protocol/src/ast.ts';
+import type {
+  AST,
+  CorrelatedSubquery,
+  Condition,
+} from '../../packages/zero-protocol/src/ast.ts';
 import {schema as paritySchema} from './zero-schema.ts';
 
 // ---------------------------------------------------------------------------
@@ -183,7 +187,10 @@ export const MUTATIONS_TABLE_INDEX = buildMutationsTableIndex();
 // ---------------------------------------------------------------------------
 // Types.
 // ---------------------------------------------------------------------------
-export type RowsByTable = Record<string, Record<string, Record<string, unknown>>>;
+export type RowsByTable = Record<
+  string,
+  Record<string, Record<string, unknown>>
+>;
 
 export type DivergenceDiff = {
   tables: Record<
@@ -238,16 +245,31 @@ export function astHash(ast: AST): string {
     .slice(0, 12);
 }
 
+/**
+ * Canonical JSON serializer — recursively sorts object keys before serializing
+ * so semantically equal values produce identical strings regardless of property
+ * insertion order. Required for TS↔RS row diff: zero-cache (TS) and Rust IVM
+ * emit row objects with different column insertion orders, so a plain
+ * JSON.stringify diff produces false-positive divergences for semantically
+ * equal rows. This canonical form fixes that.
+ */
+function canonicalize(o: unknown): string {
+  if (o === null || typeof o !== 'object') return JSON.stringify(o);
+  if (Array.isArray(o)) return '[' + o.map(canonicalize).join(',') + ']';
+  const obj = o as Record<string, unknown>;
+  return (
+    '{' +
+    Object.keys(obj)
+      .sort()
+      .map(k => JSON.stringify(k) + ':' + canonicalize(obj[k]))
+      .join(',') +
+    '}'
+  );
+}
+
 /** Hash a snapshot of rows for cheap equality test. */
 export function rowsHash(rows: RowsByTable): string {
-  const tables = Object.keys(rows).sort();
-  const obj: Record<string, Record<string, Record<string, unknown>>> = {};
-  for (const t of tables) {
-    const keys = Object.keys(rows[t]).sort();
-    obj[t] = {};
-    for (const k of keys) obj[t][k] = rows[t][k];
-  }
-  return createHash('sha1').update(JSON.stringify(obj)).digest('hex');
+  return createHash('sha1').update(canonicalize(rows)).digest('hex');
 }
 
 export function diffRows(ts: RowsByTable, rs: RowsByTable): DivergenceDiff {
@@ -260,14 +282,14 @@ export function diffRows(ts: RowsByTable, rs: RowsByTable): DivergenceDiff {
     const onlyRs = [...rsKeys].filter(k => !tsKeys.has(k)).sort();
     const shared = [...tsKeys].filter(k => rsKeys.has(k));
     const different = shared
-      .filter(k => JSON.stringify(ts[t][k]) !== JSON.stringify(rs[t][k]))
+      .filter(k => canonicalize(ts[t][k]) !== canonicalize(rs[t][k]))
       .sort();
     if (onlyTs.length || onlyRs.length || different.length) {
       out[t] = {onlyTs, onlyRs, different};
     }
   }
   const canonicalKey = createHash('sha1')
-    .update(JSON.stringify(out))
+    .update(canonicalize(out))
     .digest('hex')
     .slice(0, 16);
   return {tables: out, canonicalKey};
@@ -432,8 +454,7 @@ async function subscribeAndHydrate(
             const pk = (paritySchema.tables as any)[t]?.primaryKey ?? ['id'];
             if (op.op === 'put')
               remember(t, canonicalRowKey(pk, op.value), op.value);
-            else if (op.op === 'del')
-              forget(t, canonicalRowKey(pk, op.id));
+            else if (op.op === 'del') forget(t, canonicalRowKey(pk, op.id));
             else if (op.op === 'clear')
               for (const k of Object.keys(rows)) delete rows[k];
             else if (op.op === 'update') {
@@ -468,9 +489,7 @@ async function subscribeAndHydrate(
 // runOneAst — single-AST hydrate + diff. Live mode opens TS+RS sockets,
 // awaits both hydrations, diffs, returns. Wave 1 supports both stub and live.
 // ---------------------------------------------------------------------------
-export async function runOneAst(
-  opts: RunOneAstOpts,
-): Promise<RunOneAstResult> {
+export async function runOneAst(opts: RunOneAstOpts): Promise<RunOneAstResult> {
   const {ast, dryRun = false} = opts;
   if (!ast?.table) {
     return {status: 'error', error: 'ast.table missing', side: 'both'};
@@ -578,8 +597,7 @@ export function buildBatchedRunner(
 ): BatchedRunnerHandle {
   const batchSize = opts.batchSize ?? BATCH_SIZE;
   const dryRun = opts.dryRun ?? false;
-  const mutationPruning =
-    opts.mutationPruning ?? MUTATION_PRUNING_DEFAULT;
+  const mutationPruning = opts.mutationPruning ?? MUTATION_PRUNING_DEFAULT;
   const verbose = opts.verbose ?? VERBOSE;
 
   const stats: BatchedRunnerHandle['stats'] = {
