@@ -2790,5 +2790,160 @@ mod tests {
              from prev_db_path."
         );
     }
+
+    /// **Phase 35 / Wave 3 — cascade-throughput hard gate.**
+    ///
+    /// 3-level cascade fixture (parents 100 → children 1000 → grandchildren
+    /// 10000), single-shot delete-all-parents. Measures wall-clock for:
+    ///   - LEGACY: emit_descendant_removals_legacy (opens fresh
+    ///     `Connection::open_with_flags` per call, plain `prepare`).
+    ///   - NEW-1:  emit_descendant_removals_with_conn (single borrowed
+    ///     `&Connection`, `prepare_cached`).
+    ///
+    /// Hard gate per D-17 #3: ratio (legacy_ms / new_ms) >= 2.0.
+    /// Also asserts connection-open count reduction >= 10×.
+    ///
+    /// Marked `#[ignore]` so the default `cargo test` run doesn't pay the
+    /// fixture build cost; run with `cargo test --release bench_cascade
+    /// -- --ignored --nocapture` or via the bench harness.
+    #[test]
+    #[ignore]
+    fn bench_cascade_new1_throughput() {
+        use crate::connection_pool::ConnectionPool;
+        use std::time::Instant;
+
+        const PARENTS: usize = 100;
+        const CHILDREN_PER_PARENT: usize = 10;
+        const GRANDCHILDREN_PER_CHILD: usize = 10;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cascade.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER); \
+             CREATE TABLE grandchild (id INTEGER PRIMARY KEY, child_id INTEGER); \
+             CREATE INDEX idx_child_parent ON child(parent_id); \
+             CREATE INDEX idx_grand_child ON grandchild(child_id);",
+        )
+        .unwrap();
+
+        // Bulk insert 100 + 1000 + 10000 = 11100 rows.
+        conn.execute_batch("BEGIN").unwrap();
+        for p in 1..=PARENTS {
+            conn.execute("INSERT INTO parent VALUES (?1)", [p as i64]).unwrap();
+            for c in 0..CHILDREN_PER_PARENT {
+                let cid = (p * 1000 + c) as i64;
+                conn.execute("INSERT INTO child VALUES (?1, ?2)", [cid, p as i64]).unwrap();
+                for g in 0..GRANDCHILDREN_PER_CHILD {
+                    let gid = (cid * 100 + g as i64) as i64;
+                    conn.execute("INSERT INTO grandchild VALUES (?1, ?2)", [gid, cid]).unwrap();
+                }
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        drop(conn);
+
+        // children_of map: parent → child, child → grandchild.
+        let mut children_of = HashMap::new();
+        children_of.insert(
+            "parent".to_string(),
+            vec![ChildRelation {
+                relationship_name: "children".to_string(),
+                child_table: "child".to_string(),
+                parent_join_col: vec!["id".to_string()],
+                child_join_col: vec!["parent_id".to_string()],
+                child_pk: vec!["id".to_string()],
+                child_order: vec![],
+                child_limit: None,
+            }],
+        );
+        children_of.insert(
+            "child".to_string(),
+            vec![ChildRelation {
+                relationship_name: "grandchildren".to_string(),
+                child_table: "grandchild".to_string(),
+                parent_join_col: vec!["id".to_string()],
+                child_join_col: vec!["child_id".to_string()],
+                child_pk: vec!["id".to_string()],
+                child_order: vec![],
+                child_limit: None,
+            }],
+        );
+
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        // ── LEGACY path: opens a fresh connection per call ─────────────
+        let t0 = Instant::now();
+        let mut legacy_changes = Vec::new();
+        for pid in 1..=PARENTS {
+            let mut deleted = serde_json::Map::new();
+            deleted.insert("id".to_string(), serde_json::json!(pid));
+            emit_descendant_removals_legacy(
+                &db_path_str,
+                &deleted,
+                "parent",
+                &children_of,
+                "q1",
+                &None,
+                &mut legacy_changes,
+            );
+        }
+        let legacy_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let legacy_count = legacy_changes.len();
+
+        // ── NEW-1 path: single connection from prev_pool, prepare_cached ─
+        let prev_pool = ConnectionPool::new(&db_path_str, 1).unwrap();
+        let prev_conn_guard = prev_pool.get().unwrap();
+        let t0 = Instant::now();
+        let mut new1_changes = Vec::new();
+        for pid in 1..=PARENTS {
+            let mut deleted = serde_json::Map::new();
+            deleted.insert("id".to_string(), serde_json::json!(pid));
+            emit_descendant_removals_with_conn(
+                &*prev_conn_guard,
+                &deleted,
+                "parent",
+                &children_of,
+                "q1",
+                &None,
+                &mut new1_changes,
+            );
+        }
+        let new1_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let new1_count = new1_changes.len();
+        drop(prev_conn_guard);
+
+        // Same workload — same emitted-row count.
+        assert_eq!(legacy_count, new1_count, "legacy and NEW-1 emit different row counts");
+        // Expected: 1000 child + 10000 grandchild = 11000 removes.
+        assert_eq!(new1_count, PARENTS * CHILDREN_PER_PARENT * (1 + GRANDCHILDREN_PER_CHILD));
+
+        let ratio = legacy_ms / new1_ms;
+        // Connection::open count: legacy opens once per recursion node
+        // (PARENTS + PARENTS*CHILDREN_PER_PARENT = 100 + 1000 = 1100).
+        // NEW-1 opens exactly 1 (prev_pool's single connection).
+        let legacy_open_count = PARENTS + PARENTS * CHILDREN_PER_PARENT;
+        let new1_open_count = 1;
+        let open_reduction = legacy_open_count as f64 / new1_open_count as f64;
+
+        eprintln!("CASCADE_THROUGHPUT_BASELINE: ms={:.2}", legacy_ms);
+        eprintln!("CASCADE_THROUGHPUT_NEW1: ms={:.2}", new1_ms);
+        eprintln!("CASCADE_THROUGHPUT_RATIO: r={:.2}", ratio);
+        eprintln!("CASCADE_OPEN_REDUCTION: legacy={} new1={} ratio={:.0}x",
+                  legacy_open_count, new1_open_count, open_reduction);
+
+        // Hard gates (D-17 #2 + #3).
+        assert!(
+            ratio >= 2.0,
+            "Phase 35 D-17 #3: cascade ratio must be >= 2.0; got {ratio:.2} \
+             (legacy={legacy_ms:.2}ms, new1={new1_ms:.2}ms)"
+        );
+        assert!(
+            open_reduction >= 10.0,
+            "Phase 35 D-17 #2: connection-open reduction must be >= 10x; got {open_reduction}x"
+        );
+    }
 }
 use zero_ivm_rs::types::FetchRequest;
