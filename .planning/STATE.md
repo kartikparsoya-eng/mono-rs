@@ -4,7 +4,7 @@ milestone: v5.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 34 context gathered
-last_updated: "2026-04-30T05:29:37.810Z"
+last_updated: '2026-04-30T05:29:37.810Z'
 last_activity: 2026-04-30
 progress:
   total_phases: 5
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-29)
 Phase: 34
 Plan: Not started
 Status: Executing Phase 34
-Last activity: 2026-04-30
+Last activity: 2026-04-30 - Completed quick task 260430-gqe: wire parity check into streaming + drop bench dead-code path
 
 ## v5.0 Phase Overview
 
@@ -82,6 +82,12 @@ Every phase MUST pass these checks before commit:
 2. `npx vitest run packages/zero-cache/src/services/view-syncer/fuzz-ivm.test.ts` — fuzz with 1k iterations
 3. `cargo test` in `packages/zqlite-rs/` and `packages/zero-ivm-rs/`
 4. **Hard constraint:** no signature change to existing buffered methods (`advance`, `advanceAsync`, `hydrate*`, `addQuery*`); no change to `encode_advance_result_buf` or `decodeAdvanceResultBuf` formats.
+
+### Quick Tasks Completed
+
+| #          | Description                                                  | Date       | Commit    | Directory                                                                                                           |
+| ---------- | ------------------------------------------------------------ | ---------- | --------- | ------------------------------------------------------------------------------------------------------------------- |
+| 260430-gqe | wire parity check into streaming + drop bench dead-code path | 2026-04-30 | dc41f58fe | [260430-gqe-wire-parity-check-into-streaming-drop-be](./quick/260430-gqe-wire-parity-check-into-streaming-drop-be/) |
 
 ## Session Continuity
 
