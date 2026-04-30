@@ -67,6 +67,12 @@ struct PipelineInstance {
     // logged warning preserves back-compat. See
     // .planning/IVM-PORT-AUDIT-DEEP.md §B11.
     prev_db_path: Option<String>,
+    /// NEW-1 / D-08: single-connection ConnectionPool keyed at `prev_db_path`.
+    /// Lazily constructed by `set_prev_snapshot`; dropped by `swap_snapshot`
+    /// (closes NEW-3). Inherits BEGIN DEFERRED snapshot pin from
+    /// `ConnectionPool::new` (free side effect — closes NEW-5).
+    /// See `.planning/phases/35-pool-cascade-hardening/35-03-PLAN.md`.
+    prev_pool: Option<ConnectionPool>,
     pipelines: Vec<Mutex<PipelineState>>,
     shared_pool: ConnectionPool,
     /// Schema info for diffing — maps table name → TableAndZqlSpec
@@ -115,6 +121,8 @@ impl RustPipelineManager {
             // If never called, advance falls back to db_path with a logged
             // warning (back-compat path).
             prev_db_path: None,
+            // NEW-1: lazily constructed by set_prev_snapshot.
+            prev_pool: None,
             pipelines: Vec::new(),
             shared_pool,
             syncable_tables: HashMap::new(),
@@ -336,7 +344,22 @@ impl RustPipelineManager {
         // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
         let mut instance = instance_mutex.lock()
             .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
+
+        // NEW-1 / D-08: construct (or replace) the prev_pool. We build it
+        // BEFORE mutating prev_db_path so a failed open leaves both fields
+        // in their previous state (atomic semantics). Optional bench-only
+        // bypass via Z_DISABLE_PREV_POOL=1 to measure the legacy fallback.
+        let bypass = std::env::var("Z_DISABLE_PREV_POOL").as_deref() == Ok("1");
+        let new_pool = if bypass {
+            None
+        } else {
+            Some(
+                ConnectionPool::new(&prev_db_path, 1)
+                    .map_err(|e| napi::Error::from_reason(format!("prev_pool open: {e}")))?
+            )
+        };
         instance.prev_db_path = Some(prev_db_path);
+        instance.prev_pool = new_pool;
         Ok(())
     }
 
@@ -372,7 +395,10 @@ impl RustPipelineManager {
         instance.db_path = new_db_path;
         // NEW-3: clear prev so the next advance MUST re-arm via
         // set_prev_snapshot, otherwise the [B11] fallback warning fires.
+        // NEW-1: drop prev_pool too — the underlying SQLite handles release
+        // their BEGIN DEFERRED snapshot pin at this boundary.
         instance.prev_db_path = None;
+        instance.prev_pool = None;
         Ok(())
     }
 
@@ -537,6 +563,15 @@ impl RustPipelineManager {
                         instance.db_path.clone()
                     });
 
+                // NEW-1: route through prev_pool when available. Each
+                // pipeline acquires its OWN connection from the pool —
+                // since pool size is 1, sibling pipelines that race
+                // concurrently fall through to the legacy open path.
+                // For the typical case (set_prev_snapshot before each
+                // advance), the first pipeline through wins the pool
+                // connection.
+                let prev_pool_ref: Option<&crate::connection_pool::ConnectionPool> =
+                    instance.prev_pool.as_ref();
                 rayon::scope(|s| {
                     for pm in instance.pipelines.iter() {
                         let tx = tx.clone();
@@ -546,6 +581,7 @@ impl RustPipelineManager {
                         let db_path = instance.db_path.as_str();
                         let prev_db_path = prev_db_path_owned.as_str();
                         let changes_ref = &changes;
+                        let prev_pool_inner = prev_pool_ref;
                         s.spawn(move |_| {
                             if cancel.load(Ordering::Relaxed) { return; }
                             // Pitfall 3: AssertUnwindSafe per task. A panic
@@ -554,9 +590,11 @@ impl RustPipelineManager {
                             let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                                 let mut pipeline = pm.lock().unwrap();
                                 // STREAM-04: cancel-aware advance (Task 5/6).
-                                // B11 (Task 1b): pass prev_db_path for cascade-delete reads.
-                                let chunk = crate::advance::advance_persistent_pipeline_with_cancel(
-                                    &mut pipeline, changes_ref, db_path, prev_db_path, &cancel,
+                                // B11/NEW-1: prev_pool routes the read through the
+                                // snapshot-pinned ConnectionPool when available.
+                                let chunk = crate::advance::advance_persistent_pipeline_with_cancel_and_prev(
+                                    &mut pipeline, changes_ref, db_path, prev_db_path,
+                                    prev_pool_inner, &cancel,
                                 );
                                 // STREAM-06 / D-20: filter per-chunk.
                                 let mut filtered = chunk;
@@ -822,9 +860,14 @@ fn advance_instance(instance: &mut PipelineInstance, changes: &[Change]) -> Adva
     // 1. Push changes through IVM operator trees
     // B11 (Task 1b): advance_persistent_pipeline now consumes prev_db_path
     // (descendant SQL reads) alongside db_path (child_row_has_parent reads).
+    // Phase 35 / NEW-1: route through prev_pool when available so the
+    // descendant-reads connection is reused across the entire batch.
+    let prev_pool_ref = instance.prev_pool.as_ref();
     let mut all_row_changes: Vec<RowChange> = instance.pipelines.iter().flat_map(|pm| {
         let mut pipeline = pm.lock().unwrap();
-        advance_persistent_pipeline(&mut pipeline, changes, &instance.db_path, &prev_db_path)
+        crate::advance::advance_persistent_pipeline_with_prev(
+            &mut pipeline, changes, &instance.db_path, &prev_db_path, prev_pool_ref,
+        )
     }).collect();
 
     // 2. Permission table filtering + minRowVersion bump

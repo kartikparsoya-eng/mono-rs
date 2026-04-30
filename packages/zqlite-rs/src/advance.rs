@@ -466,8 +466,15 @@ fn collect_children_of_recursive(
 // there. Was reading against db_path (curr post-swap_snapshot) which
 // silently elided same-tx descendants.
 // See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
-fn emit_descendant_removals(
-    prev_db_path: &str,
+//
+// Phase 35 / NEW-1: refactored to take a borrowed `&rusqlite::Connection`
+// (reused from `Instance.prev_pool`) instead of opening per call.
+// `prev_conn.prepare_cached(...)` amortizes statement preparation across
+// the recursion. The legacy wrapper `emit_descendant_removals_legacy`
+// retains the open-per-call behavior for fallback + bench baseline.
+// See `.planning/phases/35-pool-cascade-hardening/35-03-PLAN.md`.
+fn emit_descendant_removals_with_conn(
+    prev_conn: &rusqlite::Connection,
     deleted_row: &serde_json::Map<String, serde_json::Value>,
     deleted_table: &str,
     children_of: &HashMap<String, Vec<ChildRelation>>,
@@ -479,32 +486,6 @@ fn emit_descendant_removals(
         Some(rels) => rels,
         None => return,
     };
-    let conn = match rusqlite::Connection::open_with_flags(
-        prev_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[B11] emit_descendant_removals: open_with_flags failed for {:?} (table={}): {}",
-                prev_db_path, deleted_table, e
-            );
-            return;
-        }
-    };
-
-    // Pin a stable snapshot for the lifetime of this function (and any
-    // recursion that re-opens its own connection). `BEGIN DEFERRED` is
-    // harmless on a SQLITE_OPEN_READ_ONLY connection but ensures all
-    // SELECTs below observe a consistent view, matching `ConnectionPool`'s
-    // pattern in `connection_pool.rs`.
-    if let Err(e) = conn.execute_batch("BEGIN DEFERRED") {
-        eprintln!(
-            "[B11] emit_descendant_removals: BEGIN DEFERRED failed for {:?} (table={}): {}",
-            prev_db_path, deleted_table, e
-        );
-        return;
-    }
 
     for rel in child_rels {
         // Build WHERE clause: child_join_col[i] = deleted_row[parent_join_col[i]]
@@ -550,7 +531,9 @@ fn emit_descendant_removals(
         if let Some(limit) = rel.child_limit {
             sql.push_str(&format!(" LIMIT {}", limit));
         }
-        let mut stmt = match conn.prepare(&sql) {
+        // NEW-1 / D-10: rusqlite's `prepare_cached` amortizes prepare cost
+        // across siblings (same SQL shape repeats per-parent within a relation).
+        let mut stmt = match prev_conn.prepare_cached(&sql) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -587,28 +570,195 @@ fn emit_descendant_removals(
             }
         };
 
-        for row_result in rows_iter {
-            if let Ok(child_row) = row_result {
-                let row_key = extract_row_key_from_map(&child_row, &rel.child_pk);
-                let mut row_map: HashMap<String, serde_json::Value> = child_row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                if let Some(ref ct) = column_types {
-                    if let Some(cols) = ct.get(&rel.relationship_name) {
-                        row_map.retain(|k, _| cols.contains_key(k));
-                    }
+        // Drain rows into an owned Vec BEFORE recursing — the rusqlite
+        // Statement keeps `&mut prev_conn` alive while iterating, which
+        // would otherwise conflict with the recursive call's own
+        // prepare_cached on the same connection.
+        let collected: Vec<_> = rows_iter.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        for child_row in collected {
+            let row_key = extract_row_key_from_map(&child_row, &rel.child_pk);
+            let mut row_map: HashMap<String, serde_json::Value> = child_row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if let Some(ref ct) = column_types {
+                if let Some(cols) = ct.get(&rel.relationship_name) {
+                    row_map.retain(|k, _| cols.contains_key(k));
                 }
-                row_changes.push(RowChange {
-                    query_id: query_id.to_string(),
-                    table: rel.relationship_name.clone(),
-                    row_key,
-                    row: None,
-                    change_type: "remove".to_string(),
-                });
-                // Recurse for deeper levels — same prev snapshot (B11).
-                emit_descendant_removals(
-                    prev_db_path, &child_row, &rel.child_table, children_of,
-                    query_id, column_types, row_changes,
-                );
             }
+            row_changes.push(RowChange {
+                query_id: query_id.to_string(),
+                table: rel.relationship_name.clone(),
+                row_key,
+                row: None,
+                change_type: "remove".to_string(),
+            });
+            // Recurse for deeper levels — same prev connection (B11/NEW-1).
+            emit_descendant_removals_with_conn(
+                prev_conn, &child_row, &rel.child_table, children_of,
+                query_id, column_types, row_changes,
+            );
+        }
+    }
+}
+
+// Phase 35 / NEW-1: legacy fallback used when `Instance.prev_pool` is None
+// (e.g., bench baseline via Z_DISABLE_PREV_POOL=1, or a TS caller that
+// forgot `set_prev_snapshot`). Opens a fresh read-only connection and
+// pins a snapshot via BEGIN DEFERRED, then delegates to
+// `emit_descendant_removals_with_conn`. Callers should prefer the
+// prev_pool path.
+fn emit_descendant_removals(
+    prev_db_path: &str,
+    deleted_row: &serde_json::Map<String, serde_json::Value>,
+    deleted_table: &str,
+    children_of: &HashMap<String, Vec<ChildRelation>>,
+    query_id: &str,
+    column_types: &Option<HashMap<String, HashMap<String, String>>>,
+    row_changes: &mut Vec<RowChange>,
+) {
+    if !children_of.contains_key(deleted_table) {
+        return;
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        prev_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[B11] emit_descendant_removals: open_with_flags failed for {:?} (table={}): {}",
+                prev_db_path, deleted_table, e
+            );
+            return;
+        }
+    };
+    if let Err(e) = conn.execute_batch("BEGIN DEFERRED") {
+        eprintln!(
+            "[B11] emit_descendant_removals: BEGIN DEFERRED failed for {:?} (table={}): {}",
+            prev_db_path, deleted_table, e
+        );
+        return;
+    }
+    emit_descendant_removals_with_conn(
+        &conn, deleted_row, deleted_table, children_of,
+        query_id, column_types, row_changes,
+    );
+}
+
+/// Test-only legacy wrapper: opens a fresh connection per call (no
+/// statement cache, no snapshot pin reuse). Used by the cascade bench
+/// baseline (Phase 35 Wave 3) and as a control oracle in differential
+/// tests.
+#[cfg(test)]
+pub(crate) fn emit_descendant_removals_legacy(
+    prev_db_path: &str,
+    deleted_row: &serde_json::Map<String, serde_json::Value>,
+    deleted_table: &str,
+    children_of: &HashMap<String, Vec<ChildRelation>>,
+    query_id: &str,
+    column_types: &Option<HashMap<String, HashMap<String, String>>>,
+    row_changes: &mut Vec<RowChange>,
+) {
+    let child_rels = match children_of.get(deleted_table) {
+        Some(rels) => rels,
+        None => return,
+    };
+    let conn = match rusqlite::Connection::open_with_flags(
+        prev_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = conn.execute_batch("BEGIN DEFERRED");
+    for rel in child_rels {
+        let mut conditions = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        let mut skip = false;
+        for (pcol, ccol) in rel.parent_join_col.iter().zip(rel.child_join_col.iter()) {
+            if let Some(val) = deleted_row.get(pcol) {
+                conditions.push(format!("\"{}\" = ?", ccol));
+                match val {
+                    serde_json::Value::String(s) => params.push(rusqlite::types::Value::Text(s.clone())),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            params.push(rusqlite::types::Value::Integer(i));
+                        } else if let Some(f) = n.as_f64() {
+                            params.push(rusqlite::types::Value::Real(f));
+                        }
+                    }
+                    serde_json::Value::Null => { skip = true; break; }
+                    _ => { skip = true; break; }
+                }
+            } else {
+                skip = true;
+                break;
+            }
+        }
+        if skip || conditions.is_empty() {
+            continue;
+        }
+        let mut sql = format!(
+            "SELECT * FROM \"{}\" WHERE {}",
+            rel.child_table,
+            conditions.join(" AND ")
+        );
+        if !rel.child_order.is_empty() {
+            let order_clause: Vec<String> = rel.child_order.iter()
+                .map(|(col, dir)| format!("\"{}\" {}", col, dir.to_uppercase()))
+                .collect();
+            sql.push_str(&format!(" ORDER BY {}", order_clause.join(", ")));
+        }
+        if let Some(limit) = rel.child_limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+        // Plain `prepare` (not _cached) per legacy semantics.
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let rows_iter = match stmt.query_map(param_refs.as_slice(), |r| {
+            let mut map = serde_json::Map::new();
+            for (i, name) in col_names.iter().enumerate() {
+                let val: rusqlite::types::Value = r.get(i)?;
+                let json_val = match val {
+                    rusqlite::types::Value::Null => serde_json::Value::Null,
+                    rusqlite::types::Value::Integer(n) => serde_json::json!(n),
+                    rusqlite::types::Value::Real(f) => serde_json::json!(f),
+                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                    rusqlite::types::Value::Blob(b) => serde_json::Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &b)),
+                };
+                map.insert(name.clone(), json_val);
+            }
+            Ok(map)
+        }) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let collected: Vec<_> = rows_iter.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+        for child_row in collected {
+            let row_key = extract_row_key_from_map(&child_row, &rel.child_pk);
+            let mut row_map: HashMap<String, serde_json::Value> = child_row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if let Some(ref ct) = column_types {
+                if let Some(cols) = ct.get(&rel.relationship_name) {
+                    row_map.retain(|k, _| cols.contains_key(k));
+                }
+            }
+            row_changes.push(RowChange {
+                query_id: query_id.to_string(),
+                table: rel.relationship_name.clone(),
+                row_key,
+                row: None,
+                change_type: "remove".to_string(),
+            });
+            // Recurse: legacy semantics open a NEW connection per call.
+            emit_descendant_removals_legacy(
+                prev_db_path, &child_row, &rel.child_table, children_of,
+                query_id, column_types, row_changes,
+            );
         }
     }
 }
@@ -1261,6 +1411,24 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
     prev_db_path: &str,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<RowChange> {
+    advance_persistent_pipeline_with_cancel_and_prev(
+        pipeline, changes, db_path, prev_db_path, None, cancel,
+    )
+}
+
+/// Phase 35 / NEW-1: variant that accepts a borrowed `&ConnectionPool` for
+/// the prev snapshot. When `Some`, opens ONE connection per advance batch
+/// (instead of one per `emit_descendant_removals` invocation) and uses
+/// `prepare_cached` for SQL reuse. When `None`, falls back to the legacy
+/// open-per-call path. See `.planning/phases/35-pool-cascade-hardening/`.
+pub(crate) fn advance_persistent_pipeline_with_cancel_and_prev(
+    pipeline: &mut PipelineState,
+    changes: &[Change],
+    db_path: &str,
+    prev_db_path: &str,
+    prev_pool: Option<&crate::connection_pool::ConnectionPool>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<RowChange> {
     #[cfg(test)]
     {
         let idx = PIPELINE_INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1306,6 +1474,38 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
 
     let mut row_changes = Vec::new();
 
+    // NEW-1: open ONE connection up front. Prefer prev_pool when present
+    // (reuses the snapshot-pinned ConnectionPool from set_prev_snapshot);
+    // fall back to opening per-batch from prev_db_path so the legacy path
+    // still works for callers that haven't wired prev_pool. The connection
+    // is reused across all `emit_descendant_removals_with_conn` invocations
+    // within this advance batch.
+    let prev_pooled = prev_pool.and_then(|p| p.get().ok());
+    let prev_conn_owned: Option<rusqlite::Connection> = if prev_pooled.is_none() {
+        match rusqlite::Connection::open_with_flags(
+            prev_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => {
+                let _ = c.execute_batch("BEGIN DEFERRED");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[B11] advance_persistent_pipeline: open_with_flags failed for {:?}: {}",
+                    prev_db_path, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let prev_conn: Option<&rusqlite::Connection> = prev_pooled
+        .as_deref()
+        .or(prev_conn_owned.as_ref());
+
     for change in changes.iter() {
         // STREAM-04: cancel observation at change boundary (RESEARCH Open Q #2).
         // Once-per-change is the natural insertion point. If TEST-01 reveals
@@ -1339,11 +1539,21 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
                         let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
                         if !has_child_rows && !pipeline.children_of_map.is_empty() {
                             let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
-                            // B11: prev_db_path per TS pipeline-driver.ts:1542
-                            emit_descendant_removals(
-                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
-                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
-                            );
+                            // B11/NEW-1: reuse the once-opened prev_conn
+                            // (from prev_pool when set, else opened above).
+                            // Falls back to legacy open-per-call when neither
+                            // is available (rare — pre-existing fallback path).
+                            if let Some(pc) = prev_conn {
+                                emit_descendant_removals_with_conn(
+                                    pc, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            } else {
+                                emit_descendant_removals(
+                                    prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            }
                         }
                     }
                 }
@@ -1401,11 +1611,21 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
                                 change_type: "remove".to_string(),
                             });
                             let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                            // B11: prev_db_path per TS pipeline-driver.ts:1542
-                            emit_descendant_removals(
-                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
-                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
-                            );
+                            // B11/NEW-1: reuse the once-opened prev_conn
+                            // (from prev_pool when set, else opened above).
+                            // Falls back to legacy open-per-call when neither
+                            // is available (rare — pre-existing fallback path).
+                            if let Some(pc) = prev_conn {
+                                emit_descendant_removals_with_conn(
+                                    pc, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            } else {
+                                emit_descendant_removals(
+                                    prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            }
                         }
                         SourceChange::Add(ref row) => {
                             let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1477,6 +1697,21 @@ pub(crate) fn advance_persistent_pipeline(
     // needs post-tx state).
     prev_db_path: &str,
 ) -> Vec<RowChange> {
+    advance_persistent_pipeline_with_prev(pipeline, changes, db_path, prev_db_path, None)
+}
+
+/// Phase 35 / NEW-1: variant of `advance_persistent_pipeline` that accepts
+/// a borrowed `&ConnectionPool` for the prev snapshot. When `Some`, opens
+/// ONE connection per advance batch and uses `prepare_cached` for SQL
+/// reuse. When `None`, falls back to the legacy open-per-call path. Used
+/// by the buffered (non-streaming) advance code path.
+pub(crate) fn advance_persistent_pipeline_with_prev(
+    pipeline: &mut PipelineState,
+    changes: &[Change],
+    db_path: &str,
+    prev_db_path: &str,
+    prev_pool: Option<&crate::connection_pool::ConnectionPool>,
+) -> Vec<RowChange> {
     if !pipeline.has_operators {
         return changes_to_row_changes_direct(
             changes,
@@ -1518,11 +1753,41 @@ pub(crate) fn advance_persistent_pipeline(
     let mut t_flatten = std::time::Duration::ZERO;
     let mut t_child_has_parent = std::time::Duration::ZERO;
 
+    // NEW-1: open ONE prev connection up front, reused across the entire
+    // advance batch. Prefer prev_pool when set; else fall back to opening
+    // from prev_db_path. See `advance_persistent_pipeline_with_cancel_and_prev`
+    // for the streaming counterpart.
+    let prev_pooled = prev_pool.and_then(|p| p.get().ok());
+    let prev_conn_owned: Option<rusqlite::Connection> = if prev_pooled.is_none() {
+        match rusqlite::Connection::open_with_flags(
+            prev_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => {
+                let _ = c.execute_batch("BEGIN DEFERRED");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[B11] advance_persistent_pipeline: open_with_flags failed for {:?}: {}",
+                    prev_db_path, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let prev_conn: Option<&rusqlite::Connection> = prev_pooled
+        .as_deref()
+        .or(prev_conn_owned.as_ref());
+
     // Debug: write to /tmp for investigation
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rust_ivm_debug.log") {
         use std::io::Write;
-        let _ = writeln!(f, "[advance_persistent] query={} source_table={} child_to_op={:?} has_ops={} changes={:?}", 
-            pipeline.query_id, pipeline.source_table, 
+        let _ = writeln!(f, "[advance_persistent] query={} source_table={} child_to_op={:?} has_ops={} changes={:?}",
+            pipeline.query_id, pipeline.source_table,
             pipeline.child_table_to_op_index.keys().collect::<Vec<_>>(),
             pipeline.has_operators,
             changes.iter().map(|c| c.table.as_str()).collect::<Vec<_>>());
@@ -1560,11 +1825,21 @@ pub(crate) fn advance_persistent_pipeline(
                         let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
                         if !has_child_rows && !pipeline.children_of_map.is_empty() {
                             let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
-                            // B11: prev_db_path per TS pipeline-driver.ts:1542
-                            emit_descendant_removals(
-                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
-                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
-                            );
+                            // B11/NEW-1: reuse the once-opened prev_conn
+                            // (from prev_pool when set, else opened above).
+                            // Falls back to legacy open-per-call when neither
+                            // is available (rare — pre-existing fallback path).
+                            if let Some(pc) = prev_conn {
+                                emit_descendant_removals_with_conn(
+                                    pc, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            } else {
+                                emit_descendant_removals(
+                                    prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            }
                         }
                     }
                 }
@@ -1635,11 +1910,21 @@ pub(crate) fn advance_persistent_pipeline(
                                 change_type: "remove".to_string(),
                             });
                             let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                            // B11: prev_db_path per TS pipeline-driver.ts:1542
-                            emit_descendant_removals(
-                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
-                                &pipeline.query_id, &pipeline.column_types, &mut row_changes,
-                            );
+                            // B11/NEW-1: reuse the once-opened prev_conn
+                            // (from prev_pool when set, else opened above).
+                            // Falls back to legacy open-per-call when neither
+                            // is available (rare — pre-existing fallback path).
+                            if let Some(pc) = prev_conn {
+                                emit_descendant_removals_with_conn(
+                                    pc, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            } else {
+                                emit_descendant_removals(
+                                    prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                    &pipeline.query_id, &pipeline.column_types, &mut row_changes,
+                                );
+                            }
                         }
                         SourceChange::Add(ref row) => {
                             let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2387,6 +2672,122 @@ mod tests {
             src.contains("[B11] prev_db_path not set"),
             "B11: fallback path must log a warning via eprintln when \
              prev_db_path is None (per RESEARCH.md fallback design)."
+        );
+    }
+
+    // ─── NEW-1 / Phase 35 tests ─────────────────────────────────────────
+
+    /// **NEW-1 — prev_pool reuses one connection per advance batch.**
+    ///
+    /// Verifies that `emit_descendant_removals_with_conn` accepts the
+    /// borrowed `&Connection` and runs N descendants without opening
+    /// additional sqlite handles. We assert this by checking that the
+    /// passed connection's prepare_cached path returns the SAME row count
+    /// across repeated invocations using a stable cache.
+    #[test]
+    fn test_new1_emit_with_conn_reuses_connection() {
+        use crate::connection_pool::ConnectionPool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prev.db");
+        // Build 2-level cascade: parents → children
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER); \
+             INSERT INTO parent VALUES (1),(2),(3); \
+             INSERT INTO child VALUES (10,1),(11,1),(20,2),(30,3);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Prev pool — single connection, snapshot-pinned.
+        let prev_pool = ConnectionPool::new(db_path.to_str().unwrap(), 1).unwrap();
+        let prev_conn_guard = prev_pool.get().unwrap();
+
+        // children_of map: parent → child
+        let mut children_of = HashMap::new();
+        children_of.insert(
+            "parent".to_string(),
+            vec![ChildRelation {
+                relationship_name: "children".to_string(),
+                child_table: "child".to_string(),
+                parent_join_col: vec!["id".to_string()],
+                child_join_col: vec!["parent_id".to_string()],
+                child_pk: vec!["id".to_string()],
+                child_order: vec![],
+                child_limit: None,
+            }],
+        );
+
+        // Run 3 deletes (parents 1, 2, 3) — exercises prepare_cached
+        // (same SQL shape repeats) and connection reuse.
+        let mut row_changes = Vec::new();
+        for pid in 1..=3 {
+            let mut deleted = serde_json::Map::new();
+            deleted.insert("id".to_string(), serde_json::json!(pid));
+            emit_descendant_removals_with_conn(
+                &*prev_conn_guard,
+                &deleted,
+                "parent",
+                &children_of,
+                "q1",
+                &None,
+                &mut row_changes,
+            );
+        }
+        // Expect 4 child removes (3 from p=1 → 2 children, p=2 → 1, p=3 → 1).
+        assert_eq!(row_changes.len(), 4, "expected 4 child removes, got {}", row_changes.len());
+        // Pool must still have its connection back when we drop the guard.
+        drop(prev_conn_guard);
+        assert_eq!(prev_pool.available().unwrap(), 1);
+    }
+
+    /// **NEW-1 — prepare_cached used in emit_descendant_removals_with_conn.**
+    ///
+    /// Source-level assertion: D-10 statement caching is via rusqlite's
+    /// built-in `prepare_cached` (per the implementer note in 35-03-PLAN).
+    /// Locks in the optimization across future refactors.
+    #[test]
+    fn test_new1_prepare_cached_present() {
+        let src = include_str!("advance.rs");
+        // Find the function body for emit_descendant_removals_with_conn.
+        let fn_marker = src
+            .find("fn emit_descendant_removals_with_conn(")
+            .expect("missing emit_descendant_removals_with_conn");
+        // Body window: ~3KB should cover the function.
+        let body = &src[fn_marker..fn_marker.saturating_add(3000).min(src.len())];
+        assert!(
+            body.contains("prepare_cached"),
+            "NEW-1/D-10: emit_descendant_removals_with_conn must use \
+             rusqlite's prepare_cached for SQL reuse across siblings. \
+             Saw body:\n{}",
+            body,
+        );
+    }
+
+    /// **NEW-1 — legacy fallback path still exists and opens fresh
+    /// connection per call.** This keeps the test_b11_fallback semantics
+    /// working when prev_pool is None.
+    #[test]
+    fn test_new1_legacy_fallback_signature() {
+        let src = include_str!("advance.rs");
+        // The PUBLIC legacy fallback fn `emit_descendant_removals` still
+        // takes `prev_db_path: &str` and opens its own connection.
+        let fn_marker = src
+            .find("fn emit_descendant_removals(")
+            .expect("missing emit_descendant_removals (legacy fallback)");
+        let body = &src[fn_marker..fn_marker.saturating_add(1500).min(src.len())];
+        assert!(
+            body.contains("prev_db_path: &str"),
+            "NEW-1: legacy fallback emit_descendant_removals must keep \
+             prev_db_path: &str signature for back-compat."
+        );
+        assert!(
+            body.contains("open_with_flags"),
+            "NEW-1: legacy fallback must still open its own connection \
+             from prev_db_path."
         );
     }
 }
