@@ -57,6 +57,16 @@ pub struct CompanionCondition {
 /// A single pipeline instance (corresponds to one PipelineDriver / client group).
 struct PipelineInstance {
     db_path: String,
+    // B11: prev snapshot path for cascade-delete enumeration. Set by TS
+    // pipeline-driver.ts BEFORE swap_snapshot on each advance. Mirrors
+    // TS pipeline-driver.ts:1542-1577 diff-from-prev lifecycle: TS
+    // materializes the snapshotter diff against `prev`; Rust must read
+    // descendants from the same snapshot (where same-tx-deleted rows
+    // still exist) — not the post-swap `curr` snapshot.
+    // None until first set_prev_snapshot call; fallback to db_path with
+    // logged warning preserves back-compat. See
+    // .planning/IVM-PORT-AUDIT-DEEP.md §B11.
+    prev_db_path: Option<String>,
     pipelines: Vec<Mutex<PipelineState>>,
     shared_pool: ConnectionPool,
     /// Schema info for diffing — maps table name → TableAndZqlSpec
@@ -100,6 +110,11 @@ impl RustPipelineManager {
 
         let instance = PipelineInstance {
             db_path,
+            // B11: initialized None; TS pipeline-driver.ts is expected to
+            // call set_prev_snapshot before each advance after swap_snapshot.
+            // If never called, advance falls back to db_path with a logged
+            // warning (back-compat path).
+            prev_db_path: None,
             pipelines: Vec::new(),
             shared_pool,
             syncable_tables: HashMap::new(),
@@ -278,6 +293,33 @@ impl RustPipelineManager {
         Ok(Buffer::from(encode_advance_result_buf(&result)))
     }
 
+    /// Set the path of the snapshot whose state should be queried for
+    /// cascade-delete enumeration. Must be called BEFORE swap_snapshot
+    /// on each advance. Mirrors TS pipeline-driver.ts:1542-1577 — TS
+    /// owns the prev/curr snapshot pair via the snapshotter diff iterator;
+    /// Rust must read descendant rows from prev (where they still exist),
+    /// not curr (post-swap; same-tx deletes already gone).
+    ///
+    /// Per CONTEXT D-17 / D-15 — B11 BLOCKING fix.
+    ///
+    /// Idempotent: calling multiple times before swap_snapshot is safe.
+    /// If never called, advance falls back to db_path with a warning;
+    /// fallback exists for back-compat with any non-mono-rs caller.
+    ///
+    /// CLAUDE.md gate #4: this is an ADDITIVE napi method — no signature
+    /// change to existing buffered methods (advance, advance_async,
+    /// hydrate*, addQuery*, addQueries*).
+    #[napi]
+    pub fn set_prev_snapshot(&self, id: String, prev_db_path: String) -> napi::Result<()> {
+        let instances = self.instances.read()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        let instance_mutex = instances.get(&id)
+            .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
+        let mut instance = instance_mutex.lock().unwrap();
+        instance.prev_db_path = Some(prev_db_path);
+        Ok(())
+    }
+
     /// Re-open SQLite connections at a new path without rebuilding operator trees.
     #[napi]
     pub fn swap_snapshot(&self, id: String, new_db_path: String) -> napi::Result<()> {
@@ -440,6 +482,23 @@ impl RustPipelineManager {
                         return;
                     }
                 };
+
+                // B11: resolve prev_db_path once per advance, before fan-out.
+                // TS pipeline-driver.ts:1542-1577 calls set_prev_snapshot(prev)
+                // BEFORE swap_snapshot(curr); we read it here. Fallback to
+                // db_path with a logged warning preserves back-compat.
+                // Resolved in Task 1a; threaded into advance_persistent_pipeline
+                // in Task 1b.
+                let prev_db_path_owned: String = instance.prev_db_path.clone()
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "[B11] prev_db_path not set (streaming); falling back to db_path — \
+                             same-tx descendant deletes may be elided. \
+                             See .planning/IVM-PORT-AUDIT-DEEP.md §B11."
+                        );
+                        instance.db_path.clone()
+                    });
+                let _ = &prev_db_path_owned; // Task 1a placeholder — Task 1b consumes.
 
                 rayon::scope(|s| {
                     for pm in instance.pipelines.iter() {
@@ -692,6 +751,23 @@ fn advance_instance(instance: &PipelineInstance, changes: &[Change]) -> AdvanceR
     if changes.is_empty() {
         return AdvanceResult { changes: vec![], error: None, error_type: None, reset_signal: None };
     }
+
+    // B11: resolve prev_db_path for cascade-delete enumeration. TS
+    // pipeline-driver.ts:1542-1577 calls set_prev_snapshot(prev) BEFORE
+    // swap_snapshot(curr); we read it here. Fallback to db_path with a
+    // logged warning preserves back-compat for callers that don't yet
+    // wire setPrevSnapshot. Resolved here in Task 1a; threaded into
+    // advance_persistent_pipeline in Task 1b.
+    let prev_db_path = instance.prev_db_path.clone()
+        .unwrap_or_else(|| {
+            eprintln!(
+                "[B11] prev_db_path not set; falling back to db_path — \
+                 same-tx descendant deletes may be elided. \
+                 See .planning/IVM-PORT-AUDIT-DEEP.md §B11."
+            );
+            instance.db_path.clone()
+        });
+    let _ = &prev_db_path; // Task 1a placeholder — Task 1b consumes this.
 
     // 1. Push changes through IVM operator trees
     let mut all_row_changes: Vec<RowChange> = instance.pipelines.iter().flat_map(|pm| {
