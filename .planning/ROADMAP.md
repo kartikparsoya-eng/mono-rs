@@ -23,7 +23,7 @@ Make v4.0's rayon parallelism investment visible to clients as reduced time-to-f
 - [x] **Phase 31: Rust Streaming Primitives + TS Wrappers** — Additive Rust napi streaming methods + TS PipelineDriver wrappers + decoder; no consumer migrated yet. (completed 2026-04-29)
 - [x] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete. (completed 2026-04-29)
 - [x] **Phase 33: Production Hardening + Benchmarks** — TS↔Rust parity wiring (dualExecCompare via lifted TS oracle), OrExists test breadth, bounded channel test, TTFB benchmark, memory peak measurement. (completed 2026-04-29)
-- [ ] **Phase 34: Differential Fuzz + Schema Extension** — Random-AST fuzz vs TS oracle; rich-type schema (jsonb, timestamptz, numeric, NULL semantics) for type-coercion coverage.
+- [x] **Phase 34: Differential Fuzz + Schema Extension** — Random-AST fuzz vs TS oracle; rich-type schema (jsonb, timestamptz, numeric, NULL semantics) for type-coercion coverage. (completed 2026-04-30)
 
 ---
 
@@ -151,7 +151,7 @@ Plans:
 3. Any divergence found by the fuzzer becomes a regression test in the appropriate `*_op.rs` or `pipeline-driver.*.test.ts` before being fixed, so it can never regress silently.
 4. Full vitest + `cargo test` suites continue to pass; new fuzz runs at 1k iterations in <2 minutes (fits CI budget).
 
-**Plans:** 6/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 
@@ -161,7 +161,7 @@ Plans:
 - [x] 34-04-PLAN.md — FUZZ-02 schema extension: events/big_id_records/event_tags + jsonb/timestamptz/numeric/bigint + NULL/i64/DST/jsonb fixtures + MUTATIONS additions (Wave 1, parallel)
 - [x] 34-05-PLAN.md — Track 2 B3 (Take partition_key threading — headline fix; closes original Risk #1 simultaneously) + B3 differential test (Wave 2, depends on 34-02)
 - [x] 34-06-PLAN.md — Track 2 B11 (cascade-delete prev snapshot via additive set_prev_snapshot napi method) + TS wiring + B11 differential test (Wave 2, depends on 34-02)
-- [ ] 34-07-PLAN.md — Verification gate: 1k fast-check fuzz <2min, Phase 33 bench re-run, npm test integration, PARITY_STATUS update, D-21 sub-condition sign-off (Wave 3)
+- [x] 34-07-PLAN.md — Verification gate: 1k fast-check fuzz <2min, Phase 33 bench re-run, npm test integration, PARITY_STATUS update, D-21 sub-condition sign-off (Wave 3)
 
 ---
 
@@ -173,7 +173,7 @@ Plans:
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
 | 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
 | 33. Production Hardening + Benchmarks       | 3/3            | Complete    | 2026-04-29 |
-| 34. Differential Fuzz + Schema Extension    | 6/7 | In Progress|  |
+| 34. Differential Fuzz + Schema Extension    | 7/7 | Complete   | 2026-04-30 |
 
 ---
 
