@@ -173,7 +173,7 @@ Plans:
 | 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
 | 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
 | 33. Production Hardening + Benchmarks       | 3/3            | Complete    | 2026-04-29 |
-| 34. Differential Fuzz + Schema Extension    | 7/7 | Complete   | 2026-04-30 |
+| 34. Differential Fuzz + Schema Extension    | 7/7 | Complete    | 2026-04-30 |
 
 ---
 

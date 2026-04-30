@@ -65,8 +65,8 @@
 
 ### Differential Fuzz + Schema Extension (Phase 34)
 
-- [ ] **FUZZ-01**: Random-AST differential fuzz against TS oracle. New `random-ast-parity.fuzz.test.ts` (or `tools/ivm-parity/` test) uses `fast-check` to generate random ASTs across the full operator surface (filter, join, exists, or-exists, take, cap) and asserts TS↔Rust IVM produce identical result sets. `FUZZ_NUM_RUNS=1000` default. Any divergence becomes a regression test before being fixed.
-- [ ] **FUZZ-02**: Schema-extension — fuzz harness's schema gains rich production-relevant types: `jsonb`, `timestamptz`, `numeric`, nullable variants, at least one composite/array column. Tests cover NULL semantics (NULL ≠ NULL in equality, NULL propagation, NULL in JOIN keys) and type coercion (string→number, numeric precision, date/time round-trips).
+- [x] **FUZZ-01**: Random-AST differential fuzz against TS oracle. New `random-ast-parity.fuzz.test.ts` (or `tools/ivm-parity/` test) uses `fast-check` to generate random ASTs across the full operator surface (filter, join, exists, or-exists, take, cap) and asserts TS↔Rust IVM produce identical result sets. `FUZZ_NUM_RUNS=1000` default. Any divergence becomes a regression test before being fixed.
+- [x] **FUZZ-02**: Schema-extension — fuzz harness's schema gains rich production-relevant types: `jsonb`, `timestamptz`, `numeric`, nullable variants, at least one composite/array column. Tests cover NULL semantics (NULL ≠ NULL in equality, NULL propagation, NULL in JOIN keys) and type coercion (string→number, numeric precision, date/time round-trips).
 
 ### Audit Bug Fixes (from `.planning/IVM-PORT-AUDIT.md`)
 
