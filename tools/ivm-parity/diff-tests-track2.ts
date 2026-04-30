@@ -1,7 +1,8 @@
 /**
- * Phase 34 Plans 02 + 05 — Differential tests for Track 2 fixes B1 + B2 + B3.
+ * Phase 34 Plans 02 + 05 + 06 — Differential tests for Track 2 fixes
+ * B1 + B2 + B3 + B11.
  *
- * Runs four focused AST shapes through the TS (port 4858) and RS (port 4868)
+ * Runs five focused AST shapes through the TS (port 4858) and RS (port 4868)
  * zero-cache instances and asserts byte-equal hydration payloads.
  *
  * Shapes:
@@ -21,6 +22,15 @@
  *     child mutations because fetch and push state keys differed. Post-fix
  *     plan 34-05 threads `correlation.childField` so both paths agree
  *     (TS builder.ts:626-632 + take.ts:710-757).
+ *   - **B11 (cascade-delete on multi-table tx):**
+ *     `channels.related(conversations.related(messages))` — verifies that
+ *     when a parent channel is deleted in a single PG transaction together
+ *     with its conversations and messages, BOTH caches emit identical
+ *     descendant Remove row-changes. Pre-fix Rust read descendants from
+ *     curr (post-swap_snapshot, descendants already gone) and silently
+ *     elided them. Post-fix plan 34-06 reads from prev (where same-tx
+ *     deletes are still present). See
+ *     .planning/phases/34-differential-fuzz-schema-extension/34-RESEARCH.md §B11.
  *
  * Per CONTEXT D-17 (TS-as-spec) and D-18 (no regressions): this script is the
  * second leg of the no-regressions mandate alongside the Rust unit tests in
@@ -406,6 +416,45 @@ const b2Ast: AST = {
   },
 } as unknown as AST;
 
+// B11 differential test — verifies cascade-delete on a multi-table
+// transaction emits descendant Remove row-changes from BOTH caches.
+// Pre-fix Rust read descendants from curr (post-swap_snapshot,
+// descendants already gone) and silently elided them. Post-fix
+// reads from prev (where same-tx-deleted rows still exist).
+//
+// Shape: `channels.related(conversations.related(messages))` — three-level
+// chain so the recursive descendant walk in emit_descendant_removals is
+// exercised end-to-end.
+//
+// See .planning/phases/34-differential-fuzz-schema-extension/34-RESEARCH.md §B11.
+const b11Ast: AST = {
+  table: 'channels',
+  orderBy: [['id', 'asc']],
+  related: [
+    {
+      correlation: {parentField: ['id'], childField: ['channelId']},
+      subquery: {
+        table: 'conversations',
+        alias: 'b11_conv',
+        orderBy: [['id', 'asc']],
+        related: [
+          {
+            correlation: {
+              parentField: ['id'],
+              childField: ['conversationId'],
+            },
+            subquery: {
+              table: 'messages',
+              alias: 'b11_msg',
+              orderBy: [['id', 'asc']],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as AST;
+
 // ---------------------------------------------------------------------------
 // Main.
 // ---------------------------------------------------------------------------
@@ -413,7 +462,7 @@ async function main() {
   const failures: string[] = [];
   const clientSchema = buildClientSchema();
 
-  process.stdout.write('Track 2 differential tests — B1 + B2 + B3\n');
+  process.stdout.write('Track 2 differential tests — B1 + B2 + B3 + B11\n');
   process.stdout.write(`  TS_URL: ${TS_URL}\n`);
   process.stdout.write(`  RS_URL: ${RS_URL}\n`);
   process.stdout.write(`  PG_URL: ${PG_URL}\n\n`);
@@ -421,7 +470,7 @@ async function main() {
   // -------------------------------------------------------------------------
   // B1: Skip + EXISTS — verifies post-fix ordering matches TS.
   // -------------------------------------------------------------------------
-  process.stdout.write('[1/4] B1 (b1-skip-exists): hydrate ');
+  process.stdout.write('[1/5] B1 (b1-skip-exists): hydrate ');
   try {
     const r = await diffTest('b1-skip-exists', b1Ast, clientSchema);
     if (!r.ok) {
@@ -443,7 +492,7 @@ async function main() {
   // B2: OR(simple, EXISTS) hydrate — verifies parent_sizes cache holds REAL
   // count for or_predicate-positive empty-children parents.
   // -------------------------------------------------------------------------
-  process.stdout.write('[2/4] B2 (b2-or-exists-hydrate): hydrate ');
+  process.stdout.write('[2/5] B2 (b2-or-exists-hydrate): hydrate ');
   try {
     const r = await diffTest('b2-or-exists-hydrate', b2Ast, clientSchema);
     if (!r.ok) {
@@ -474,9 +523,9 @@ async function main() {
   // that extends this script.
   // -------------------------------------------------------------------------
   if (skipMutation) {
-    process.stdout.write('[3/4] B2 push: SKIPPED (--skip-mutation)\n');
+    process.stdout.write('[3/5] B2 push: SKIPPED (--skip-mutation)\n');
   } else {
-    process.stdout.write('[3/4] B2 push (b2-or-exists-mutation): ');
+    process.stdout.write('[3/5] B2 push (b2-or-exists-mutation): ');
     let sql: ReturnType<typeof postgres> | undefined;
     try {
       sql = postgres(PG_URL);
@@ -539,10 +588,10 @@ async function main() {
   // Restored in finally{} regardless of test outcome.
   // -------------------------------------------------------------------------
   if (skipMutation) {
-    process.stdout.write('[4/4] B3 push: SKIPPED (--skip-mutation)\n');
+    process.stdout.write('[4/5] B3 push: SKIPPED (--skip-mutation)\n');
   } else {
     process.stdout.write(
-      '[4/4] B3 push (b3-related-limit-child-mutation): ',
+      '[4/5] B3 push (b3-related-limit-child-mutation): ',
     );
     let sql: ReturnType<typeof postgres> | undefined;
     let originalBody: string | null = null;
@@ -656,10 +705,179 @@ async function main() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // B11: cascade-delete on multi-table transaction.
+  //
+  // Inserts a temp channel + 2 conversations + 4 messages, hydrates baseline
+  // on both caches, then DELETEs all 7 rows in a single PG transaction
+  // (messages → conversations → channel order — schema has no FK CASCADE
+  // per schema.sql:9-40, so the explicit ordered DELETE drives the same
+  // single-tx cascade pattern as a real cascade-delete-enabled schema).
+  //
+  // Pre-fix Rust would silently elide the descendant Removes (read against
+  // curr post-swap_snapshot, descendants already gone). Post-fix matches
+  // TS exactly — the descendants are emitted from the prev snapshot.
+  //
+  // The test asserts BYTE-EQUAL hash on the post-mutation hydration: TS
+  // and RS must produce the same set of remaining channels (the temp
+  // channel + its descendants are all gone from both). A truly broken
+  // Rust would diverge from TS in the per-poke row-changes stream — we
+  // can't capture that without harness-advance-coverage.ts integration,
+  // so the hash-equality is the same pattern as B2/B3 push.
+  //
+  // RESTORE: cleanup re-deletes (no-op if already deleted) and silently
+  // tolerates any leftover state. The test channel id is keyed by Date.now()
+  // so concurrent runs don't collide.
+  //
+  // Per SKILL.md hard rule 2 (no baseline seed modification): all rows
+  // are inserted at test start and removed at test end; baseline seed.sql
+  // is NOT modified.
+  //
+  // Spec: TS pipeline-driver.ts:1542-1577.
+  // See .planning/phases/34-differential-fuzz-schema-extension/34-RESEARCH.md §B11.
+  // -------------------------------------------------------------------------
+  if (skipMutation) {
+    process.stdout.write('[5/5] B11 cascade-delete: SKIPPED (--skip-mutation)\n');
+  } else {
+    process.stdout.write(
+      '[5/5] B11 cascade-delete (b11-cascade-multi-table-tx): ',
+    );
+    let sql: ReturnType<typeof postgres> | undefined;
+    const stamp = Date.now();
+    const channelId = `b11-ch-${stamp}`;
+    const convIds = [`b11-co-1-${stamp}`, `b11-co-2-${stamp}`];
+    const msgIds = [
+      `b11-m-1-${stamp}`,
+      `b11-m-2-${stamp}`,
+      `b11-m-3-${stamp}`,
+      `b11-m-4-${stamp}`,
+    ];
+    let inserted = false;
+    try {
+      sql = postgres(PG_URL);
+
+      // Insert the temp rows: 1 channel → 2 conversations → 4 messages.
+      // u1 must exist in seed.sql:14 — we use it as authorId.
+      await sql.begin(async tx => {
+        await tx`INSERT INTO channels (id, name, visibility) VALUES
+          (${channelId}, 'b11-test', 'public')`;
+        await tx`INSERT INTO conversations (id, "channelId", title, "createdAt") VALUES
+          (${convIds[0]}, ${channelId}, 'b11 c1', 90000),
+          (${convIds[1]}, ${channelId}, 'b11 c2', 90001)`;
+        await tx`INSERT INTO messages
+          (id, "conversationId", "authorId", body, "createdAt", "visibleTo") VALUES
+          (${msgIds[0]}, ${convIds[0]}, 'u1', 'b11-m1', 90100, NULL),
+          (${msgIds[1]}, ${convIds[0]}, 'u1', 'b11-m2', 90101, NULL),
+          (${msgIds[2]}, ${convIds[1]}, 'u1', 'b11-m3', 90200, NULL),
+          (${msgIds[3]}, ${convIds[1]}, 'u1', 'b11-m4', 90201, NULL)`;
+      });
+      inserted = true;
+      // Wait for replicators on both caches to pick up the inserts.
+      await new Promise(r => setTimeout(r, POKE_QUIESCE_MS));
+
+      // Baseline hydrate: confirm the temp rows reach both caches and TS↔RS
+      // agree before the cascade-delete. If they diverge here, the cascade
+      // signal is meaningless.
+      const before = await diffTest(
+        'b11-cascade-baseline',
+        b11Ast,
+        clientSchema,
+      );
+      if (!before.ok) {
+        process.stdout.write('FAIL (baseline diverges)\n');
+        failures.push(`B11 baseline diverges:\n${before.diff}`);
+        if (verbose) {
+          process.stdout.write(`  ts: ${JSON.stringify(before.tsRows)}\n`);
+          process.stdout.write(`  rs: ${JSON.stringify(before.rsRows)}\n`);
+        }
+      } else {
+        // Multi-table transaction: messages → conversations → channels
+        // (FK ordering — schema.sql has no CASCADE; ordered DELETE drives
+        // the same single-tx semantics).
+        await sql.begin(async tx => {
+          await tx`DELETE FROM messages WHERE "conversationId" IN (${convIds[0]}, ${convIds[1]})`;
+          await tx`DELETE FROM conversations WHERE "channelId" = ${channelId}`;
+          await tx`DELETE FROM channels WHERE id = ${channelId}`;
+        });
+        // Mark not-inserted so cleanup doesn't try to re-delete inside finally.
+        inserted = false;
+        await new Promise(r => setTimeout(r, POKE_QUIESCE_MS));
+
+        // Re-hydrate: TS and RS must converge to the SAME post-cascade
+        // state. summarizeDiff catches any per-table key+value drift.
+        const after = await diffTest(
+          'b11-cascade-after',
+          b11Ast,
+          clientSchema,
+        );
+        if (!after.ok) {
+          process.stdout.write('FAIL\n');
+          failures.push(
+            `B11 cascade-delete diverges:\n${after.diff}\n` +
+              `  This is the headline B11 signal — descendants in same-tx ` +
+              `delete were elided in one cache. Verify Rust ` +
+              `emit_descendant_removals reads from prev_db_path (Plan 34-06).`,
+          );
+          if (verbose) {
+            process.stdout.write(`  ts: ${JSON.stringify(after.tsRows)}\n`);
+            process.stdout.write(`  rs: ${JSON.stringify(after.rsRows)}\n`);
+          }
+        } else {
+          // Sanity: the deleted channel must NOT appear in either payload.
+          const tsChans = (after.tsRows.channels ?? {}) as Record<
+            string,
+            Record<string, unknown>
+          >;
+          const rsChans = (after.rsRows.channels ?? {}) as Record<
+            string,
+            Record<string, unknown>
+          >;
+          const tsHas = Object.values(tsChans).some(c => c.id === channelId);
+          const rsHas = Object.values(rsChans).some(c => c.id === channelId);
+          if (tsHas || rsHas) {
+            process.stdout.write('FAIL (channel still present)\n');
+            failures.push(
+              `B11 sanity: ${channelId} still in ts=${tsHas} rs=${rsHas} ` +
+                `post-cascade. Replicator may not be in sync; bump ` +
+                `POKE_QUIESCE_MS.`,
+            );
+          } else {
+            process.stdout.write(
+              `OK (${rowCount(after.tsRows)} rows after cascade)\n`,
+            );
+          }
+        }
+      }
+    } catch (e) {
+      process.stdout.write('ERROR\n');
+      failures.push(`B11 cascade-delete threw: ${(e as Error).message}`);
+    } finally {
+      // Cleanup: re-attempt deletion (no-op if cascade-delete already ran)
+      // so subsequent runs are deterministic and SKILL.md hard rule 2
+      // (additive only) is preserved.
+      if (sql && inserted) {
+        try {
+          await sql.begin(async tx => {
+            await tx`DELETE FROM messages WHERE "conversationId" IN (${convIds[0]}, ${convIds[1]})`;
+            await tx`DELETE FROM conversations WHERE "channelId" = ${channelId}`;
+            await tx`DELETE FROM channels WHERE id = ${channelId}`;
+          });
+          await new Promise(r => setTimeout(r, POKE_QUIESCE_MS));
+        } catch (e) {
+          process.stderr.write(
+            `WARNING: B11 cleanup failed for ${channelId} — ` +
+              `manual fix may be needed. (${(e as Error).message})\n`,
+          );
+        }
+      }
+      if (sql) await sql.end({timeout: 2});
+    }
+  }
+
   process.stdout.write('\n');
   if (failures.length === 0) {
     process.stdout.write(
-      'OK: Track 2 differential tests pass (B1 + B2 hydrate + B2 push + B3 push)\n',
+      'OK: Track 2 differential tests pass (B1 + B2 hydrate + B2 push + B3 push + B11 cascade)\n',
     );
     process.exit(0);
   }
