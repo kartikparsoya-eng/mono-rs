@@ -484,8 +484,27 @@ fn emit_descendant_removals(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!(
+                "[B11] emit_descendant_removals: open_with_flags failed for {:?} (table={}): {}",
+                prev_db_path, deleted_table, e
+            );
+            return;
+        }
     };
+
+    // Pin a stable snapshot for the lifetime of this function (and any
+    // recursion that re-opens its own connection). `BEGIN DEFERRED` is
+    // harmless on a SQLITE_OPEN_READ_ONLY connection but ensures all
+    // SELECTs below observe a consistent view, matching `ConnectionPool`'s
+    // pattern in `connection_pool.rs`.
+    if let Err(e) = conn.execute_batch("BEGIN DEFERRED") {
+        eprintln!(
+            "[B11] emit_descendant_removals: BEGIN DEFERRED failed for {:?} (table={}): {}",
+            prev_db_path, deleted_table, e
+        );
+        return;
+    }
 
     for rel in child_rels {
         // Build WHERE clause: child_join_col[i] = deleted_row[parent_join_col[i]]
@@ -533,7 +552,13 @@ fn emit_descendant_removals(
         }
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "[B11] emit_descendant_removals: prepare failed for table={} sql={:?}: {}",
+                    rel.child_table, sql, e
+                );
+                continue;
+            }
         };
         let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
@@ -553,7 +578,13 @@ fn emit_descendant_removals(
             Ok(map)
         }) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "[B11] emit_descendant_removals: query_map failed for table={}: {}",
+                    rel.child_table, e
+                );
+                continue;
+            }
         };
 
         for row_result in rows_iter {
