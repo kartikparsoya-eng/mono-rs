@@ -47,12 +47,12 @@ import {
   type DecodedRowChange,
 } from './decode-advance-buf.ts';
 import {compareChanges, materializeChanges} from './dual-executor.ts';
-import {createRustExistsWrapper} from './rust-exists.ts';
 import {
   tsAdvance,
   tsAddQueryAll,
   type TsOracleContext,
 } from './pipeline-driver-ts-oracle.ts';
+import {createRustExistsWrapper} from './rust-exists.ts';
 
 // ===== HARDEN-01 (Phase 33-01): parity check shim (env-gated) =====
 //
@@ -349,7 +349,7 @@ import {
   ZERO_VERSION_COLUMN_NAME,
 } from '../replicator/schema/replication-state.ts';
 import {checkClientSchema} from './client-schema.ts';
-import type {Snapshotter} from './snapshotter.ts';
+import type {SnapshotDiff, Snapshotter} from './snapshotter.ts';
 import {ResetPipelinesSignal} from './snapshotter.ts';
 
 type RowOp<Op extends Omit<ChangeType, ChangeType.CHILD>> = {
@@ -1477,6 +1477,21 @@ export class PipelineDriver {
   ): AsyncIterable<RowChange | 'yield' | 'chunk-end'> {
     let lastTotalElapsed = 0;
 
+    // HARDEN-01 streaming wire: parity-check on the streaming hot path.
+    // Cost paid only when shouldRunParityCheck() returns true (sample
+    // cadence) — the gate at end-of-generator avoids per-row branch
+    // overhead. Production output is the streamed Rust array;
+    // #maybeRunParityCheck returns void by design (P-07 anti-pattern
+    // avoided — never substitute TS for production).
+    //
+    // Parity check fires AFTER the consumer drains the AsyncIterable so
+    // streaming benefit is preserved (consumer sees first chunk before
+    // oracle runs). If the consumer breaks early via `return`, the
+    // parity check is skipped — comparing partials would falsely
+    // diverge.
+    const rustHydrateChangesForParity: RowChange[] | undefined =
+      this.#parityCheckMode !== 'off' ? [] : undefined;
+
     // Per-query bookkeeping helper (mirror of addQueriesAsync's per-query
     // tail-end work). Runs after each query's main result set + companion
     // rows have been yielded.
@@ -1648,6 +1663,13 @@ export class PipelineDriver {
           changes,
           permTables.size > 0 ? permTables : undefined,
         )) {
+          // HARDEN-01 streaming wire: accumulate Rust-eligible changes
+          // for end-of-generator parity comparison. Skip 'yield'/'chunk-end'
+          // sentinels (cross-references the buffered site at
+          // addQueriesAsync ~L1247).
+          if (rustHydrateChangesForParity && change !== 'yield') {
+            rustHydrateChangesForParity.push(change as RowChange);
+          }
           yield change;
         }
         for (const {table, row} of p.companionRows) {
@@ -1666,6 +1688,40 @@ export class PipelineDriver {
       } finally {
         this.#hydrateContext = null;
       }
+    }
+
+    // HARDEN-01 streaming wire: fire parity check after all Rust-eligible
+    // streaming hydrate output has been consumed. Mirrors the buffered
+    // `addQueriesAsync` site (~L1247) byte-for-byte aside from where the
+    // Rust-side accumulator comes from. (DRY by extraction is tempting
+    // but adds risk; copy-paste is safer pending a follow-up consolidation.)
+    if (rustHydrateChangesForParity) {
+      const rustEligiblePrepared = prepared.filter(p => p.rustEligible);
+      await this.#maybeRunParityCheck(
+        'hydrate',
+        rustHydrateChangesForParity,
+        // oxlint-disable-next-line require-await
+        async () => {
+          const out: RowChange[] = [];
+          const ctx = this.#oracleCtx();
+          const eligibleQueries = rustEligiblePrepared.map(p => ({
+            transformationHash: p.transformationHash,
+            queryID: p.queryID,
+            resolvedQuery: p.resolvedQuery,
+          }));
+          // Re-establish hydrate context for the TS oracle's #fetch path
+          // (cleared at end of Phase 3c above).
+          this.#hydrateContext = {timer};
+          try {
+            for (const c of tsAddQueryAll(ctx, eligibleQueries, timer)) {
+              if (c !== 'yield') out.push(c);
+            }
+          } finally {
+            this.#hydrateContext = null;
+          }
+          return out;
+        },
+      );
     }
   }
 
@@ -2113,11 +2169,68 @@ export class PipelineDriver {
       JSON.stringify(collectedChanges),
     );
 
+    // HARDEN-01 streaming wire: parity-check on the streaming hot path.
+    // Cost paid only when shouldRunParityCheck() returns true. Production
+    // output is the streamed Rust array; #maybeRunParityCheck returns
+    // void by design (P-07 anti-pattern avoided — never substitute TS
+    // for production).
+    //
+    // Parity check fires AFTER the consumer drains the AsyncIterable so
+    // streaming benefit is preserved (consumer sees first chunk before
+    // oracle runs). Errored or `return()`-cancelled streams skip the
+    // parity check (comparing partials would falsely diverge).
+    const innerStream = this.#streamChanges(stream, timer, numChanges);
+    const teedChanges =
+      this.#parityCheckMode !== 'off'
+        ? this.#streamChangesWithParity(innerStream, timer, numChanges, diff)
+        : innerStream;
+
     return {
       version: curr.version,
       numChanges,
-      changes: this.#streamChanges(stream, timer, numChanges),
+      changes: teedChanges,
     };
+  }
+
+  /**
+   * HARDEN-01 teeing wrapper around {@link #streamChanges}. Re-yields each
+   * item from the inner stream verbatim while accumulating non-sentinel
+   * RowChange values into a local array for end-of-stream parity
+   * comparison. Errors and consumer cancellation propagate without
+   * triggering the parity check (comparing partials would falsely
+   * diverge). Only natural completion fires the comparison.
+   */
+  async *#streamChangesWithParity(
+    inner: AsyncIterable<RowChange | 'yield' | 'chunk-end'>,
+    timer: Timer,
+    numChanges: number,
+    diff: SnapshotDiff,
+  ): AsyncIterable<RowChange | 'yield' | 'chunk-end'> {
+    const accumulated: RowChange[] = [];
+    let completed = false;
+    try {
+      for await (const item of inner) {
+        if (item !== 'yield' && item !== 'chunk-end') {
+          accumulated.push(item);
+        }
+        yield item;
+      }
+      completed = true;
+    } finally {
+      // Only run parity on natural completion — error/cancel paths skip
+      // (partial streams would diverge by definition).
+      if (completed) {
+        await this.#maybeRunParityCheck(
+          'advance',
+          accumulated,
+          // oxlint-disable-next-line require-await
+          async () =>
+            materializeChanges(
+              tsAdvance(this.#oracleCtx(), diff, timer, numChanges),
+            ),
+        );
+      }
+    }
   }
 
   /**

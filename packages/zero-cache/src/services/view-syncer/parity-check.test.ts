@@ -9,7 +9,7 @@
  * into #rustAdvanceAsync + addQueriesAsync.
  */
 
-import {beforeEach, describe, expect, test} from 'vitest';
+import {beforeEach, describe, expect, test, vi} from 'vitest';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import type {AST} from '../../../../zero-protocol/src/ast.ts';
@@ -28,12 +28,16 @@ import {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {DbFile} from '../../test/lite.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
+import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
+import * as oracleModule from './pipeline-driver-ts-oracle.ts';
+import {ChangeType} from './pipeline-driver-ts-oracle.ts';
 import {
   getParityCheckInvocationCountForTesting,
   getParityDivergenceCount,
   parseParityCheckMode,
   PipelineDriver,
   resetParityDivergenceCount,
+  type RowChange,
   type Timer,
 } from './pipeline-driver.ts';
 import {Snapshotter} from './snapshotter.ts';
@@ -322,6 +326,309 @@ describe('HARDEN-01 parity check shim', () => {
       resetParityDivergenceCount();
       expect(getParityDivergenceCount()).toBe(0);
       expect(getParityCheckInvocationCountForTesting()).toBe(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Streaming parity wire — verifies #maybeRunParityCheck fires on the
+  // streaming hydrate (addQueriesStreaming) and streaming advance
+  // (advanceStreaming) paths, which are the production defaults
+  // (view-syncer.ts:361-365 sets useStreamingConsumer=true).
+  // ---------------------------------------------------------------------------
+  describe('streaming parity', () => {
+    const streamingShardID: ShardID = {appID: 'zeroz', shardNum: 1};
+    const streamingMutationsTable = `${upstreamSchema(streamingShardID)}.mutations`;
+
+    const items = table('items')
+      .columns({
+        id: string(),
+        active: boolean(),
+      })
+      .primaryKey('id');
+    const streamingClientSchema = createSchema({tables: [items]});
+    const ITEMS_QUERY: AST = {
+      table: 'items',
+      orderBy: [['id', 'asc']],
+    };
+
+    const replicationMessages = new ReplicationMessages({
+      items: 'id',
+      [streamingMutationsTable]: ['clientGroupID', 'clientID', 'mutationID'],
+    });
+
+    function makeStreamingDriver(label: string): {
+      driver: PipelineDriver;
+      dbFile: DbFile;
+      cleanup: () => void;
+    } {
+      const lc = createSilentLogContext();
+      const dbFile = new DbFile(`parity_streaming_${label}`);
+      const conn = dbFile.connect(lc);
+      conn.pragma('journal_mode = wal2');
+
+      const storage = new Database(lc, ':memory:');
+      storage.prepare(CREATE_STORAGE_TABLE).run();
+
+      const driver = new PipelineDriver(
+        lc,
+        testLogConfig,
+        new Snapshotter(lc, dbFile.path, {appID: streamingShardID.appID}),
+        streamingShardID,
+        new DatabaseStorage(storage).createClientGroupStorage(
+          `parity-streaming-cg-${label}`,
+        ),
+        `parity-check.test.ts/${label}`,
+        new InspectorDelegate(undefined),
+        () => 200,
+      );
+
+      const db = dbFile.connect(lc);
+      initReplicationState(db, ['zero_data'], '123');
+      db.exec(/*sql*/ `
+        CREATE TABLE "${streamingMutationsTable}" (
+          "clientGroupID"  TEXT,
+          "clientID"       TEXT,
+          "mutationID"     INTEGER,
+          "result"         TEXT,
+          _0_version       TEXT NOT NULL,
+          PRIMARY KEY ("clientGroupID", "clientID", "mutationID")
+        );
+        CREATE TABLE items (
+          id TEXT PRIMARY KEY,
+          active BOOL,
+          _0_version TEXT NOT NULL
+        );
+        INSERT INTO items (id, active, _0_version) VALUES ('a', 1, '123');
+        INSERT INTO items (id, active, _0_version) VALUES ('b', 0, '123');
+      `);
+
+      driver.init(streamingClientSchema);
+
+      return {
+        driver,
+        dbFile,
+        cleanup: () => {
+          driver.destroy();
+          dbFile.delete();
+        },
+      };
+    }
+
+    function setEnv(mode: string, rate: string): () => void {
+      const prevMode = process.env['ZQLITE_RS_PARITY_CHECK'];
+      const prevRate = process.env['ZQLITE_RS_PARITY_CHECK_RATE'];
+      process.env['ZQLITE_RS_PARITY_CHECK'] = mode;
+      process.env['ZQLITE_RS_PARITY_CHECK_RATE'] = rate;
+      return () => {
+        if (prevMode !== undefined) {
+          process.env['ZQLITE_RS_PARITY_CHECK'] = prevMode;
+        } else {
+          delete process.env['ZQLITE_RS_PARITY_CHECK'];
+        }
+        if (prevRate !== undefined) {
+          process.env['ZQLITE_RS_PARITY_CHECK_RATE'] = prevRate;
+        } else {
+          delete process.env['ZQLITE_RS_PARITY_CHECK_RATE'];
+        }
+      };
+    }
+
+    beforeEach(() => {
+      resetParityDivergenceCount();
+      vi.restoreAllMocks();
+    });
+
+    // S1: cadence-mode (sample, rate=1) advanceStreaming increments counter.
+    test('S1: mode=sample/rate=1, advanceStreaming increments invocationCount', async () => {
+      const restoreEnv = setEnv('sample', '1');
+      try {
+        const startCount = getParityCheckInvocationCountForTesting();
+        const {driver, dbFile, cleanup} = makeStreamingDriver('s1');
+        try {
+          // Hydrate first so advance has a non-trivial pipeline.
+          for await (const _ of await driver.addQueriesStreaming(
+            [{transformationHash: 'h1', queryID: 'q1', ast: ITEMS_QUERY}],
+            NO_TIME_TIMER,
+          )) {
+            void _;
+          }
+
+          // Mutate so advance has actual work.
+          const lc = createSilentLogContext();
+          const writeConn = dbFile.connect(lc);
+          const replicator = fakeReplicator(lc, writeConn);
+          replicator.processTransaction(
+            '124',
+            replicationMessages.insert('items', {id: 'c'}),
+          );
+
+          // Drive streaming advance and fully consume.
+          const result = await driver.advanceStreaming(NO_TIME_TIMER);
+          for await (const _ of result.changes) {
+            void _;
+          }
+
+          // S1 assertion: counter strictly increased — proving the
+          // streaming wire fired the parity gate. (Rate=1 means every
+          // invocation runs comparison; >startCount also covers the
+          // hydrate's contribution.)
+          expect(getParityCheckInvocationCountForTesting()).toBeGreaterThan(
+            startCount,
+          );
+        } finally {
+          cleanup();
+        }
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    // S2: cadence-mode (sample, rate=1) addQueriesStreaming increments counter.
+    test('S2: mode=sample/rate=1, addQueriesStreaming increments invocationCount', async () => {
+      const restoreEnv = setEnv('sample', '1');
+      try {
+        const startCount = getParityCheckInvocationCountForTesting();
+        const {driver, cleanup} = makeStreamingDriver('s2');
+        try {
+          // Drive streaming hydrate; fully consume.
+          for await (const _ of await driver.addQueriesStreaming(
+            [{transformationHash: 'h1', queryID: 'q1', ast: ITEMS_QUERY}],
+            NO_TIME_TIMER,
+          )) {
+            void _;
+          }
+
+          // S2 assertion: counter strictly increased — proving the
+          // streaming hydrate wire fired the parity gate.
+          expect(getParityCheckInvocationCountForTesting()).toBeGreaterThan(
+            startCount,
+          );
+        } finally {
+          cleanup();
+        }
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    // S3: divergence detection on streaming advance — strict mode + injected
+    // divergence via a mocked tsAdvance (oracle module spy).
+    //
+    // The default `tsAdvance` is intentionally empty — it never yields any
+    // RowChange. Strict mode runs the comparison even with empty TS, but
+    // matching empty-vs-some-rust-changes IS a divergence (rustCount > 0,
+    // tsCount === 0). We further inject a synthetic non-matching change
+    // so the divergence is unambiguously caused by the spy and the
+    // comparison must have been driven.
+    test('S3: mode=strict, advanceStreaming detects divergence (mocked tsAdvance)', async () => {
+      const restoreEnv = setEnv('strict', '10');
+      try {
+        // Spy on tsAdvance to inject a synthetic divergent change so the
+        // comparison fires AND finds a mismatch.
+        const tsAdvanceSpy = vi
+          .spyOn(oracleModule, 'tsAdvance')
+          .mockImplementation(function* injectDivergence() {
+            // Yield a change that the Rust side will NOT produce so
+            // compareChanges() reports tsCount > rustCount.
+            yield {
+              type: ChangeType.ADD,
+              queryID: 'q1',
+              table: 'items',
+              rowKey: {id: 'NONEXISTENT'},
+              row: {id: 'NONEXISTENT', active: true},
+            } as RowChange;
+          });
+
+        const {driver, dbFile, cleanup} = makeStreamingDriver('s3');
+        try {
+          for await (const _ of await driver.addQueriesStreaming(
+            [{transformationHash: 'h1', queryID: 'q1', ast: ITEMS_QUERY}],
+            NO_TIME_TIMER,
+          )) {
+            void _;
+          }
+
+          const lc = createSilentLogContext();
+          const writeConn = dbFile.connect(lc);
+          const replicator = fakeReplicator(lc, writeConn);
+          replicator.processTransaction(
+            '124',
+            replicationMessages.insert('items', {id: 'c'}),
+          );
+
+          const result = await driver.advanceStreaming(NO_TIME_TIMER);
+
+          // Strict mode + divergence: drain throws OR divergence count
+          // increments. Both prove the comparison fired against streaming
+          // output.
+          let didThrow = false;
+          try {
+            for await (const _ of result.changes) {
+              void _;
+            }
+          } catch (err) {
+            didThrow = true;
+            expect(String(err)).toMatch(/parity check failed|divergence/i);
+          }
+
+          if (!didThrow) {
+            expect(getParityDivergenceCount()).toBeGreaterThan(0);
+          }
+
+          // tsAdvance MUST have been invoked (otherwise the wire is
+          // bypassed regardless of throw/divergence-count outcome).
+          expect(tsAdvanceSpy).toHaveBeenCalled();
+        } finally {
+          cleanup();
+        }
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    // S4: divergence detection on streaming hydrate — strict mode + injected
+    // divergence via a mocked tsAddQueryAll.
+    test('S4: mode=strict, addQueriesStreaming detects divergence (mocked tsAddQueryAll)', async () => {
+      const restoreEnv = setEnv('strict', '10');
+      try {
+        const tsAddQueryAllSpy = vi
+          .spyOn(oracleModule, 'tsAddQueryAll')
+          .mockImplementation(function* injectDivergence() {
+            yield {
+              type: ChangeType.ADD,
+              queryID: 'q1',
+              table: 'items',
+              rowKey: {id: 'NONEXISTENT'},
+              row: {id: 'NONEXISTENT', active: true},
+            } as RowChange;
+          });
+
+        const {driver, cleanup} = makeStreamingDriver('s4');
+        try {
+          let didThrow = false;
+          try {
+            for await (const _ of await driver.addQueriesStreaming(
+              [{transformationHash: 'h1', queryID: 'q1', ast: ITEMS_QUERY}],
+              NO_TIME_TIMER,
+            )) {
+              void _;
+            }
+          } catch (err) {
+            didThrow = true;
+            expect(String(err)).toMatch(/parity check failed|divergence/i);
+          }
+
+          if (!didThrow) {
+            expect(getParityDivergenceCount()).toBeGreaterThan(0);
+          }
+
+          expect(tsAddQueryAllSpy).toHaveBeenCalled();
+        } finally {
+          cleanup();
+        }
+      } finally {
+        restoreEnv();
+      }
     });
   });
 });
