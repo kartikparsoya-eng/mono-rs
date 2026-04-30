@@ -48,7 +48,11 @@ import {readFileSync} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import fc from 'fast-check';
-import type {AST, CorrelatedSubquery, Condition} from '../../packages/zero-protocol/src/ast.ts';
+import type {
+  AST,
+  CorrelatedSubquery,
+  Condition,
+} from '../../packages/zero-protocol/src/ast.ts';
 import {buildArbitraries} from './arb-ast.ts';
 import {
   astHash,
@@ -78,6 +82,12 @@ const SEED = Number(process.env.FUZZ_SEED ?? Date.now());
 const VERBOSE = Number(process.env.FUZZ_VERBOSE ?? 1);
 const ARB_MODE = (process.env.FUZZ_ARB ?? 'targeted').toLowerCase();
 const FORCE_DIVERGENCE = process.env.FORCE_DIVERGENCE === '1';
+// FUZZ_KEEP_GOING=1 makes the property body return true even on divergence
+// so fast-check completes all numRuns iterations instead of stopping at the
+// first failure to shrink. Used for breadth surveys (find every distinct
+// divergence shape in one run); not used in CI gating mode (where we WANT
+// to stop on first failure to expose it via fast-check shrinking).
+const KEEP_GOING = process.env.FUZZ_KEEP_GOING === '1';
 
 // Coverage + timing instrumentation per Phase 34 D-21 #3 + checker BLOCKER.
 // PER_TABLE_HITS proves FUZZ-02 schema (events / big_id_records / event_tags)
@@ -141,7 +151,8 @@ function isAllowedDivergence(
 function wave0CoarseMatch(ast: AST, hint: string): boolean {
   const flat = JSON.stringify(ast);
   if (hint.includes('flip=true') && !flat.includes('"flip":true')) return false;
-  if (hint.includes('scalar=true') && !flat.includes('"scalar":true')) return false;
+  if (hint.includes('scalar=true') && !flat.includes('"scalar":true'))
+    return false;
   return true;
 }
 
@@ -150,7 +161,8 @@ function matchesPattern(ast: AST, p: AllowListEntry): boolean {
   const id = String(p.id ?? '');
   const flat = JSON.stringify(ast);
   if (id === 'B7-flipped-join') return flat.includes('"flip":true');
-  if (id === 'B12-companion-scalar-drift') return flat.includes('"scalar":true');
+  if (id === 'B12-companion-scalar-drift')
+    return flat.includes('"scalar":true');
   if (id === 'B6-exists-limit-downgrade') {
     // EXISTS subquery with explicit limit > 1.
     return /"op":"EXISTS"[^}]*?\}[^}]*?"limit":\s*([2-9]|\d{2,})/.test(flat);
@@ -280,7 +292,11 @@ async function runForceDivergenceSmoke(): Promise<number> {
     return verdict.allowed ? 0 : 1;
   }
   // Live mode: route through the live runner. The query MUST diverge per B7.
-  const runner = buildBatchedRunner({dryRun: false, batchSize: 1, verbose: VERBOSE});
+  const runner = buildBatchedRunner({
+    dryRun: false,
+    batchSize: 1,
+    verbose: VERBOSE,
+  });
   const result = await runner.enqueueAndMaybeFlush(ast);
   await runner.finalFlush();
   process.stdout.write(
@@ -378,7 +394,11 @@ async function main(): Promise<number> {
           ast,
           reason: `unexpected divergence (canonicalKey=${result.divergence.canonicalKey})`,
         });
-        return false;
+        // KEEP_GOING: count as pass so fast-check continues to next iteration
+        // and finds more distinct shapes in the same run. The recorded[]
+        // array still tracks every divergence; the final report dumps them
+        // all. The exit code is still non-zero if any divergence happened.
+        return KEEP_GOING ? true : false;
       }),
       {numRuns: NUM_RUNS, seed: SEED, verbose: VERBOSE},
     );
@@ -414,7 +434,11 @@ async function main(): Promise<number> {
     process.stdout.write(
       `random-ast-fuzz: ${unexpectedCount} unexpected divergence(s):\n`,
     );
-    for (const r of recorded.slice(0, 5)) {
+    // KEEP_GOING mode dumps every recorded divergence so a breadth-survey
+    // run captures all distinct shapes; default mode keeps the original
+    // truncated-to-5 behavior to avoid log flooding in CI.
+    const dumpLimit = KEEP_GOING ? recorded.length : 5;
+    for (const r of recorded.slice(0, dumpLimit)) {
       process.stdout.write(
         `  - ${astHash(r.ast)}: ${r.reason}\n    AST: ${JSON.stringify(r.ast)}\n`,
       );
