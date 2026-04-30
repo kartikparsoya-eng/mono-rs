@@ -115,6 +115,14 @@ interface RustPipelineManagerInstance {
   hydrateAsync(id: string): Promise<Buffer>;
   hydrateQueryAsync(id: string, queryId: string): Promise<Buffer>;
   swapSnapshot(id: string, newDbPath: string): void;
+  // B11: tells Rust where to read descendants for cascade-delete BEFORE
+  // we repoint the connection pool to curr. After swapSnapshot, the pool
+  // sees post-tx state where same-tx-deleted descendants are already gone;
+  // reading from prev preserves them. MUST be called BEFORE swapSnapshot
+  // on every advance (pitfall 6 — order matters).
+  // Spec: TS pipeline-driver.ts:1542-1577.
+  // See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
+  setPrevSnapshot(id: string, prevDbPath: string): void;
   pipelineCount(id: string): number;
   // Phase 31-01 streaming surface — additive, alongside the buffered
   // methods above.
@@ -2078,6 +2086,13 @@ export class PipelineDriver {
       collectedChanges.push(change);
     }
 
+    // B11: tell Rust where to read descendants for cascade-delete BEFORE we
+    // repoint the connection pool to curr. After swapSnapshot, the pool sees
+    // post-tx state where same-tx-deleted descendants are gone; reading from
+    // prev preserves them. Mirrors TS upstream behavior — see
+    // .planning/IVM-PORT-AUDIT-DEEP.md §B11. Lifecycle pitfall: setPrevSnapshot
+    // MUST happen before swapSnapshot on every advance (RESEARCH pitfall 6).
+    this.#manager.setPrevSnapshot(this.#instanceId, prev.db.db.name);
     this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
 
     const permTables = this.#combinedPermissionTables();
@@ -2217,6 +2232,13 @@ export class PipelineDriver {
       collectedChanges.push(change);
     }
 
+    // B11: tell Rust where to read descendants for cascade-delete BEFORE we
+    // repoint the connection pool to curr. After swapSnapshot, the pool sees
+    // post-tx state where same-tx-deleted descendants are gone; reading from
+    // prev preserves them. Lifecycle pitfall: setPrevSnapshot MUST happen
+    // before swapSnapshot on every advance.
+    // See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
+    this.#manager.setPrevSnapshot(this.#instanceId, prev.db.db.name);
     this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
 
     const permTables = this.#combinedPermissionTables();
@@ -2301,7 +2323,14 @@ export class PipelineDriver {
       collectedChanges.push(change);
     }
 
+    // B11: tell Rust where to read descendants for cascade-delete BEFORE we
+    // repoint the connection pool to curr. After swapSnapshot, the pool sees
+    // post-tx state where same-tx-deleted descendants are gone; reading from
+    // prev preserves them. Lifecycle pitfall: setPrevSnapshot MUST happen
+    // before swapSnapshot on every advance.
+    // See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
     // Swap manager's snapshot to the new DB path
+    this.#manager.setPrevSnapshot(this.#instanceId, prev.db.db.name);
     this.#manager.swapSnapshot(this.#instanceId, curr.db.db.name);
 
     // Update permission tables on Rust side before advance
