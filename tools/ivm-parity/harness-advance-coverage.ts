@@ -847,11 +847,19 @@ async function runBatch(
 // Entry.
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
-  const corpusPath = join(here, 'ast_corpus.json');
+  // CORPUS_FILE env var overrides the default ast_corpus.json so randomly-
+  // generated AST corpora (via gen-random-corpus.ts) can be run through
+  // the same batched hydrate+mutate flow without touching this harness.
+  const corpusPath =
+    process.env.CORPUS_FILE && process.env.CORPUS_FILE.length > 0
+      ? process.env.CORPUS_FILE.startsWith('/')
+        ? process.env.CORPUS_FILE
+        : join(here, process.env.CORPUS_FILE)
+      : join(here, 'ast_corpus.json');
   const corpus: CorpusEntry[] = JSON.parse(readFileSync(corpusPath, 'utf8'));
   const slice = CORPUS_LIMIT > 0 ? corpus.slice(0, CORPUS_LIMIT) : corpus;
   console.error(
-    `[advance-coverage] running ${slice.length} ASTs through hydrate+mutate cycle, BATCH_SIZE=${BATCH_SIZE}, POKE_WAIT_MS=${POKE_WAIT_MS}`,
+    `[advance-coverage] running ${slice.length} ASTs through hydrate+mutate cycle, BATCH_SIZE=${BATCH_SIZE}, POKE_WAIT_MS=${POKE_WAIT_MS} (corpus=${corpusPath})`,
   );
 
   const sql = postgres(PG_URL, {max: 4, prepare: false});
