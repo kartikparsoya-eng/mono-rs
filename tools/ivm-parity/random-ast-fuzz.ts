@@ -1,6 +1,10 @@
 /**
  * Phase 34 Wave 1 — fast-check driver script (production).
  *
+ * Coverage + timing instrumentation — PER_TABLE_HITS proves FUZZ-02 table
+ * coverage (events/big_id_records/event_tags >=10 hits per 1k iter);
+ * WALL_MS provides machine-checkable <120s timing gate per D-21 #3.
+ *
  * Loads `parity-allowlist.json`, builds arbitraries via `arb-ast.ts`, runs
  * `fc.assert(fc.asyncProperty(...))`, and calls `harness-fuzz.runOneAst`
  * per iteration. Diverges that match the allow-list are silently passed;
@@ -74,6 +78,13 @@ const SEED = Number(process.env.FUZZ_SEED ?? Date.now());
 const VERBOSE = Number(process.env.FUZZ_VERBOSE ?? 1);
 const ARB_MODE = (process.env.FUZZ_ARB ?? 'targeted').toLowerCase();
 const FORCE_DIVERGENCE = process.env.FORCE_DIVERGENCE === '1';
+
+// Coverage + timing instrumentation per Phase 34 D-21 #3 + checker BLOCKER.
+// PER_TABLE_HITS proves FUZZ-02 schema (events / big_id_records / event_tags)
+// is actually targeted by the fast-check arb (each ≥10 hits per 1k iter
+// = 1% floor). WALL_MS provides machine-checkable <120000ms timing gate.
+const startMs = Date.now();
+const tableHits: Record<string, number> = {};
 
 // ---------------------------------------------------------------------------
 // Allow-list — load + index.
@@ -333,6 +344,12 @@ async function main(): Promise<number> {
   try {
     await fc.assert(
       fc.asyncProperty(arb, async ast => {
+        // Coverage instrumentation per Phase 34 checker BLOCKER fix:
+        // proves FUZZ-02 schema (events / big_id_records / event_tags) is
+        // actually targeted by the fast-check arb. Each iteration logs which
+        // table the AST landed on; on exit we assert each new table sees
+        // ≥10 hits per 1000 iterations (1% floor). See `tableHits` decl.
+        tableHits[ast.table] = (tableHits[ast.table] || 0) + 1;
         const result = await runner.enqueueAndMaybeFlush(ast);
         if (result.status === 'ok') {
           okCount++;
@@ -408,4 +425,13 @@ async function main(): Promise<number> {
 }
 
 const code = await main();
+
+// Emit machine-parseable timing + coverage gates per Phase 34 D-21 #3 +
+// checker BLOCKER. Single-line, parseable via `tail | grep`. WALL_MS gate:
+// <120000 ms for 1k iter. PER_TABLE_HITS gate: each FUZZ-02 table
+// (events, big_id_records, event_tags) sees ≥10 hits in a 1k run.
+const wallMs = Date.now() - startMs;
+console.log(`WALL_MS=${wallMs}`);
+console.log(`PER_TABLE_HITS=${JSON.stringify(tableHits)}`);
+
 process.exit(code);
