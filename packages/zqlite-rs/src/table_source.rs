@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 use rusqlite::types::ValueRef;
@@ -50,7 +51,14 @@ pub struct Connection {
     pub ordering: Option<Ordering>,
     pub filters: Option<Condition>,
     pub split_edit_keys: Option<HashSet<String>>,
-    pub last_pushed_epoch: u64,
+    /// Monotonic epoch counter for the most recent push observed by this
+    /// connection. Stored as `AtomicU64` so concurrent fetch (`&self`) and
+    /// `reset_state(&self)` calls are race-free without `unsafe` casts. The
+    /// value participates only in epoch comparison against `overlay.epoch`
+    /// (itself guarded by `RustTableSource::overlay`'s `Mutex`); ordering
+    /// of any other memory operations is established by that mutex, so
+    /// `Ordering::Relaxed` is sufficient here.
+    pub last_pushed_epoch: AtomicU64,
 }
 
 pub struct RustTableSource {
@@ -65,10 +73,19 @@ pub struct RustTableSource {
     push_epoch: Mutex<u64>,
 }
 
-// SAFETY: All mutable state is behind Mutex. ConnectionPool is Clone+Send+Sync.
-// `connections` Vec is only mutated via `connect()` before Arc wrapping.
-unsafe impl Send for RustTableSource {}
-unsafe impl Sync for RustTableSource {}
+// `RustTableSource` is `Send + Sync` via auto-derivation:
+// - `pool: ConnectionPool` is `Clone + Send + Sync` (Arc<Mutex<…>>).
+// - `write_conn: Mutex<Option<rusqlite::Connection>>`: `rusqlite::Connection`
+//   is `Send` but not `Sync`; `Mutex<T>` is `Send + Sync` iff `T: Send`.
+// - `overlay`, `push_epoch`: `Mutex<…>` of `Send` types.
+// - `connections: Vec<Connection>` where `Connection` only contains `Send +
+//   Sync` fields; per-connection runtime mutation of `last_pushed_epoch`
+//   uses `AtomicU64` so concurrent `&self` access is race-free (B14 fix).
+//
+// The historical `unsafe impl Send/Sync` was needed because the original
+// `last_pushed_epoch: u64` was mutated via `*const → *mut` cast through
+// `&self`, which the compiler cannot prove safe. With `AtomicU64`, the
+// `unsafe` impls are no longer required and have been removed.
 
 impl RustTableSource {
     pub fn new(
@@ -156,7 +173,7 @@ impl RustTableSource {
             ordering,
             filters,
             split_edit_keys,
-            last_pushed_epoch: 0,
+            last_pushed_epoch: AtomicU64::new(0),
         };
         self.connections.push(conn);
         self.connections.len() - 1
@@ -197,7 +214,7 @@ impl RustTableSource {
             start_row,
             req.constraint.as_ref(),
             overlay_guard.as_ref(),
-            conn_info.last_pushed_epoch,
+            conn_info.last_pushed_epoch.load(AtomicOrdering::Relaxed),
             sort,
             None,
         );
@@ -239,9 +256,11 @@ impl RustTableSource {
     pub fn reset_state(&self) {
         *self.overlay.lock().unwrap() = None;
         *self.push_epoch.lock().unwrap() = 0;
+        // SAFETY: `last_pushed_epoch` is `AtomicU64` — `.store` through `&self`
+        // is well-defined and race-free with concurrent `.load` calls.
+        // No `unsafe` const-to-mut cast needed (B14 fix).
         for conn in &self.connections {
-            let conn_ptr = conn as *const Connection as *mut Connection;
-            unsafe { (*conn_ptr).last_pushed_epoch = 0; }
+            conn.last_pushed_epoch.store(0, AtomicOrdering::Relaxed);
         }
     }
 
@@ -344,8 +363,8 @@ impl RustTableSource {
                 self.assert_change_valid(ch)?;
             }
 
-            for (i, conn) in self.connections.iter_mut().enumerate() {
-                conn.last_pushed_epoch = epoch;
+            for (i, conn) in self.connections.iter().enumerate() {
+                conn.last_pushed_epoch.store(epoch, AtomicOrdering::Relaxed);
                 all_results[i].push(source_change_to_change(ch));
             }
 
@@ -925,12 +944,83 @@ mod tests {
         let row1 = make_row(&[("id", json!("4")), ("name", json!("Dave")), ("age", json!(40))]);
         src.push(SourceChange::Add(row1)).unwrap();
         assert_eq!(*src.push_epoch.lock().unwrap(), 1);
-        assert_eq!(src.connections[cid].last_pushed_epoch, 1);
+        assert_eq!(
+            src.connections[cid]
+                .last_pushed_epoch
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
 
         let row2 = make_row(&[("id", json!("5")), ("name", json!("Eve")), ("age", json!(28))]);
         src.push(SourceChange::Add(row2)).unwrap();
         assert_eq!(*src.push_epoch.lock().unwrap(), 2);
-        assert_eq!(src.connections[cid].last_pushed_epoch, 2);
+        assert_eq!(
+            src.connections[cid]
+                .last_pushed_epoch
+                .load(AtomicOrdering::Relaxed),
+            2
+        );
+    }
+
+    /// B14 regression: `last_pushed_epoch` must be safe to read concurrently
+    /// with `reset_state(&self)`. Pre-fix, `reset_state` used a `*const →
+    /// *mut` cast and wrote through `&self`, which is undefined behaviour
+    /// when another thread observes the same field. Post-fix, the field is
+    /// `AtomicU64` so concurrent load/store is well-defined and the value
+    /// is always either pre-reset or post-reset, never torn.
+    #[test]
+    fn test_b14_epoch_atomic_concurrent_reset() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = setup_test_db();
+        let mut src = make_source(&db);
+        let cid = src.connect(Some(vec![("id".into(), "asc".into())]), None, None);
+
+        // Seed an epoch so reset is observable.
+        let row = make_row(&[("id", json!("4")), ("name", json!("Dave")), ("age", json!(40))]);
+        src.push(SourceChange::Add(row)).unwrap();
+        assert_eq!(
+            src.connections[cid]
+                .last_pushed_epoch
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+
+        let src = Arc::new(src);
+        let reader = {
+            let src = Arc::clone(&src);
+            thread::spawn(move || {
+                for _ in 0..10_000 {
+                    // Atomic load — value must be a valid u64 (0 or 1) at all times.
+                    let v = src.connections[cid]
+                        .last_pushed_epoch
+                        .load(AtomicOrdering::Relaxed);
+                    assert!(v == 0 || v == 1, "torn read observed: {v}");
+                }
+            })
+        };
+
+        for _ in 0..10_000 {
+            src.reset_state();
+        }
+        reader.join().expect("reader thread panicked");
+
+        // After resets, value must be 0.
+        assert_eq!(
+            src.connections[cid]
+                .last_pushed_epoch
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+    }
+
+    /// Compile-time check that `RustTableSource` is `Send + Sync` without the
+    /// manual `unsafe impl` (B14: removed in favor of auto-derivation).
+    #[test]
+    fn test_b14_table_source_auto_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RustTableSource>();
     }
 
     #[test]
