@@ -14,4 +14,7 @@ pub mod join_op;
 pub mod take_op;
 pub mod exists_op;
 pub mod or_exists_op;
+pub mod flipped_join_op;
+pub mod union_fan_in_op;
+pub mod union_fan_out_op;
 pub mod pipeline;
