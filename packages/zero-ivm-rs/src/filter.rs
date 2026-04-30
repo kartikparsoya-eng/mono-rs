@@ -11,17 +11,32 @@ use serde_json;
 pub enum Value {
     Null,
     Bool(bool),
+    /// Integer values preserved with full i64 precision.
+    /// SQLite-sourced PKs > 2^53 (e.g. snowflake IDs) require this to avoid
+    /// precision loss that would collapse distinct keys when coerced to f64.
+    Int(i64),
     Number(f64),
     String(String),
 }
 
 impl Value {
-    /// Parse a serde_json::Value into our Value enum
+    /// Parse a serde_json::Value into our Value enum.
+    /// Numbers are dispatched to Int first if they fit in i64; otherwise f64.
+    /// This preserves precision for values outside f64's safe-integer range
+    /// (|n| > 2^53), which matters for snowflake-style PKs.
     pub fn from_json(v: &serde_json::Value) -> Self {
         match v {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(*b),
-            serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Number(f)
+                } else {
+                    Value::Number(0.0)
+                }
+            }
             serde_json::Value::String(s) => Value::String(s.clone()),
             _ => Value::Null,
         }
@@ -151,6 +166,15 @@ fn values_eq(a: &Value, b: &Value) -> bool {
             let bool_as_num = if *ab { 1.0 } else { 0.0 };
             *n == bool_as_num
         }
+        (Value::Bool(ab), Value::Int(i)) | (Value::Int(i), Value::Bool(ab)) => {
+            let bool_as_int: i64 = if *ab { 1 } else { 0 };
+            *i == bool_as_int
+        }
+        // Mixed Int/Number: compare as f64 (lossy for |i| > 2^53 but consistent
+        // with SQL semantics where REAL and INTEGER compare numerically).
+        (Value::Int(i), Value::Number(n)) | (Value::Number(n), Value::Int(i)) => {
+            (*i as f64) == *n
+        }
         _ => a == b,
     }
 }
@@ -246,6 +270,12 @@ pub fn evaluate_json_row(predicate: &Predicate, row: &serde_json::Map<String, se
 }
 
 /// Compare two Values. null < everything else. Same-type comparisons.
+///
+/// Int/Int: full-precision i64 ordering (preserves snowflake IDs > 2^53).
+/// Number/Number: f64 partial_cmp.
+/// Mixed Int/Number: convert i64 → f64 then partial_cmp (lossy for |i| > 2^53,
+/// but mixed types only arise from heterogeneous JSON input where we cannot
+/// avoid the conversion).
 pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -253,7 +283,14 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Number(a), Value::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Int(i), Value::Number(n)) => {
+            (*i as f64).partial_cmp(n).unwrap_or(Ordering::Equal)
+        }
+        (Value::Number(n), Value::Int(i)) => {
+            n.partial_cmp(&(*i as f64)).unwrap_or(Ordering::Equal)
+        }
         (Value::String(a), Value::String(b)) => a.cmp(b),
         // Cross-type: treat as equal (shouldn't happen in practice)
         _ => Ordering::Equal,
@@ -834,5 +871,74 @@ mod tests {
         let pred_eq = Predicate::Eq("active".into(), Value::Bool(true));
         assert!(evaluate(&pred_eq, &make_row(&[("active", Value::Number(1.0))])));
         assert!(!evaluate(&pred_eq, &make_row(&[("active", Value::Number(0.0))])));
+    }
+
+    #[test]
+    fn test_int_precision_above_2_pow_53() {
+        // Two distinct i64 values that collapse to the same f64.
+        // f64 has 53 bits of mantissa, so integers in [2^53, 2^54) can only
+        // represent every other value — odd ones round to the nearest even.
+        // 2^53 (= 9007199254740992) is exact; 2^53+1 rounds to 2^53.
+        // Without preserving i64 precision, these distinct PKs collapse to equal.
+        let a: i64 = 9_007_199_254_740_992; // 2^53, exact in f64
+        let b: i64 = 9_007_199_254_740_993; // 2^53 + 1, rounds to 2^53 in f64
+
+        // Sanity check: confirm these collapse under f64 conversion (the bug).
+        assert_eq!(a as f64, b as f64, "f64 cast must be lossy here");
+
+        // With Value::Int variant, ordering and equality must be preserved.
+        let va = Value::Int(a);
+        let vb = Value::Int(b);
+        assert_eq!(compare_values(&va, &vb), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(&vb, &va), std::cmp::Ordering::Greater);
+        assert_ne!(va, vb, "distinct i64 values must not be equal");
+
+        // from_json must dispatch to Int (not Number) for integer JSON.
+        let ja = serde_json::json!(a);
+        let jb = serde_json::json!(b);
+        let parsed_a = Value::from_json(&ja);
+        let parsed_b = Value::from_json(&jb);
+        assert_eq!(parsed_a, Value::Int(a));
+        assert_eq!(parsed_b, Value::Int(b));
+        assert_eq!(
+            compare_values(&parsed_a, &parsed_b),
+            std::cmp::Ordering::Less
+        );
+
+        // Sort a vec of these values and verify ordering.
+        let mut vs = vec![Value::Int(b), Value::Int(a)];
+        vs.sort_by(|x, y| compare_values(x, y));
+        assert_eq!(vs, vec![Value::Int(a), Value::Int(b)]);
+
+        // Also test a more extreme case: i64::MAX and i64::MAX - 1 both
+        // overflow to 2^63 in f64.
+        let big_a: i64 = i64::MAX;
+        let big_b: i64 = i64::MAX - 1;
+        assert_eq!(big_a as f64, big_b as f64);
+        assert_eq!(
+            compare_values(&Value::Int(big_b), &Value::Int(big_a)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_int_number_cross_type_eq() {
+        // Boolean coercion still works with Int (SQLite stores bool as INTEGER 0/1).
+        let pred = Predicate::Eq("active".into(), Value::Bool(true));
+        assert!(evaluate(&pred, &make_row(&[("active", Value::Int(1))])));
+        assert!(!evaluate(&pred, &make_row(&[("active", Value::Int(0))])));
+
+        // Int/Number cross-type equality (within f64 safe range).
+        let pred = Predicate::Eq("n".into(), Value::Int(42));
+        assert!(evaluate(&pred, &make_row(&[("n", Value::Number(42.0))])));
+
+        // In predicate with mixed Int/Number list.
+        let pred = Predicate::In(
+            "id".into(),
+            vec![Value::Int(1), Value::Int(2), Value::Number(3.0)],
+        );
+        assert!(evaluate(&pred, &make_row(&[("id", Value::Int(2))])));
+        assert!(evaluate(&pred, &make_row(&[("id", Value::Number(3.0))])));
+        assert!(!evaluate(&pred, &make_row(&[("id", Value::Int(4))])));
     }
 }

@@ -203,6 +203,15 @@ fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> i32 {
 
     // Number comparison
     if let (Number(na), Number(nb)) = (a, b) {
+        // Preserve i64 precision for SQLite-sourced PKs > 2^53. Routing through
+        // f64 would collapse distinct snowflake IDs that differ only below bit 53.
+        if let (Some(ia), Some(ib)) = (na.as_i64(), nb.as_i64()) {
+            return match ia.cmp(&ib) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+        }
         let fa = na.as_f64().unwrap_or(0.0);
         let fb = nb.as_f64().unwrap_or(0.0);
         let diff = fa - fb;

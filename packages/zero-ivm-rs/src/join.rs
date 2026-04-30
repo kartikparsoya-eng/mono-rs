@@ -87,6 +87,7 @@ fn row_to_json(row: &Row) -> serde_json::Value {
             match v {
                 Value::Null => serde_json::Value::Null,
                 Value::Bool(b) => serde_json::Value::Bool(*b),
+                Value::Int(i) => serde_json::json!(*i),
                 Value::Number(n) => serde_json::json!(*n),
                 Value::String(s) => serde_json::Value::String(s.clone()),
             },
@@ -334,7 +335,9 @@ mod tests {
         let json_str = r#"{"id": 1, "name": "Alice", "active": true, "deleted": null}"#;
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let row = parse_row(&v);
-        assert_eq!(row.get("id"), Some(&Value::Number(1.0)));
+        // JSON integers now dispatch to Value::Int (not Number) to preserve
+        // i64 precision for snowflake-style PKs > 2^53.
+        assert_eq!(row.get("id"), Some(&Value::Int(1)));
         assert_eq!(row.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(row.get("active"), Some(&Value::Bool(true)));
         assert_eq!(row.get("deleted"), Some(&Value::Null));
