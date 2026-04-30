@@ -32,15 +32,31 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 - ✓ Cross-ViewSyncer parallel poke dispatch — v4.0
 - ✓ E2E validation + benchmark suite — v4.0
 - ✓ Dual-Exec Correctness Hardening — v4.0
+- ✓ Per-pipeline streaming Rust API (advance_streaming, hydrate_streaming) — v5.0
+- ✓ TS streaming wrappers (advanceStreaming, addQueriesStreaming) returning AsyncIterable — v5.0
+- ✓ Cancellation via Arc<AtomicBool> — TS timer can stop Rust work — v5.0
+- ✓ view-syncer migrated to streaming (pokes fire as fast pipelines complete) — v5.0
+- ✓ TTFB drops from max(pipeline_time) to min(pipeline_time) — v5.0 (1.05× ratio measured, threshold 1.5×)
+- ✓ Memory peak reduction: ~12.47× streaming-vs-buffered — v5.0 (threshold ≥4×)
+- ✓ Audit fixes: LIKE case sensitivity, EXISTS split_edit_keys, debug_assert→assert, Exists Edit with or_predicate — v5.0 (Phase 30)
+- ✓ Production parity-check shim (`ZQLITE_RS_PARITY_CHECK` env-gated TS-vs-Rust sampling) — v5.0 (Phase 33; advance-path strict mode unusable due to architectural mono-rs constraint, hydrate path works)
+- ✓ OrExists test breadth parity (5 → 26 tests, exists_op.rs ≥22 target) — v5.0 (Phase 33)
+- ✓ Bounded mpsc channel test (PERF-01) — v5.0 (Phase 33)
+- ✓ Random-AST differential fuzz infrastructure (`tools/ivm-parity/random-ast-fuzz.ts` + `arb-ast.ts` + WALL_MS/PER_TABLE_HITS instrumentation) — v5.0 (Phase 34; live 1k execution deferred to v6.0 pending TS-oracle env fix)
+- ✓ FUZZ-02 rich-types schema (jsonb, timestamptz, numeric, nullables, composite/array, NULL semantics, type-coercion fixtures, i64 > 2^53 boundaries) — v5.0 (Phase 34)
+- ✓ Deep-audit Track 2 fixes B1 (Skip ordering), B2 (parent_sizes.max(1) cache poison), B3 (partition_key threading — closes original audit Risk #1), B11 (cascade-delete prev snapshot via additive `set_prev_snapshot` napi method) — v5.0 (Phase 34)
 
 ### Active
 
-- [ ] Per-pipeline streaming Rust API (advance_streaming, hydrate_streaming) — additive
-- [ ] TS streaming wrappers (advanceStreaming, addQueriesStreaming) returning AsyncIterable
-- [ ] Cancellation via Arc<AtomicBool> — TS timer can stop Rust work
-- [ ] view-syncer migrated to streaming (pokes fire as fast pipelines complete)
-- [ ] Bench: TTFB drops from max(pipeline_time) to min(pipeline_time)
-- [ ] Audit fixes: LIKE case sensitivity, EXISTS split_edit_keys, debug_assert→assert, Exists Edit with or_predicate
+(Active section reset for v6.0 — see ROADMAP.md "Carry-Forward Tech Debt" for the full Phase 35+ candidate list. Headlining items:)
+
+- [ ] FlippedJoin + UnionFanIn + UnionFanOut operators in Rust (closes deep-audit B7 + 2 catalogued PARITY_STATUS.md divergences) — sized as its own phase
+- [ ] TS-oracle env import resolution (unblocks live 1k fast-check fuzz from Phase 34)
+- [ ] EXISTS_LIMIT downgrade fix (deep-audit B6, security-relevant for PERMISSIONS_EXISTS_LIMIT)
+- [ ] OrExists.push_child first-branch short-circuit (deep-audit B5)
+- [ ] Companion scalar resolved_value drift fix (deep-audit B12)
+- [ ] CI integration of `npm run fuzz-check:gate` (deferred from Phase 34 D-22)
+- [ ] Pre-existing pipeline-driver.test.ts whereExists+permissions snapshot failure investigation
 
 ### Out of Scope
 
@@ -90,20 +106,31 @@ All SQLite I/O and row-level computation must happen in Rust with multi-core par
 - **v2.0** — IVM Operators in Rust (2026-04-21): Filter, Join, Take, Exists operators, Rayon parallelism
 - **v3.0** — Test Coverage & Correctness Hardening (2026-04-21): 139 Rust tests, E2E Docker validation
 - **v4.0** — Parallel IVM Runtime (2026-04-29): Full operator tree in Rust, parallel hydration + advance, cross-ViewSyncer parallel poke, binary FFI format, dual-exec correctness harness
+- **v5.0** — Streaming + Differential Fuzz (2026-04-30): Per-pipeline streaming (TTFB 1.05× / MemPeak 12.47×), production parity-check shim, OrExists test breadth, fast-check differential fuzz infrastructure (`tools/ivm-parity/`), FUZZ-02 production-shape rich-types schema (jsonb/timestamptz/numeric/i64-boundary), deep-audit Track 2 fixes (B1 Skip ordering, B2 parent_sizes cache poison, B3 partition_key threading, B11 cascade-delete prev snapshot via additive `set_prev_snapshot` napi method preserving CLAUDE.md gate #4)
 
-## Current Milestone: v5.0 Streaming
+## Current State
 
-**Goal:** Make the v4.0 rayon parallelism investment visible to clients as reduced time-to-first-byte. Today, parallelism only reduces total server-side wall time — clients still wait for the slowest pipeline because everything is materialized into a single Buffer before returning to JS. Per-pipeline streaming changes that. Also fix two real bugs and three latent risks identified in the port audit.
+**Latest shipped:** v5.0 Streaming + Differential Fuzz (2026-04-30) — 5 phases, 19 plans, 19 requirements satisfied. Audit status: `tech_debt` (no critical blockers; carry-forward documented in v5.0-MILESTONE-AUDIT.md).
 
-**Target features:**
+**Currently:** Planning v6.0. Run `/gsd-new-milestone` to set goals and generate fresh REQUIREMENTS.md + Phase 35+ roadmap.
 
-- New `advance_streaming` / `hydrate_streaming` napi methods returning AsyncIterator-shaped per-pipeline chunks (existing buffered methods preserved as opt-out).
-- TS `pipeline-driver.ts::advanceStreaming` / `addQueriesStreaming` returning `AsyncIterable<RowChange | 'yield'>` (existing methods preserved).
-- View-syncer migrated to streaming so `pokers.pokePart` fires as fast pipelines complete, not at the end.
-- Cancellation via `Arc<AtomicBool>` — TS timer can actually stop Rust work on `advancement-timeout`, not just stop iterating.
-- Audit fixes: LIKE case sensitivity in `parse_predicate_json`, `EXISTS` parent_field missing from `split_edit_keys`, `debug_assert!` → `assert!` for framework invariants, `Exists` Edit-with-or_predicate evaluating both old and new node.
+## Next Milestone Goals (v6.0 — TBD)
 
-See `.planning/IVM-STREAMING-PLAN.md` and `.planning/IVM-PORT-AUDIT.md`.
+The carry-forward tech debt from v5.0 splits naturally into two buckets:
+
+**Bucket 1 — v5.0 polish (Phase 35.x style):**
+- TS-oracle import resolution (unblocks live 1k fuzz from Phase 34's deferred UAT)
+- Deep-audit B5 (OrExists short-circuit), B6 (EXISTS_LIMIT downgrade, security-relevant), B12 (companion scalar drift)
+- Code review WR-03 (debug log gating), WR-01/WR-02 fuzz coverage tightening
+- 3 pre-existing pipeline-driver.test.ts test failures
+- Nyquist VALIDATION.md formal close-out for Phases 31-34
+
+**Bucket 2 — v6.0 net-new capability:**
+- **B7 / FlippedJoin operator family** — implement `FlippedJoin` + `UnionFanIn` + `UnionFanOut` operators in Rust. Closes 2 of 5 catalogued PARITY_STATUS.md divergences (fuzz_00132/133 — `OR(simple, EXISTS flip:true)`). Sized as its own phase or v6.x.
+- Scalar EXISTS companion resolution (closes 2 more divergences: fuzz_00139/140)
+- CI integration of `npm run fuzz-check:gate` (after divergence catalog drains)
+
+See `.planning/v5.0-MILESTONE-AUDIT.md`, `.planning/notes/2026-04-29-phase-34-scope-decision.md`, and `.planning/IVM-PORT-AUDIT-DEEP.md` for full scope.
 
 ## Evolution
 
@@ -125,4 +152,4 @@ This document evolves at phase transitions and milestone boundaries.
 
 ---
 
-_Last updated: 2026-04-29 starting v5.0 Streaming_
+_Last updated: 2026-04-30 after v5.0 Streaming + Differential Fuzz milestone_

@@ -1,192 +1,86 @@
-# Roadmap — v5.0 Streaming
+# Roadmap — zero-cache Rust Rewrite
 
-> **Mandatory verification gate.** Every phase MUST pass these checks before commit:
->
-> 1. `npx vitest run packages/zero-cache/src/services/view-syncer/pipeline-driver.*.test.ts` — all existing tests pass unchanged
-> 2. `npx vitest run packages/zero-cache/src/services/view-syncer/fuzz-ivm.test.ts` — fuzz with 1k iterations
-> 3. `cargo test` in `packages/zqlite-rs/` and `packages/zero-ivm-rs/`
-> 4. **Hard constraint:** no signature change to existing buffered methods (`advance`, `advanceAsync`, `hydrate*`, `addQuery*`); no change to `encode_advance_result_buf` or `decodeAdvanceResultBuf` formats.
+## Milestones
 
----
+- ✅ **v1.0 Rust SQLite Foundation** — (shipped 2026-04-20) → [archive](milestones/v1.0-ROADMAP.md)
+- ✅ **v2.0 IVM Operators in Rust** — (shipped 2026-04-21) → [archive](milestones/v2.0-ROADMAP.md)
+- ✅ **v3.0 Test Coverage & Correctness Hardening** — (shipped 2026-04-21) → [archive](milestones/v3.0-ROADMAP.md)
+- ✅ **v4.0 Parallel IVM Runtime** — (shipped 2026-04-29) → [archive](milestones/v4.0-ROADMAP.md)
+- ✅ **v5.0 Streaming + Differential Fuzz** — Phases 30-34 (shipped 2026-04-30) → [archive](milestones/v5.0-ROADMAP.md)
+- 📋 **v6.0** — TBD (run `/gsd-new-milestone` to kick off)
 
-## Milestone Goal
+## Carry-Forward Tech Debt (v6.0 candidates)
 
-Make v4.0's rayon parallelism investment visible to clients as reduced time-to-first-byte. Today, parallelism only reduces total server-side wall time — clients still wait for the slowest pipeline because everything is materialized into a single Buffer before returning to JS. Per-pipeline streaming changes that. Also fix two real bugs and three latent risks identified in `.planning/IVM-PORT-AUDIT.md`.
+Documented in `.planning/v5.0-MILESTONE-AUDIT.md` and `.planning/notes/2026-04-29-phase-34-scope-decision.md`:
 
-**Phases derive from:** `.planning/IVM-STREAMING-PLAN.md` (3-phase A/B-merged + C + D split) and `.planning/IVM-PORT-AUDIT.md` (4 audit fixes shipped first as a known-correct baseline).
+### Operator-environment fix (high priority)
+
+- TS-oracle import resolution at `/private/tmp/ivm-parity-ts-ref` — unblocks live 1k fuzz + npm test sweep that Phase 34 left as deferred UAT items.
+
+### Deep-audit deferred fixes (`.planning/IVM-PORT-AUDIT-DEEP.md`)
+
+- **B5** — OrExists.push_child first-branch short-circuit (small surgical fix)
+- **B6** — EXISTS_LIMIT downgrade not honored (security-relevant: PERMISSIONS_EXISTS_LIMIT)
+- **B7** — `flip:true` CSQ silently treated as regular Exists. Requires implementing `FlippedJoin` + `UnionFanIn` + `UnionFanOut` operators in Rust. **Sized as its own phase** (large; possibly v6.x). Maps to 2 of the 5 catalogued PARITY_STATUS.md divergences (fuzz_00132/133).
+- **B12** — Companion scalar `resolved_value` drift causes spurious resets
+
+### Code-review findings (Phase 33 / Phase 34)
+
+- Phase 33 WR-01 — strict-mode parity advance unusable; carry-forward (architectural: real differential parity comes from `tools/ivm-parity/` two-process harness)
+- Phase 34 WR-03 — pre-existing `/tmp/rust_ivm_debug.log` debug write in `advance.rs:1510-1518` (should be `cfg!(debug_assertions)` gated)
+- Phase 34 WR-01/WR-02 — fuzz arb coverage signal-degraders (`arb-ast.ts` random-table dilution; `BatchedRunner` BATCH_SIZE plumbing dead)
+
+### Process / CI
+
+- Nyquist VALIDATION.md formal close-out for Phases 31-34 (drafts created but never flipped to `nyquist_compliant: true`)
+- CI integration of `npm run fuzz-check:gate` (Phase 34 D-22 explicit deferral; revisit when divergence catalog drains)
+- 3 pre-existing pipeline-driver.test.ts whereExists+permissions snapshot failures (verified pre-Phase-34 base)
+
+### Catalogued divergences (PARITY_STATUS.md)
+
+- 2× `OR(simple, EXISTS flip:true)` (fuzz_00132/133) — same root as B7
+- 2× `scalar:true` EXISTS (fuzz_00139/140) — companion resolution work
+- 1× duplicate CSQ alias (seed_18) — won't-fix
+
+### Live verification carry-forward
+
+- Live 1k fast-check fuzz against running caches (after TS-oracle unblocks)
+- Full `tools/ivm-parity/` `npm test` sweep
+- Phase 33 production-style soak validation
 
 ---
 
 ## Phases
 
-- [x] **Phase 30: Audit Fixes** — Ship the 4 IVM port audit fixes on a known-correct baseline before building streaming on top. (4/5 plans complete; gap-closure plan 30-05 pending — closes AUDIT-02 end-to-end) (completed 2026-04-29)
-- [x] **Phase 31: Rust Streaming Primitives + TS Wrappers** — Additive Rust napi streaming methods + TS PipelineDriver wrappers + decoder; no consumer migrated yet. (completed 2026-04-29)
-- [x] **Phase 32: View-Syncer Streaming Migration** — Production consumer flips to streaming; pokes fire as fast pipelines complete. (completed 2026-04-29)
-- [x] **Phase 33: Production Hardening + Benchmarks** — TS↔Rust parity wiring (dualExecCompare via lifted TS oracle), OrExists test breadth, bounded channel test, TTFB benchmark, memory peak measurement. (completed 2026-04-29)
-- [x] **Phase 34: Differential Fuzz + Schema Extension** — Random-AST fuzz vs TS oracle; rich-type schema (jsonb, timestamptz, numeric, NULL semantics) for type-coercion coverage. (completed 2026-04-30)
+<details>
+<summary>✅ v5.0 Streaming + Differential Fuzz (Phases 30-34) — SHIPPED 2026-04-30</summary>
 
----
+- [x] Phase 30: Audit Fixes (5/5 plans) — completed 2026-04-29
+- [x] Phase 31: Rust Streaming Primitives + TS Wrappers (2/2 plans) — completed 2026-04-29
+- [x] Phase 32: View-Syncer Streaming Migration (2/2 plans) — completed 2026-04-29
+- [x] Phase 33: Production Hardening + Benchmarks (3/3 plans) — completed 2026-04-29
+- [x] Phase 34: Differential Fuzz + Schema Extension (7/7 plans) — completed 2026-04-30
 
-## Phase Details
+See `.planning/milestones/v5.0-ROADMAP.md` for full details.
 
-### Phase 30: Audit Fixes
+</details>
 
-**Goal:** Ship the 4 fixes from the IVM port audit so the streaming work in Phase 31 builds on a known-correct operator baseline. These are independent of streaming, low-risk, and unblock the rest of the milestone.
+### 📋 v6.0 (Planning)
 
-**Depends on:** —
-
-**Requirements:** AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04
-
-**Success Criteria** (what must be TRUE):
-
-1. `LIKE 'Foo%'` matches only `'Foo...'`-prefixed rows in Rust IVM (case-sensitive); `LIKE 'foo%'` does not match `'Foo...'`. A regression test in `packages/zqlite-rs/` distinguishes the two.
-2. Editing a column that is an `EXISTS` parent_field causes the source to emit `Remove + Add` (not `Edit`); a regression test confirms downstream output matches TS for both directions of the membership transition.
-3. Framework-invariant violations in Join (parent/child edit changes relationship), Exists (re-entrancy), Take (duplicate primary key), and Cap (partition key change on edit) panic loudly via `assert!` in release builds — verified by a Rust unit test that triggers each invariant and confirms the panic message.
-4. `ExistsOperator` / `OrExistsOperator` Edit handling with `or_predicate` set emits `Remove` when old row passed via or_predicate but new row no longer matches and child count is 0; emits `Add` in the inverse case; passes through when both sides match the same way. Verified by a unit test with all 4 transitions.
-5. Full vitest suite (`pipeline-driver.*.test.ts` + `fuzz-ivm.test.ts` 1k iterations) and `cargo test` in both Rust crates pass after fixes are applied.
-
-**Plans:** 5/5 plans complete
-
-Plans:
-
-- [x] 30-01-PLAN.md — AUDIT-01: LIKE case sensitivity fix in parse_predicate_json (Wave 1)
-- [x] 30-02-PLAN.md — AUDIT-02: EXISTS parent_field added to collect_split_edit_keys (Wave 1)
-- [x] 30-03-PLAN.md — AUDIT-04: Exists/OrExists Edit-with-or_predicate 4-transition fix (Wave 2, depends on 30-02)
-- [x] 30-04-PLAN.md — AUDIT-03: Promote 5 framework-invariant debug_assert sites to assert (Wave 2)
-- [x] 30-05-PLAN.md — AUDIT-02 end-to-end gap closure: production-path TS→Rust split-edit wiring (Wave 3, depends on 30-02 + 30-03; gap_closure)
-
----
-
-### Phase 31: Rust Streaming Primitives + TS Wrappers
-
-**Goal:** Add the full additive streaming surface — Rust `advance_streaming` / `hydrate_streaming` napi methods returning AsyncIterator-shaped chunks, plus TS PipelineDriver wrappers and a per-chunk decoder. Nothing in production code consumes these yet; existing buffered methods are byte-for-byte unchanged.
-
-**Depends on:** Phase 30
-
-**Requirements:** STREAM-01, STREAM-02, STREAM-03, STREAM-04, STREAM-05, STREAM-06, WRAP-01, WRAP-02, WRAP-03, WRAP-04, COMPAT-01, COMPAT-02, COMPAT-03, TEST-01, TEST-02, TEST-03, TEST-04, TEST-05
-
-**Note on scope:** Phases A and B from `.planning/IVM-STREAMING-PLAN.md` are intentionally combined into one phase. The split is only meaningful if a TS consumer migrated between them — which doesn't happen until Phase 32. Combining keeps the additive-but-unconsumed streaming surface in one reviewable unit and lets TEST-04 (TS-vs-Rust parity test) ship alongside the code it covers.
-
-**Success Criteria** (what must be TRUE):
-
-1. `RustPipelineManager.advance_streaming(id, changesJson)` and `hydrate_streaming(id)` / `hydrate_query_streaming(id, queryId)` return an `AdvanceStream`/`HydrateStream` napi class whose `next()` resolves to per-pipeline chunks in completion order; `return_()` flips an `Arc<AtomicBool>` cancel flag that running rayon tasks observe between operator pushes and exit early. Verified by `TEST-01` (cancellation drops at most cancelled+1 chunks), `TEST-02` (companion scalar reset closes channel cleanly), `TEST-03` (panicking pipeline surfaces as `StreamItem::Error` while siblings complete).
-2. `pipeline-driver.ts::advanceStreaming(timer, vsId?)` and `addQueriesStreaming(queries, timer)` exist alongside (not replacing) `advanceAsync` / `addQueriesAsync`, return `AsyncIterable<RowChange | 'yield'>`, surface `ResetPipelinesSignal('scalar-subquery')` / `ResetPipelinesSignal('advancement-timeout')` with the same throw shape as today's buffered path, and call `stream.return_()` on timeout. Companion-bearing queries fall back to the existing TS hydrate path via the same `rustEligible` check.
-3. `decodeAdvanceChunkBuf(buf): DecodedRowChange[]` decodes the per-chunk format (header `[u32 count][u8 0]` + per-row tagged encoding); `decodeAdvanceResultBuf` is byte-for-byte unchanged. A TS test confirms parity: same input → buffered `advanceAsync` and `advanceStreaming` produce identical `RowChange` sets modulo cross-pipeline ordering (`TEST-04`).
-4. `TEST-05` confirms `for await { break }` over `advanceStreaming.changes` calls Rust `stream.return_()` and Rust pipeline tasks stop work within one operator-push boundary.
-5. Backwards compatibility: full vitest suite (`pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts` 1k iterations, `decode-advance-buf.test.ts`) and `cargo test` in both Rust crates pass unchanged. Buffered method signatures (`advance`, `advanceAsync`, `hydrate*`, `addQuery*`, `addQueries*`) and the `encode_advance_result_buf` / `decodeAdvanceResultBuf` binary format are byte-for-byte identical to v4.0 (verified by diff against the v4.0 tag).
-
-**Plans:** 2/2 plans complete
-
-Plans:
-
-- [x] 31-01-PLAN.md — Rust streaming primitives (chunk_encoder, AdvanceStream/HydrateStream napi classes, advance_streaming/hydrate_streaming/hydrate_query_streaming methods, TEST-01/02/03) (Wave 1)
-- [x] 31-02-PLAN.md — TS streaming wrappers (decodeAdvanceChunkBuf, RustStreamError, advanceStreaming/addQueriesStreaming, TEST-04 fuzz, TEST-05 cancel propagation) (Wave 2, depends on 31-01)
-
----
-
-### Phase 32: View-Syncer Streaming Migration
-
-**Goal:** Flip the production consumer (`view-syncer.ts`) from the buffered API to the streaming API so `pokers.pokePart` fires as fast pipelines complete instead of only at the end of the batch. CVR commit semantics, `pokers.end`, and `pokers.cancel` on reset are preserved exactly.
-
-**Depends on:** Phase 31
-
-**Requirements:** MIGRATE-01, MIGRATE-02, MIGRATE-03, MIGRATE-04
-
-**Success Criteria** (what must be TRUE):
-
-1. `view-syncer.ts::#advancePipelines` calls `advanceStreaming` (not `advanceAsync`); `#processChanges` consumes `AsyncIterable<RowChange | 'yield'>` via `for await of`. The signature change is internal to `view-syncer.ts` and does not leak to any other module.
-2. `view-syncer.ts::#hydrateUnchangedQueries` (and any other batch-hydration callsite identified in Phase 32 planning) calls `addQueriesStreaming` instead of `addQueriesAsync`.
-3. `pokers.pokePart` is observed firing mid-batch in a test scenario with N pipelines of varying completion times — verified by an instrumented test that records `pokePart` call timestamps relative to per-pipeline completion, asserting the first `pokePart` occurs before the slowest pipeline finishes.
-4. CVR commit happens exactly once at the end of `#advancePipelines` after the full stream is consumed; `pokers.end(finalVersion)` fires exactly once after CVR commit; `pokers.cancel()` fires correctly when `ResetPipelinesSignal` is thrown mid-stream (verified by an integration test that injects a companion-scalar change mid-batch and asserts no in-flight changes are committed client-side).
-5. Full view-syncer test suite passes; `pipeline-driver.*.test.ts`, `fuzz-ivm.test.ts` (1k iterations), and `cargo test` continue to pass unchanged from Phase 31.
-
-**Plans:** 2/2 plans complete
-
-Plans:
-
-- [x] 32-01-PLAN.md — CR-01: i64 decoder safe-integer gate fix in decode-advance-buf.ts (Wave 1)
-- [x] 32-02-PLAN.md — MIGRATE-01..04: view-syncer streaming migration with ZQLITE_RS_USE_STREAMING_CONSUMER feature flag, RustStreamError logging, mid-batch pokePart test, reset-cancel test (Wave 2, depends on 32-01)
-
----
-
-### Phase 33: Production Hardening + Benchmarks
-
-**Goal:** Layered defense before shipping the Rust IVM port to production. Wire `dualExecCompare` into the pipeline-driver hot path so every existing vitest run becomes a TS↔Rust parity check; close the OrExists test breadth gap (currently 4.4× behind Exists); deliver the streaming PERF benchmarks (TTFB and peak heap) deferred from Phases 31/32. Out of scope for this phase: random-AST differential fuzz and schema-extended fuzz (moved to Phase 34).
-
-**Depends on:** Phase 32
-
-**Requirements:** HARDEN-01, HARDEN-02, PERF-01, PERF-02, PERF-03
-
-**Success Criteria** (what must be TRUE):
-
-1. `dualExecCompare` (already exists at `packages/zero-cache/src/services/view-syncer/dual-executor.ts:283`) is invoked from `pipeline-driver.ts` `advanceAsync` / `hydrateAsync` paths under a feature flag (e.g., `ZQLITE_RS_PARITY_CHECK=true`), so any test that exercises pipeline-driver becomes a TS-vs-Rust differential check. Log + count divergences; in strict mode, throw on divergence. Default off in CI; on for the parity-check vitest run added by this phase.
-2. `or_exists_op.rs` test count reaches parity with `exists_op.rs` patterns (target: ≥30 tests in or_exists_op.rs vs the current 10; matched against the test categories in exists_op.rs — fetch, push, hydrate, edit-with/without-or-predicate, transition matrix, in_push re-entrancy, framework-invariant assertions, builder-spec parity).
-3. The Rust streaming channel is bounded (`mpsc::sync_channel(pipeline_count.max(1) + 1)` per Phase 31 `D-16`); verified by a new Rust unit test that fills the channel and confirms producer pipelines block until JS pulls.
-4. A microbenchmark (extending `rust-ivm-bench.ts` or new file) configures N pipelines with one slow tail pipeline and asserts that time-to-first-chunk is within ~1.5× of `min(pipeline_time)` (not `max`). Result recorded in `.planning/milestones/v5.0-bench-results.md`.
-5. Peak Rust heap during a representative advance/hydrate batch is measured and shown to be `O(max_pipeline_changes)` rather than `O(total_changes)` — verified by running the same workload through buffered `advanceAsync` and streaming `advanceStreaming` and showing the streaming peak is at least ~Nx smaller for an N-pipeline workload with balanced output.
-6. Full vitest + `cargo test` suites continue to pass; benchmark numbers committed to `.planning/milestones/v5.0-bench-results.md` for posterity.
-
-**Plans:** 3/3 plans complete
-
-Plans:
-
-- [x] 33-01-PLAN.md — HARDEN-01: TS oracle lift + dualExecCompare sampling shim wired into pipeline-driver.ts (Wave 1)
-- [x] 33-02-PLAN.md — HARDEN-02: Expand or_exists_op.rs test coverage from 5 to ≥22 tests (Wave 1, parallel with 33-01)
-- [x] 33-03-PLAN.md — PERF-01 + PERF-02 + PERF-03: Channel-block test + TTFB bench + memory-peak bench + bench-results.md (Wave 1, parallel with 33-01/02)
-
----
-
-### Phase 34: Differential Fuzz + Schema Extension
-
-**Goal:** Close the largest remaining correctness gap — bugs the per-operator unit tests and the streaming-vs-buffered fuzz cannot catch because they live at AST shapes nobody wrote tests for, or at type-coercion boundaries the harness's basic-types schema doesn't exercise. Build a property-based differential fuzzer that generates random `(schema, AST, data, change-stream)` tuples and asserts TS↔Rust IVM produce identical results.
-
-**Depends on:** Phase 33
-
-**Requirements:** FUZZ-01, FUZZ-02
-
-**Success Criteria** (what must be TRUE):
-
-1. New file `packages/zero-cache/src/services/view-syncer/random-ast-parity.fuzz.test.ts` (or in `tools/ivm-parity/`) uses `fast-check` to generate random ASTs across the full operator surface (filter, join, exists, or-exists, take, cap) and runs each through the existing TS oracle and the Rust IVM, asserting result-set equality. `FUZZ_NUM_RUNS=1000` default; expandable.
-2. The fuzz harness's schema is extended with rich production-relevant types: `jsonb`, `timestamptz`, `numeric`, nullable variants, and at least one composite/array column. Test fixtures cover NULL semantics (NULL ≠ NULL in equality, NULL propagation in arithmetic, NULL in JOIN keys) and type coercion (string→number, numeric precision boundaries, date/time round-trips).
-3. Any divergence found by the fuzzer becomes a regression test in the appropriate `*_op.rs` or `pipeline-driver.*.test.ts` before being fixed, so it can never regress silently.
-4. Full vitest + `cargo test` suites continue to pass; new fuzz runs at 1k iterations in <2 minutes (fits CI budget).
-
-**Plans:** 7/7 plans complete
-
-Plans:
-
-- [x] 34-01-PLAN.md — Wave 0 scaffolding: fast-check skeleton (arb-ast/harness-fuzz/random-ast-fuzz) + allow-list config + red-state Rust unit-test stubs for B1/B2/B3/B11 (Wave 0)
-- [x] 34-02-PLAN.md — Track 2 B1 (Skip ordering) + B2 (parent_sizes max(1)) surgical fixes + B1/B2 differential test (Wave 1)
-- [x] 34-03-PLAN.md — Track 1 fast-check generator full operator surface + targeted B1/B2/B3 arbs + 100-iter timing probe (Wave 1, parallel)
-- [x] 34-04-PLAN.md — FUZZ-02 schema extension: events/big_id_records/event_tags + jsonb/timestamptz/numeric/bigint + NULL/i64/DST/jsonb fixtures + MUTATIONS additions (Wave 1, parallel)
-- [x] 34-05-PLAN.md — Track 2 B3 (Take partition_key threading — headline fix; closes original Risk #1 simultaneously) + B3 differential test (Wave 2, depends on 34-02)
-- [x] 34-06-PLAN.md — Track 2 B11 (cascade-delete prev snapshot via additive set_prev_snapshot napi method) + TS wiring + B11 differential test (Wave 2, depends on 34-02)
-- [x] 34-07-PLAN.md — Verification gate: 1k fast-check fuzz <2min, Phase 33 bench re-run, npm test integration, PARITY_STATUS update, D-21 sub-condition sign-off (Wave 3)
+Use `/gsd-new-milestone` to:
+1. Surface and prioritize the carry-forward items above
+2. Add new v6.0 capabilities (FlippedJoin operator family is the biggest open item)
+3. Generate fresh `REQUIREMENTS.md` and Phase 35+ roadmap
 
 ---
 
 ## Progress
 
-| Phase                                       | Plans Complete | Status      | Completed  |
-| ------------------------------------------- | -------------- | ----------- | ---------- |
-| 30. Audit Fixes                             | 5/5            | Complete    | 2026-04-29 |
-| 31. Rust Streaming Primitives + TS Wrappers | 2/2            | Complete    | 2026-04-29 |
-| 32. View-Syncer Streaming Migration         | 2/2            | Complete    | 2026-04-29 |
-| 33. Production Hardening + Benchmarks       | 3/3            | Complete    | 2026-04-29 |
-| 34. Differential Fuzz + Schema Extension    | 7/7 | Complete    | 2026-04-30 |
-
----
-
-## Coverage
-
-- v5.0 requirements: 33
-- Mapped: 33 (100%)
-- Orphans: 0
-
-| Phase    | Requirement count | Requirement IDs                                                                                                                                                                    |
-| -------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Phase 30 | 4                 | AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04                                                                                                                                             |
-| Phase 31 | 18                | STREAM-01, STREAM-02, STREAM-03, STREAM-04, STREAM-05, STREAM-06, WRAP-01, WRAP-02, WRAP-03, WRAP-04, COMPAT-01, COMPAT-02, COMPAT-03, TEST-01, TEST-02, TEST-03, TEST-04, TEST-05 |
-| Phase 32 | 4                 | MIGRATE-01, MIGRATE-02, MIGRATE-03, MIGRATE-04                                                                                                                                     |
-| Phase 33 | 5                 | HARDEN-01, HARDEN-02, PERF-01, PERF-02, PERF-03                                                                                                                                    |
-| Phase 34 | 2                 | FUZZ-01, FUZZ-02                                                                                                                                                                   |
+| Milestone | Phases | Status | Completed |
+| --------- | ------ | ------ | --------- |
+| v1.0 | 12 | Complete | 2026-04-20 |
+| v2.0 | 6 | Complete | 2026-04-21 |
+| v3.0 | — | Complete | 2026-04-21 |
+| v4.0 | 11 | Complete | 2026-04-29 |
+| v5.0 | 5 (30–34) | Complete | 2026-04-30 |
+| v6.0 | TBD | Planning | — |
