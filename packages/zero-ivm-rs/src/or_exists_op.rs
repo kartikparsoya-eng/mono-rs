@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::filter::{Predicate, Value, compare_values, evaluate_json_row};
+use crate::filter::{compare_values, evaluate_json_row, Predicate, Value};
 use crate::operator::Operator;
 use crate::types::{Change, ChildData, Constraint, FetchRequest, Node, Row};
 
@@ -64,8 +64,14 @@ impl Branch {
 
     fn is_join_match(&self, parent_row: &Row, child_row: &Row) -> bool {
         for (pk, ck) in self.parent_key.iter().zip(self.child_key.iter()) {
-            let pv = parent_row.get(pk).map(Value::from_json).unwrap_or(Value::Null);
-            let cv = child_row.get(ck).map(Value::from_json).unwrap_or(Value::Null);
+            let pv = parent_row
+                .get(pk)
+                .map(Value::from_json)
+                .unwrap_or(Value::Null);
+            let cv = child_row
+                .get(ck)
+                .map(Value::from_json)
+                .unwrap_or(Value::Null);
             if matches!(pv, Value::Null) || matches!(cv, Value::Null) {
                 return false;
             }
@@ -86,13 +92,19 @@ impl Branch {
 
     fn get_or_fetch_count(&mut self, row: &Row, in_push: bool) -> usize {
         let pk = self.parent_key_str(row);
-        if !in_push {
-            if let Some(&count) = self.parent_sizes.get(&pk) {
-                return count;
-            }
+        // During push, the explicit increment/decrement in push_impl is the
+        // authoritative count; re-fetching here would race with concurrent
+        // branch updates and overwrite valid cached counts (B5: this manifests
+        // when one branch's transition triggers `other_branches_pass`, which
+        // would otherwise overwrite a sibling branch's just-incremented count
+        // with a stale fetch from the underlying source).
+        if let Some(&count) = self.parent_sizes.get(&pk) {
+            return count;
         }
         let count = self.fetch_child_count(row);
-        self.parent_sizes.insert(pk, count);
+        if !in_push {
+            self.parent_sizes.insert(pk, count);
+        }
         count
     }
 
@@ -243,9 +255,22 @@ impl Operator for OrExistsOperator {
     }
 
     fn push_child(&mut self, change: Change) -> Vec<Change> {
+        // B5 fix: process EVERY branch so each branch's `parent_sizes` cache
+        // stays in sync with the underlying child source. The previous
+        // implementation short-circuited on the first branch that produced
+        // output, leaving later branches with stale counts. That broke OR-of-
+        // EXISTS where multiple branches share (or independently observe) the
+        // same child source — subsequent edits/removes diverged from the TS
+        // distributive-OR (FanOut/FanIn) semantics.
+        //
+        // After collecting per-branch outputs we collapse them with rules
+        // matching `pushAccumulatedChanges` for a CHILD fan-out:
+        //   - if any branch preserved the original Child change, that wins
+        //   - otherwise at most one Add or one Remove is emitted
+        //   - duplicate Adds / Removes across branches are merged on row PK
         let child_row = change.node().row.clone();
 
-        // Try each branch to find which one this child belongs to
+        let mut accumulated: Vec<Change> = Vec::new();
         for bi in 0..self.branches.len() {
             // Clone needed data to avoid borrow issues
             let child_key = self.branches[bi].child_key.clone();
@@ -254,18 +279,15 @@ impl Operator for OrExistsOperator {
 
             let constraint = if !child_key.is_empty() && !parent_key.is_empty() {
                 Some(Constraint::from_pairs(
-                    child_key
-                        .iter()
-                        .zip(parent_key.iter())
-                        .map(|(ck, pk)| {
-                            (
-                                pk.clone(),
-                                child_row
-                                    .get(ck)
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null),
-                            )
-                        }),
+                    child_key.iter().zip(parent_key.iter()).map(|(ck, pk)| {
+                        (
+                            pk.clone(),
+                            child_row
+                                .get(ck)
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    }),
                 ))
             } else {
                 None
@@ -286,7 +308,6 @@ impl Operator for OrExistsOperator {
                 continue;
             }
 
-            let mut output = Vec::new();
             for parent_node in parent_nodes {
                 let wrapped = Change::Child {
                     node: parent_node,
@@ -295,13 +316,11 @@ impl Operator for OrExistsOperator {
                         change: Box::new(change.clone()),
                     },
                 };
-                output.extend(self.push(wrapped));
-            }
-            if !output.is_empty() {
-                return output;
+                accumulated.extend(self.push(wrapped));
             }
         }
-        vec![]
+
+        Self::collapse_child_fanout(accumulated)
     }
 }
 
@@ -363,9 +382,7 @@ impl OrExistsOperator {
                             .copied()
                             .unwrap_or_else(|| self.branches[bi].fetch_child_count(&node.row));
                         let new_count = old_count + 1;
-                        self.branches[bi]
-                            .parent_sizes
-                            .insert(pk.clone(), new_count);
+                        self.branches[bi].parent_sizes.insert(pk.clone(), new_count);
 
                         let was_passing = self.branches[bi].passes_filter(old_count)
                             || self.other_branches_pass(bi, &node.row);
@@ -389,9 +406,7 @@ impl OrExistsOperator {
                             .copied()
                             .unwrap_or_else(|| self.branches[bi].fetch_child_count(&node.row));
                         let new_count = old_count.saturating_sub(1);
-                        self.branches[bi]
-                            .parent_sizes
-                            .insert(pk.clone(), new_count);
+                        self.branches[bi].parent_sizes.insert(pk.clone(), new_count);
 
                         let was_passing = self.branches[bi].passes_filter(old_count)
                             || self.other_branches_pass(bi, &node.row);
@@ -410,10 +425,7 @@ impl OrExistsOperator {
                     }
                     Change::Edit { .. } | Change::Child { .. } => {
                         // Re-evaluate all branches
-                        let cached = self.branches[bi]
-                            .parent_sizes
-                            .get(&pk)
-                            .copied();
+                        let cached = self.branches[bi].parent_sizes.get(&pk).copied();
                         let count = match cached {
                             Some(c) => c,
                             None => self.branches[bi].fetch_child_count(&node.row),
@@ -442,6 +454,320 @@ impl OrExistsOperator {
             }
         }
         false
+    }
+
+    /// Collapse outputs from all OR branches for a single CHILD fan-out push,
+    /// matching the rules used by TS `pushAccumulatedChanges` (CHILD case):
+    ///   - If any branch preserved the original Child change, that takes
+    ///     precedence over Add/Remove emissions from other branches.
+    ///   - Otherwise emit at most one Add or one Remove (the row is the same
+    ///     across branches; downstream sees a single OR-level transition).
+    ///   - Duplicate Adds or Removes for the same parent are merged.
+    fn collapse_child_fanout(accumulated: Vec<Change>) -> Vec<Change> {
+        if accumulated.is_empty() {
+            return vec![];
+        }
+        let mut child_changes: Vec<Change> = Vec::new();
+        let mut add_change: Option<Change> = None;
+        let mut remove_change: Option<Change> = None;
+        for ch in accumulated {
+            match ch {
+                Change::Child { .. } => child_changes.push(ch),
+                Change::Add(_) => {
+                    if add_change.is_none() {
+                        add_change = Some(ch);
+                    }
+                }
+                Change::Remove(_) => {
+                    if remove_change.is_none() {
+                        remove_change = Some(ch);
+                    }
+                }
+                Change::Edit { .. } => {
+                    // Edits should not arise from a Child fan-out, but if they
+                    // do (e.g. nested Edit-of-Child) preserve them.
+                    child_changes.push(ch);
+                }
+            }
+        }
+        // Child takes precedence over Add/Remove from sibling branches.
+        if !child_changes.is_empty() {
+            return child_changes.into_iter().take(1).collect();
+        }
+        if let Some(c) = add_change {
+            return vec![c];
+        }
+        if let Some(c) = remove_change {
+            return vec![c];
+        }
+        vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests_b5 {
+    use super::*;
+    use crate::filter::Predicate;
+    use std::sync::{Arc, Mutex};
+
+    /// Shared, mutable mock source. Both the parent input and each branch's
+    /// child input can be wired to a shared `Arc<Mutex<Vec<Node>>>` so
+    /// tests can mirror "upstream Add/Remove" effects on the underlying
+    /// table — required because OrExistsOperator's push_impl falls back to
+    /// `fetch_child_count` whenever the cached count is unknown.
+    /// (Arc/Mutex over Rc/RefCell because Operator: Send.)
+    struct MockSource {
+        nodes: Arc<Mutex<Vec<Node>>>,
+    }
+
+    impl MockSource {
+        fn from_handle(handle: Arc<Mutex<Vec<Node>>>) -> Self {
+            Self { nodes: handle }
+        }
+    }
+
+    impl Operator for MockSource {
+        fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
+            let nodes = self.nodes.lock().unwrap();
+            match &req.constraint {
+                Some(c) if !c.columns.is_empty() => nodes
+                    .iter()
+                    .filter(|n| c.columns.iter().all(|(k, v)| n.row.get(k) == Some(v)))
+                    .cloned()
+                    .collect(),
+                _ => nodes.clone(),
+            }
+        }
+        fn push(&mut self, _change: Change) -> Vec<Change> {
+            vec![]
+        }
+        fn op_type(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn make_parent(id: i64) -> Node {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        Node {
+            row,
+            relationships: HashMap::new(),
+        }
+    }
+
+    /// Build a child row with branch-routing keys. Setting one of
+    /// `parent_a_id` / `parent_b_id` to None encodes "this child belongs to
+    /// the other branch only" — push_child's null-key check then routes the
+    /// change exclusively to the matching branch (mirrors how upstream
+    /// Filter operators in TS pre-screen children per branch).
+    fn make_comment(id: i64, parent_a_id: Option<i64>, parent_b_id: Option<i64>) -> Node {
+        let mut row = Row::new();
+        row.insert("id".to_string(), serde_json::json!(id));
+        row.insert(
+            "parent_a_id".to_string(),
+            match parent_a_id {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+        row.insert(
+            "parent_b_id".to_string(),
+            match parent_b_id {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+        Node {
+            row,
+            relationships: HashMap::new(),
+        }
+    }
+
+    /// Two branches that observe the SAME underlying `comments` source via
+    /// two independent join keys (parent_a_id / parent_b_id).
+    /// This emulates OR(EXISTS(comments WHERE x=1), EXISTS(comments WHERE x=2))
+    /// after distributive-OR rewrite: each branch sees children pre-filtered
+    /// to its predicate (the null on the other branch's key blocks routing).
+    /// Returns the operator plus a shared handle to the comments table that
+    /// the test mutates to mirror upstream Add/Remove effects.
+    fn build_or_exists_two_branches_same_source(
+        parents: Vec<Node>,
+    ) -> (OrExistsOperator, Arc<Mutex<Vec<Node>>>) {
+        let parent_input = Box::new(MockSource {
+            nodes: Arc::new(Mutex::new(parents)),
+        });
+        // Both branches read the SAME shared comments table.
+        let comments = Arc::new(Mutex::new(Vec::<Node>::new()));
+        let child_a = Box::new(MockSource::from_handle(Arc::clone(&comments)));
+        let child_b = Box::new(MockSource::from_handle(Arc::clone(&comments)));
+        let op = OrExistsOperator::new(
+            parent_input,
+            vec![
+                (
+                    child_a,
+                    "comments_a".to_string(),
+                    false,
+                    vec!["id".to_string()],
+                    vec!["parent_a_id".to_string()],
+                ),
+                (
+                    child_b,
+                    "comments_b".to_string(),
+                    false,
+                    vec!["id".to_string()],
+                    vec!["parent_b_id".to_string()],
+                ),
+            ],
+            None::<Predicate>,
+        );
+        (op, comments)
+    }
+
+    /// Regression test for B5 — OrExists.push_child must update EVERY
+    /// branch's `parent_sizes`, not short-circuit on the first branch that
+    /// produces output. The previous implementation early-returned after
+    /// branch A emitted, leaving branch B's count permanently stale; later
+    /// pushes then mis-computed transitions and diverged from TS
+    /// distributive-OR (FanOut/FanIn) semantics.
+    #[test]
+    fn test_b5_or_exists_same_source_multi_branch() {
+        let parents = vec![make_parent(1)];
+        let (mut op, comments) = build_or_exists_two_branches_same_source(parents);
+
+        // Initial state: parent 1 has zero matching children in either branch.
+        let initial = op.fetch(&FetchRequest::default());
+        assert_eq!(
+            initial.len(),
+            0,
+            "no branch passes; parent must be filtered"
+        );
+        let pk = op.branches[0].parent_key_str(&make_parent(1).row);
+        assert_eq!(op.branches[0].parent_sizes.get(&pk).copied(), Some(0));
+        assert_eq!(op.branches[1].parent_sizes.get(&pk).copied(), Some(0));
+
+        // Step 1: push Child::Add for a comment routed to branch A only
+        // (parent_b_id is NULL → push_child skips branch B for this change).
+        let child_for_a = make_comment(10, Some(1), None);
+        // Mirror the upstream Add: the child source now contains this row so
+        // any fetch_child_count fallback inside push_impl sees the new state.
+        comments.lock().unwrap().push(child_for_a.clone());
+        let result_a = op.push_child(Change::Add(child_for_a));
+        // 0→1 transition on branch A while branch B is still 0 → OR-level
+        // goes from "no branch passes" to "branch A passes" → emit Add.
+        assert_eq!(result_a.len(), 1, "expected exactly one OR-level Add");
+        assert!(matches!(
+            &result_a[0],
+            Change::Add(n) if n.row.get("id").unwrap() == &serde_json::json!(1)
+        ));
+        assert_eq!(
+            op.branches[0].parent_sizes.get(&pk).copied(),
+            Some(1),
+            "branch A parent_sizes[1] should be 1 after Add"
+        );
+        assert_eq!(
+            op.branches[1].parent_sizes.get(&pk).copied(),
+            Some(0),
+            "branch B parent_sizes[1] must remain 0 (child has parent_b_id=null)"
+        );
+
+        // Step 2: push Child::Add for a comment routed to branch B only.
+        // Pre-fix: branch A had ALREADY produced output for the previous
+        // push, so the short-circuit logic was reachable on similar
+        // multi-branch routing. With same-source-different-key wiring,
+        // branch A's constraint has parent_a_id=null and is skipped;
+        // branch B must update its state.
+        let child_for_b = make_comment(20, None, Some(1));
+        comments.lock().unwrap().push(child_for_b.clone());
+        let result_b = op.push_child(Change::Add(child_for_b));
+        assert_eq!(
+            op.branches[1].parent_sizes.get(&pk).copied(),
+            Some(1),
+            "B5 regression: branch B parent_sizes[1] must be 1 \
+             (independent of branch A state)"
+        );
+        assert_eq!(
+            op.branches[0].parent_sizes.get(&pk).copied(),
+            Some(1),
+            "branch A unaffected by branch B's child"
+        );
+        // Branch A is already passing; OR-level was passing → still passing,
+        // so no Add/Remove transition. At most one passthrough Child.
+        assert!(
+            result_b.len() <= 1
+                && !result_b
+                    .iter()
+                    .any(|c| matches!(c, Change::Add(_) | Change::Remove(_))),
+            "expected no Add/Remove transition, got {:?}",
+            result_b
+        );
+
+        // Step 3: remove the branch-A child. Branch A 1→0, branch B still 1.
+        // OR-level remains passing, so NO Remove(parent) should be emitted.
+        comments
+            .lock()
+            .unwrap()
+            .retain(|n| n.row.get("id") != Some(&serde_json::json!(10)));
+        let result_c = op.push_child(Change::Remove(make_comment(10, Some(1), None)));
+        assert_eq!(
+            op.branches[0].parent_sizes.get(&pk).copied(),
+            Some(0),
+            "branch A should drop to 0 after Remove"
+        );
+        assert_eq!(
+            op.branches[1].parent_sizes.get(&pk).copied(),
+            Some(1),
+            "branch B still passing after branch A remove"
+        );
+        let emitted_remove = result_c.iter().any(|c| matches!(c, Change::Remove(_)));
+        assert!(
+            !emitted_remove,
+            "OR-level must NOT emit Remove(parent) while branch B still passes; got {:?}",
+            result_c
+        );
+
+        // Step 4 (the smoking-gun for B5): push a child that matches BOTH
+        // branches simultaneously (parent_a_id=1 AND parent_b_id=1, no nulls).
+        // Pre-fix: branch A processes the change, accumulates output, then
+        // the short-circuit `if !output.is_empty() return` exits — branch B's
+        // parent_sizes[1] is NEVER decremented from its current 1, BUT the
+        // INVERSE scenario (initial Add) would never increment branch B
+        // either. To make the divergence inescapable on a single push, start
+        // from a fresh, empty state: both branches at 0, then push an Add
+        // that should drive BOTH to 1.
+        let parents2 = vec![make_parent(2)];
+        let (mut op2, comments2) = build_or_exists_two_branches_same_source(parents2);
+        let _ = op2.fetch(&FetchRequest::default());
+        let pk2 = op2.branches[0].parent_key_str(&make_parent(2).row);
+        assert_eq!(op2.branches[0].parent_sizes.get(&pk2).copied(), Some(0));
+        assert_eq!(op2.branches[1].parent_sizes.get(&pk2).copied(), Some(0));
+
+        // Child matches BOTH join keys simultaneously.
+        // NOTE: we deliberately do NOT mirror the Add into `comments2` here.
+        // OrExistsOperator's push_impl reads cached parent_sizes (the
+        // pre-change state seeded by op2.fetch above). When the cache is
+        // present, push_impl treats `old_count` as the pre-change value and
+        // increments — exactly mimicking how a real pipeline behaves where
+        // the upstream child source's count is reflected via the cache rather
+        // than re-fetched mid-push. Mirroring the underlying source here would
+        // cause `other_branches_pass` (in_push=true) to re-fetch and observe
+        // the post-change count, double-counting via cache overwrite.
+        let _comments2_handle = &comments2; // keep alive
+        let child_both = make_comment(99, Some(2), Some(2));
+        let _ = op2.push_child(Change::Add(child_both));
+
+        // Post-fix: BOTH branches must reach 1. Pre-fix: branch A reaches 1,
+        // short-circuit returns, branch B stays at 0 — this is the bug.
+        assert_eq!(
+            op2.branches[0].parent_sizes.get(&pk2).copied(),
+            Some(1),
+            "branch A must increment for shared-key child"
+        );
+        assert_eq!(
+            op2.branches[1].parent_sizes.get(&pk2).copied(),
+            Some(1),
+            "B5 smoking gun: branch B MUST also increment when the same \
+             change matches both branches; pre-fix short-circuit left this at 0"
+        );
     }
 }
 
