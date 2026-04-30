@@ -355,7 +355,27 @@ fn append_condition_configs(
             configs.push(OperatorConfig::Filter { predicate: pred });
         }
         Condition::And { conditions } => {
+            // NEW-4: TS builder.ts:308-333 emits CSQ-Exists conditions BEFORE
+            // applyWhere (Filter). Pre-fix Rust appended in lexical order,
+            // producing [Filter, Exists] for `And { [simple, csq] }` while TS
+            // produces [Exists, Filter]. Partition immediate children: emit
+            // CSQ-bearing branches first, simple branches after. Nested
+            // And/Or branches that themselves contain CSQs are NOT hoisted
+            // out of their parent — `has_csq` only inspects this immediate
+            // level via the recursive emission of the inner branch.
+            let mut csq_first: Vec<&Condition> = Vec::new();
+            let mut simple_after: Vec<&Condition> = Vec::new();
             for sub in conditions {
+                if has_csq(sub) {
+                    csq_first.push(sub);
+                } else {
+                    simple_after.push(sub);
+                }
+            }
+            for sub in csq_first {
+                append_condition_configs(schema, configs, sub, primary_key)?;
+            }
+            for sub in simple_after {
                 append_condition_configs(schema, configs, sub, primary_key)?;
             }
         }
@@ -673,26 +693,37 @@ fn apply_exists_limit(
     system: Option<&str>,
     partition_key: Option<Vec<String>>,
 ) {
-    // Check if there's already a Take in the child configs
-    let has_take = child_configs.iter().any(|c| matches!(c, OperatorConfig::Take { .. }));
-    if !has_take {
-        let limit = if system == Some("permissions") {
-            PERMISSIONS_EXISTS_LIMIT
-        } else {
-            EXISTS_LIMIT
-        };
-        // Extract sort from the child Source config so TakeOperator can compare
-        // rows correctly when using the bound-based path on subsequent fetches.
-        let sort = child_configs.first().and_then(|c| match c {
-            OperatorConfig::Source { sort, .. } => Some(sort.clone()),
-            _ => None,
-        }).unwrap_or_default();
-        child_configs.push(OperatorConfig::Take {
-            limit,
-            sort,
-            partition_key,
-        });
+    let cap = if system == Some("permissions") {
+        PERMISSIONS_EXISTS_LIMIT
+    } else {
+        EXISTS_LIMIT
+    };
+    // B6: TS `builder.ts:316-319` overwrites `subquery.limit` with the EXISTS
+    // cap BEFORE recursion, so a user-supplied larger limit is always clamped.
+    // Rust used to short-circuit on `has_take` and leave the user limit intact,
+    // which leaks unbounded permission-EXISTS evaluations under malicious ACLs.
+    // Now: if a Take already exists with a larger limit, clamp it to `cap`.
+    if let Some(take) = child_configs
+        .iter_mut()
+        .find(|c| matches!(c, OperatorConfig::Take { .. }))
+    {
+        if let OperatorConfig::Take { limit, .. } = take {
+            if *limit > cap {
+                *limit = cap;
+            }
+        }
+        return;
     }
+    // No Take present — append one at `cap`.
+    let sort = child_configs.first().and_then(|c| match c {
+        OperatorConfig::Source { sort, .. } => Some(sort.clone()),
+        _ => None,
+    }).unwrap_or_default();
+    child_configs.push(OperatorConfig::Take {
+        limit: cap,
+        sort,
+        partition_key,
+    });
 }
 
 fn json_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
