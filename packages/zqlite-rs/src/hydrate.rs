@@ -899,6 +899,13 @@ fn build_next_operator(
             primary_key.clone(),
             partition_key.clone(),
         ))),
+        OperatorConfig::FanOut { .. } => {
+            // Phase 36 Wave 4 will implement proper hydration. Wave 1 lands
+            // the OperatorConfig variant + zero-ivm-rs operator; the
+            // ast_to_config emitter does not yet emit FanOut, so this arm
+            // is unreachable in production today.
+            Err("FanOut hydration not yet implemented (Phase 36 Wave 4)".to_string())
+        }
     }
 }
 
@@ -1157,6 +1164,10 @@ fn build_push_next_operator(
             primary_key.clone(),
             partition_key.clone(),
         ))),
+        OperatorConfig::FanOut { .. } => {
+            // Phase 36 Wave 4 will implement push-next for FanOut.
+            Err("FanOut push-next not yet implemented (Phase 36 Wave 4)".to_string())
+        }
     }
 }
 

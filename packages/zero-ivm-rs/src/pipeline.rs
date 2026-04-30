@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::cap_op::CapOperator;
 use crate::exists_op::ExistsOperator;
 use crate::or_exists_op::OrExistsOperator;
+use crate::fan_out_op::FanOutOperator;
 use crate::filter::{Predicate, Value};
 use crate::filter_op::FilterOperator;
 use crate::join_op::JoinOperator;
@@ -78,6 +79,13 @@ pub enum OperatorConfig {
         primary_key: Vec<String>,
         partition_key: Option<Vec<String>>,
     },
+    /// FanOut+FanIn composite operator (filter-graph variant).
+    /// Wave 1 of Phase 36 — used by `applyOr` for non-flipped subqueries.
+    /// `branches` is a list of sub-pipelines; the operator owns each branch
+    /// and dedup-merges their outputs via `push_accumulated_changes` with
+    /// identity merge/make functions.
+    #[serde(rename = "fan_out")]
+    FanOut { branches: Vec<Vec<OperatorConfig>> },
 }
 
 fn parse_sort(sort: &[(String, String)]) -> Vec<SortSpec> {
@@ -346,6 +354,23 @@ pub fn build_operator(configs: &[OperatorConfig]) -> std::result::Result<Box<dyn
                     primary_key.clone(),
                     partition_key.clone(),
                 ))
+            }
+            OperatorConfig::FanOut { branches } => {
+                if branches.is_empty() {
+                    return Err("fan_out requires at least one branch".to_string());
+                }
+                // Each branch is a self-contained sub-pipeline (Source +
+                // downstream filter chain). The `current` upstream is
+                // dropped — branches must include their own Source. This
+                // mirrors `OrExistsOperator::Branch` semantics.
+                //
+                // (Wave 4 AST translation responsibility: when emitting a
+                // FanOut, replicate the parent Source-config into each
+                // branch's prefix so the wire format is self-contained.)
+                let _ = current; // intentionally drop
+                let branch_ops: Result<Vec<Box<dyn Operator>>, String> =
+                    branches.iter().map(|b| build_operator(b)).collect();
+                Box::new(FanOutOperator::new(branch_ops?))
             }
         });
     }
@@ -689,5 +714,112 @@ mod tests {
         });
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].row.get("id").unwrap(), &serde_json::json!(1));
+    }
+
+    // ----- Phase 36 Wave 1: FanOut config round-trip + builder tests -----
+
+    #[test]
+    fn test_deserialize_fan_out_config() {
+        let json = r#"{
+            "type": "fan_out",
+            "branches": [
+                [{"type":"source","table_name":"users","columns":["id"],"primary_key":["id"],"sort":[["id","asc"]]}],
+                [{"type":"source","table_name":"users","columns":["id"],"primary_key":["id"],"sort":[["id","asc"]]}]
+            ]
+        }"#;
+        let config: OperatorConfig = serde_json::from_str(json).unwrap();
+        match &config {
+            OperatorConfig::FanOut { branches } => {
+                assert_eq!(branches.len(), 2);
+            }
+            _ => panic!("expected FanOut, got {:?}", config),
+        }
+    }
+
+    #[test]
+    fn test_fan_out_builds_to_operator_tree() {
+        let configs = vec![OperatorConfig::FanOut {
+            branches: vec![
+                vec![OperatorConfig::Source {
+                    table_name: "u".to_string(),
+                    columns: vec!["id".to_string()],
+                    primary_key: vec!["id".to_string()],
+                    sort: vec![("id".to_string(), "asc".to_string())],
+                }],
+                vec![OperatorConfig::Source {
+                    table_name: "u".to_string(),
+                    columns: vec!["id".to_string()],
+                    primary_key: vec!["id".to_string()],
+                    sort: vec![("id".to_string(), "asc".to_string())],
+                }],
+            ],
+        }];
+        let op = build_operator(&configs);
+        assert!(op.is_ok());
+        assert_eq!(op.unwrap().op_type(), "fan_out");
+    }
+
+    #[test]
+    fn test_fan_out_zero_branches_errors() {
+        let configs = vec![OperatorConfig::FanOut { branches: vec![] }];
+        let result = build_operator(&configs);
+        match result {
+            Err(e) => assert!(
+                e.contains("at least one branch"),
+                "expected 'at least one branch' error, got: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error for empty branches"),
+        }
+    }
+
+    #[test]
+    fn test_fan_out_with_filter_branches_smoke() {
+        // Build FanOut with two filter branches; do a smoke fetch.
+        let configs = vec![OperatorConfig::FanOut {
+            branches: vec![
+                vec![
+                    OperatorConfig::Source {
+                        table_name: "u".to_string(),
+                        columns: vec!["id".to_string()],
+                        primary_key: vec!["id".to_string()],
+                        sort: vec![("id".to_string(), "asc".to_string())],
+                    },
+                    OperatorConfig::Filter {
+                        predicate: serde_json::json!({"field": "id", "eq": 1}),
+                    },
+                ],
+                vec![
+                    OperatorConfig::Source {
+                        table_name: "u".to_string(),
+                        columns: vec!["id".to_string()],
+                        primary_key: vec!["id".to_string()],
+                        sort: vec![("id".to_string(), "asc".to_string())],
+                    },
+                    OperatorConfig::Filter {
+                        predicate: serde_json::json!({"field": "id", "eq": 2}),
+                    },
+                ],
+            ],
+        }];
+        let mut op = build_operator(&configs).unwrap();
+        let result = op.fetch(&FetchRequest::default());
+        // Both source operators are empty, so fetch should be empty.
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_fan_out_round_trip_via_pipeline_factory() {
+        // Pipeline::build is the canonical entry — verify FanOut wire format
+        // round-trips through it.
+        let configs_json = r#"[{
+            "type": "fan_out",
+            "branches": [
+                [{"type":"source","table_name":"u","columns":["id"],"primary_key":["id"],"sort":[["id","asc"]]}]
+            ]
+        }]"#;
+        let configs: Vec<OperatorConfig> = serde_json::from_str(configs_json).unwrap();
+        let op = build_operator(&configs);
+        assert!(op.is_ok(), "fan_out wire format must build");
     }
 }
