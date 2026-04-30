@@ -1,1428 +1,61 @@
 {
-  "total": 57,
-  "uniqueShapes": 56,
+  "total": 6,
+  "uniqueShapes": 6,
   "sources": {
-    "hydrate-fuzz-multi-seed": 45,
-    "hydrate-fuzz-big-sweep": 12
+    "hydrate-fuzz-multi-seed": 5,
+    "hydrate-fuzz-big-sweep": 1
   },
   "buckets": {
-    "D-simple-OR-with-EXISTS": 22,
-    "A-nested-OR-with-EXISTS": 20,
-    "B-OR-of-AND-of-EXISTS": 13,
-    "G-NOT-IN/LIKE-no-EXISTS": 1
+    "A-nested-OR-with-EXISTS": 5,
+    "D-simple-OR-with-EXISTS": 1
   },
   "shapes": [
     {
-      "canonicalAstHash": "{\"orderBy\":[[\"name\",\"desc\"],[\"id",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": ["or(1)", "and(1)", "exists(2)", "orderBy", "related[]"],
-      "sources": ["hydrate-fuzz-multi-seed", "hydrate-fuzz-big-sweep"],
-      "ids": ["eb6270164b64", "eb6270164b64"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "team_members",
-                      "alias": "arb_departments_teamMembers"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "tagKey"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "%notes"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": ">",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["parentBigId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "big_id_records",
-                  "alias": "arb_big_id_records_parent"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["name", "desc"],
-          ["id", "desc"]
-        ],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "team_members",
-              "alias": "arb_departments_teamMembers_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"name\",\"desc\"],[\"id",
-      "bucket": "B-OR-of-AND-of-EXISTS",
+      "canonicalAstHash": "{\"limit\":3,\"related\":[{\"correlat",
+      "bucket": "A-nested-OR-with-EXISTS",
       "features": [
-        "or(1)",
-        "and(1)",
+        "or(2)",
+        "and(3)",
         "exists(2)",
-        "start",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["a4b9cb2e5afb"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "team_members",
-                      "alias": "arb_departments_teamMembers"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-pub-1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": ">",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["parentBigId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "big_id_records",
-                  "alias": "arb_big_id_records_parent"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["name", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "name": "u1",
-            "id": "u2"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "team_members",
-              "alias": "arb_departments_teamMembers_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"name\",\"desc\"],[\"id",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["343d92f9c7bd"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "team_members",
-                      "alias": "arb_departments_teamMembers"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": ">",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["parentBigId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "big_id_records",
-                  "alias": "arb_big_id_records_parent"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["name", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "name": "u1",
-            "id": "u2"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "team_members",
-              "alias": "arb_departments_teamMembers_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"name\",\"desc\"],[\"id",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["bf68b9789a06"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "team_members",
-                      "alias": "arb_departments_teamMembers"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "visibility"
-              },
-              "right": {
-                "type": "literal",
-                "value": ["a", "c", "a"]
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["parentBigId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "big_id_records",
-                  "alias": "arb_big_id_records_parent"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["name", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "name": "u1",
-            "id": "u2"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "team_members",
-              "alias": "arb_departments_teamMembers_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"name\",\"desc\"],[\"id",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["eb256f1d6d8a"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "team_members",
-                      "alias": "arb_departments_teamMembers"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "NOT LIKE",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["parentBigId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "big_id_records",
-                  "alias": "arb_big_id_records_parent"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["name", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "name": "u1",
-            "id": "u2"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "team_members",
-              "alias": "arb_departments_teamMembers_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":2,\"orderBy\":[[\"tagKey\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
         "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["495b39912778"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "processedAt"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "userId"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["eventId"]
-                },
-                "subquery": {
-                  "table": "event_tags",
-                  "alias": "arb_events_tags"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 2,
-        "orderBy": [["tagKey", "desc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["messageId"]
-            },
-            "subquery": {
-              "table": "attachments",
-              "alias": "arb_messages_attachments_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_attachments_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":2,\"orderBy\":[[\"tagKey\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
         "related[]",
         "NOT_IN/LIKE"
       ],
       "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["4ef1c038a3e1"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "userId"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["eventId"]
-                },
-                "subquery": {
-                  "table": "event_tags",
-                  "alias": "arb_events_tags"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 2,
-        "orderBy": [["tagKey", "desc"]],
-        "start": {
-          "row": {
-            "tagKey": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["messageId"]
-            },
-            "subquery": {
-              "table": "attachments",
-              "alias": "arb_messages_attachments_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_attachments_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":2,\"orderBy\":[[\"tagKey\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["be656334abe5"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "userId"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "participants",
-                  "alias": "arb_channels_participants"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 2,
-        "orderBy": [["tagKey", "desc"]],
-        "start": {
-          "row": {
-            "tagKey": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["messageId"]
-            },
-            "subquery": {
-              "table": "attachments",
-              "alias": "arb_messages_attachments_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_attachments_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":2,\"orderBy\":[[\"tagKey\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["a739bb264a30"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "userId"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 2,
-        "orderBy": [["tagKey", "desc"]],
-        "start": {
-          "row": {
-            "tagKey": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["messageId"]
-            },
-            "subquery": {
-              "table": "attachments",
-              "alias": "arb_messages_attachments_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_attachments_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"tagKey\",\"desc\"]],\"",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["d944315ba774"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "userId"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [["tagKey", "desc"]],
-        "start": {
-          "row": {
-            "tagKey": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["messageId"]
-            },
-            "subquery": {
-              "table": "attachments",
-              "alias": "arb_messages_attachments_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_attachments_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":10,\"orderBy\":[[\"process",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["141bc6f4af27"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "channelId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "<",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-pub-1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["eventId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "events",
-                  "alias": "arb_event_tags_event"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 10,
-        "orderBy": [
-          ["processedAt", "desc"],
-          ["id", "desc"]
-        ],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":10,\"orderBy\":[[\"process",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["c5038649ddf0"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "channelId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "%standup%"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["eventId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "events",
-                  "alias": "arb_event_tags_event"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 10,
-        "orderBy": [
-          ["processedAt", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "processedAt": 4,
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":10,\"orderBy\":[[\"process",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["d469fdc20b04"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "channelId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["eventId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "events",
-                  "alias": "arb_event_tags_event"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 10,
-        "orderBy": [
-          ["processedAt", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "processedAt": 4,
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":10,\"orderBy\":[[\"process",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["c0e7d8685799"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "channelId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 10,
-        "orderBy": [
-          ["processedAt", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "processedAt": 4,
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"processedAt\",\"desc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "start",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["757287572dbf"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "channelId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [
-          ["processedAt", "desc"],
-          ["id", "desc"]
-        ],
-        "start": {
-          "row": {
-            "processedAt": 4,
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "and(1)",
-        "exists(1)",
-        "related[]",
-        "IS_NULL",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["f15c381c1ce5"],
+      "ids": ["23cf4c26379f"],
       "ast": {
         "table": "conversations",
         "where": {
           "type": "or",
           "conditions": [
             {
-              "type": "or",
+              "type": "and",
               "conditions": [
                 {
                   "type": "and",
                   "conditions": [
                     {
                       "type": "simple",
-                      "op": ">",
+                      "op": "<=",
                       "left": {
                         "type": "column",
-                        "name": "amount"
+                        "name": "createdAt"
                       },
                       "right": {
                         "type": "literal",
-                        "value": 1790
+                        "value": 4434
+                      }
+                    },
+                    {
+                      "type": "simple",
+                      "op": "NOT ILIKE",
+                      "left": {
+                        "type": "column",
+                        "name": "id"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": "standup%"
                       }
                     },
                     {
@@ -1430,7 +63,309 @@
                       "op": ">=",
                       "left": {
                         "type": "column",
-                        "name": "name"
+                        "name": "createdAt"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": 7456
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "or",
+                      "conditions": [
+                        {
+                          "type": "simple",
+                          "op": "NOT IN",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": [67, 65, 94]
+                          }
+                        },
+                        {
+                          "type": "simple",
+                          "op": "!=",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": 2889
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "correlatedSubquery",
+                      "related": {
+                        "correlation": {
+                          "parentField": ["channelId"],
+                          "childField": ["id"]
+                        },
+                        "subquery": {
+                          "table": "channels",
+                          "alias": "arb_conversations_channel"
+                        }
+                      },
+                      "op": "EXISTS"
+                    }
+                  ]
+                },
+                {
+                  "type": "simple",
+                  "op": ">",
+                  "left": {
+                    "type": "column",
+                    "name": "title"
+                  },
+                  "right": {
+                    "type": "literal",
+                    "value": "u1"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "correlatedSubquery",
+              "related": {
+                "correlation": {
+                  "parentField": ["id"],
+                  "childField": ["conversationId"]
+                },
+                "subquery": {
+                  "table": "attachments",
+                  "alias": "arb_conversations_attachments"
+                }
+              },
+              "op": "EXISTS"
+            }
+          ]
+        },
+        "limit": 3,
+        "related": [
+          {
+            "correlation": {
+              "parentField": ["channelId"],
+              "childField": ["id"]
+            },
+            "subquery": {
+              "table": "channels",
+              "alias": "arb_participants_channel_d0",
+              "related": [
+                {
+                  "correlation": {
+                    "parentField": ["id"],
+                    "childField": ["channelId"]
+                  },
+                  "subquery": {
+                    "table": "participants",
+                    "alias": "arb_channels_participants_d1"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "zql": null,
+      "firstDelta": null
+    },
+    {
+      "canonicalAstHash": "{\"limit\":3,\"related\":[{\"correlat",
+      "bucket": "A-nested-OR-with-EXISTS",
+      "features": [
+        "or(2)",
+        "and(3)",
+        "exists(2)",
+        "limit",
+        "related[]",
+        "NOT_IN/LIKE"
+      ],
+      "sources": ["hydrate-fuzz-multi-seed"],
+      "ids": ["ad9ba9641ca7"],
+      "ast": {
+        "table": "conversations",
+        "where": {
+          "type": "or",
+          "conditions": [
+            {
+              "type": "and",
+              "conditions": [
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "simple",
+                      "op": "NOT ILIKE",
+                      "left": {
+                        "type": "column",
+                        "name": "id"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": "standup%"
+                      }
+                    },
+                    {
+                      "type": "simple",
+                      "op": ">=",
+                      "left": {
+                        "type": "column",
+                        "name": "createdAt"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": 7456
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "or",
+                      "conditions": [
+                        {
+                          "type": "simple",
+                          "op": "NOT IN",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": [67, 65, 94]
+                          }
+                        },
+                        {
+                          "type": "simple",
+                          "op": "!=",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": 2889
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "correlatedSubquery",
+                      "related": {
+                        "correlation": {
+                          "parentField": ["channelId"],
+                          "childField": ["id"]
+                        },
+                        "subquery": {
+                          "table": "channels",
+                          "alias": "arb_conversations_channel"
+                        }
+                      },
+                      "op": "EXISTS"
+                    }
+                  ]
+                },
+                {
+                  "type": "simple",
+                  "op": ">",
+                  "left": {
+                    "type": "column",
+                    "name": "title"
+                  },
+                  "right": {
+                    "type": "literal",
+                    "value": "u1"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "correlatedSubquery",
+              "related": {
+                "correlation": {
+                  "parentField": ["id"],
+                  "childField": ["conversationId"]
+                },
+                "subquery": {
+                  "table": "attachments",
+                  "alias": "arb_conversations_attachments"
+                }
+              },
+              "op": "EXISTS"
+            }
+          ]
+        },
+        "limit": 3,
+        "related": [
+          {
+            "correlation": {
+              "parentField": ["channelId"],
+              "childField": ["id"]
+            },
+            "subquery": {
+              "table": "channels",
+              "alias": "arb_participants_channel_d0",
+              "related": [
+                {
+                  "correlation": {
+                    "parentField": ["id"],
+                    "childField": ["channelId"]
+                  },
+                  "subquery": {
+                    "table": "participants",
+                    "alias": "arb_channels_participants_d1"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "zql": null,
+      "firstDelta": null
+    },
+    {
+      "canonicalAstHash": "{\"limit\":3,\"related\":[{\"correlat",
+      "bucket": "A-nested-OR-with-EXISTS",
+      "features": [
+        "or(2)",
+        "and(3)",
+        "exists(2)",
+        "limit",
+        "related[]",
+        "NOT_IN/LIKE"
+      ],
+      "sources": ["hydrate-fuzz-multi-seed"],
+      "ids": ["c0e34c2f0efb"],
+      "ast": {
+        "table": "conversations",
+        "where": {
+          "type": "or",
+          "conditions": [
+            {
+              "type": "and",
+              "conditions": [
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "simple",
+                      "op": "=",
+                      "left": {
+                        "type": "column",
+                        "name": "id"
                       },
                       "right": {
                         "type": "literal",
@@ -1439,3869 +374,118 @@
                     },
                     {
                       "type": "simple",
-                      "op": "NOT ILIKE",
+                      "op": ">=",
                       "left": {
                         "type": "column",
-                        "name": "name"
+                        "name": "createdAt"
                       },
                       "right": {
                         "type": "literal",
-                        "value": "a%"
+                        "value": 7456
                       }
                     }
                   ]
                 },
                 {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "LIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup%"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "orgID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%standup%"
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["orgID", "deptID"],
-                    "childField": ["orgID", "deptID"]
-                  },
-                  "subquery": {
-                    "table": "team_members",
-                    "alias": "arb_departments_teamMembers_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": ["or(2)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["dddd03150f4d"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "LIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup%"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "orgID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%standup%"
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["orgID", "deptID"],
-                    "childField": ["orgID", "deptID"]
-                  },
-                  "subquery": {
-                    "table": "team_members",
-                    "alias": "arb_departments_teamMembers_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": ["or(2)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["06a3fbe60658"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup%"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "orgID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%standup%"
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["orgID", "deptID"],
-                    "childField": ["orgID", "deptID"]
-                  },
-                  "subquery": {
-                    "table": "team_members",
-                    "alias": "arb_departments_teamMembers_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": ["or(2)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["030c6440943c"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-priv-1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "orgID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%standup%"
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["orgID", "deptID"],
-                    "childField": ["orgID", "deptID"]
-                  },
-                  "subquery": {
-                    "table": "team_members",
-                    "alias": "arb_departments_teamMembers_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": ["or(2)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["30c6704ebbb8"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "parentBigId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "orgID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%standup%"
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["orgID", "deptID"],
-                    "childField": ["orgID", "deptID"]
-                  },
-                  "subquery": {
-                    "table": "team_members",
-                    "alias": "arb_departments_teamMembers_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["6f0a46e445be"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-priv-1"
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "visibleTo"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u2"
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "NOT ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "orgID"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "%notes"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "participants",
-                  "alias": "arb_channels_participants"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["conversationId"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_conversations_messages_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_messages_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["d0064114e3a7"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "participants",
-                  "alias": "arb_channels_participants"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "standup-monday"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["conversationId"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_conversations_messages_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_messages_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["eea7041aea1e"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "standup-monday"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["conversationId"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_conversations_messages_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_messages_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"id\",\"asc\"]],\"relat",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["039b3ae58e59"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "standup-monday"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["conversationId"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_conversations_messages_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_messages_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": ["or(1)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["a2f794d03a3b"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["conversationId"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_conversations_messages_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["conversationId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "conversations",
-                    "alias": "arb_messages_conversation_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":7,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(5)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["0a223d73205d"],
-      "ast": {
-        "table": "messages",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "messageId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-pub-1"
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "<",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-priv-1"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["eventId"],
-                      "childField": ["id"]
-                    },
-                    "subquery": {
-                      "table": "events",
-                      "alias": "arb_event_tags_event"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "visibility"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "ch-priv-1"
-                      }
-                    },
-                    {
-                      "type": "or",
-                      "conditions": [
-                        {
-                          "type": "correlatedSubquery",
-                          "related": {
-                            "correlation": {
-                              "parentField": ["orgID", "deptID"],
-                              "childField": ["orgID", "deptID"]
-                            },
-                            "subquery": {
-                              "table": "team_members",
-                              "alias": "arb_departments_teamMembers"
-                            }
-                          },
-                          "op": "EXISTS"
-                        },
-                        {
-                          "type": "simple",
-                          "op": "NOT IN",
-                          "left": {
-                            "type": "column",
-                            "name": "name"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": []
-                          }
-                        },
-                        {
-                          "type": "simple",
-                          "op": "LIKE",
-                          "left": {
-                            "type": "column",
-                            "name": "parentBigId"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "%notes"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "type": "simple",
-                      "op": "LIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "tagKey"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "channelId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "standup-monday"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "NOT ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "visibleTo"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 7,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":7,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(5)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["ce11ff3eb179"],
-      "ast": {
-        "table": "messages",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "visibility"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "ch-priv-1"
-                      }
-                    },
-                    {
-                      "type": "or",
-                      "conditions": [
-                        {
-                          "type": "correlatedSubquery",
-                          "related": {
-                            "correlation": {
-                              "parentField": ["orgID", "deptID"],
-                              "childField": ["orgID", "deptID"]
-                            },
-                            "subquery": {
-                              "table": "team_members",
-                              "alias": "arb_departments_teamMembers"
-                            }
-                          },
-                          "op": "EXISTS"
-                        },
-                        {
-                          "type": "simple",
-                          "op": "NOT IN",
-                          "left": {
-                            "type": "column",
-                            "name": "name"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": []
-                          }
-                        },
-                        {
-                          "type": "simple",
-                          "op": "LIKE",
-                          "left": {
-                            "type": "column",
-                            "name": "parentBigId"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "%notes"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "type": "simple",
-                      "op": "LIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "tagKey"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "channelId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "standup-monday"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "NOT ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "visibleTo"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 7,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":7,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(5)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["700021adcfe9"],
-      "ast": {
-        "table": "messages",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
+                  "type": "and",
                   "conditions": [
                     {
                       "type": "or",
                       "conditions": [
                         {
-                          "type": "correlatedSubquery",
-                          "related": {
-                            "correlation": {
-                              "parentField": ["orgID", "deptID"],
-                              "childField": ["orgID", "deptID"]
-                            },
-                            "subquery": {
-                              "table": "team_members",
-                              "alias": "arb_departments_teamMembers"
-                            }
-                          },
-                          "op": "EXISTS"
-                        },
-                        {
                           "type": "simple",
                           "op": "NOT IN",
                           "left": {
                             "type": "column",
-                            "name": "name"
+                            "name": "createdAt"
                           },
                           "right": {
                             "type": "literal",
-                            "value": []
+                            "value": [67, 65, 94]
                           }
                         },
                         {
                           "type": "simple",
-                          "op": "LIKE",
+                          "op": "!=",
                           "left": {
                             "type": "column",
-                            "name": "parentBigId"
+                            "name": "createdAt"
                           },
                           "right": {
                             "type": "literal",
-                            "value": "%notes"
+                            "value": 2889
                           }
                         }
                       ]
                     },
                     {
-                      "type": "simple",
-                      "op": "LIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "tagKey"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "channelId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "standup-monday"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "NOT ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "visibleTo"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 7,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":7,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(5)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["1c511e23c18f"],
-      "ast": {
-        "table": "messages",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "or",
-                      "conditions": [
-                        {
-                          "type": "correlatedSubquery",
-                          "related": {
-                            "correlation": {
-                              "parentField": ["id"],
-                              "childField": ["channelId"]
-                            },
-                            "subquery": {
-                              "table": "participants",
-                              "alias": "arb_channels_participants"
-                            }
-                          },
-                          "op": "EXISTS"
+                      "type": "correlatedSubquery",
+                      "related": {
+                        "correlation": {
+                          "parentField": ["channelId"],
+                          "childField": ["id"]
                         },
-                        {
-                          "type": "simple",
-                          "op": "NOT IN",
-                          "left": {
-                            "type": "column",
-                            "name": "name"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": []
-                          }
-                        },
-                        {
-                          "type": "simple",
-                          "op": "LIKE",
-                          "left": {
-                            "type": "column",
-                            "name": "parentBigId"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "%notes"
-                          }
+                        "subquery": {
+                          "table": "channels",
+                          "alias": "arb_conversations_channel"
                         }
-                      ]
-                    },
-                    {
-                      "type": "simple",
-                      "op": "LIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "tagKey"
                       },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
+                      "op": "EXISTS"
                     }
                   ]
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "channelId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "standup-monday"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "NOT ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "visibleTo"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 7,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":7,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(5)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["64c02ffba9b6"],
-      "ast": {
-        "table": "messages",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "or",
-                      "conditions": [
-                        {
-                          "type": "correlatedSubquery",
-                          "related": {
-                            "correlation": {
-                              "parentField": ["id"],
-                              "childField": ["channelId"]
-                            },
-                            "subquery": {
-                              "table": "conversations",
-                              "alias": "arb_channels_conversations"
-                            }
-                          },
-                          "op": "EXISTS"
-                        },
-                        {
-                          "type": "simple",
-                          "op": "NOT IN",
-                          "left": {
-                            "type": "column",
-                            "name": "name"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": []
-                          }
-                        },
-                        {
-                          "type": "simple",
-                          "op": "LIKE",
-                          "left": {
-                            "type": "column",
-                            "name": "parentBigId"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "%notes"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "type": "simple",
-                      "op": "LIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "tagKey"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "channelId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "standup-monday"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "NOT ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "visibleTo"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 7,
-        "orderBy": [["id", "asc"]],
-        "start": {
-          "row": {
-            "id": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"orderBy\":[[\"name\",\"d",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "limit",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["9dea50f44539"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "<=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u2"
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "LIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "messageId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "%standup%"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "departments",
-                      "alias": "arb_team_members_department"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 3,
-        "orderBy": [["name", "desc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"orderBy\":[[\"name\",\"d",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["d3a825543611"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "LIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "messageId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "%standup%"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "departments",
-                      "alias": "arb_team_members_department"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 3,
-        "orderBy": [["name", "desc"]],
-        "start": {
-          "row": {
-            "name": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"orderBy\":[[\"name\",\"d",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["b1b696d3eab0"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "<=",
-                  "left": {
-                    "type": "column",
-                    "name": "visibility"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u1"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "departments",
-                      "alias": "arb_team_members_department"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 3,
-        "orderBy": [["name", "desc"]],
-        "start": {
-          "row": {
-            "name": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"orderBy\":[[\"name\",\"d",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["e71983cf3c24"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "<",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u2"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "departments",
-                      "alias": "arb_team_members_department"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 3,
-        "orderBy": [["name", "desc"]],
-        "start": {
-          "row": {
-            "name": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"orderBy\":[[\"name\",\"d",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["4b52b3e16a86"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup-monday"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["orgID", "deptID"],
-                      "childField": ["orgID", "deptID"]
-                    },
-                    "subquery": {
-                      "table": "departments",
-                      "alias": "arb_team_members_department"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 3,
-        "orderBy": [["name", "desc"]],
-        "start": {
-          "row": {
-            "name": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"amount\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["a41315ea6087"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["channelId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "channels",
-                  "alias": "arb_participants_channel"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["amount", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["conversationId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_messages_conversation_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"amount\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["812ed2bd733b"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "participants",
-                  "alias": "arb_channels_participants"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["amount", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["conversationId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_messages_conversation_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"amount\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["476ca56bd8b2"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["amount", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["conversationId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_messages_conversation_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"amount\",\"asc\"]],\"r",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": ["or(1)", "exists(1)", "orderBy", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["7afa1e4ce1ee"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "orderBy": [["amount", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["conversationId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_messages_conversation_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"related\":[{\"correlation\":{\"chi",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": ["or(1)", "exists(1)", "related[]", "IS_NULL"],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["16e2123d11a2"],
-      "ast": {
-        "table": "events",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["conversationId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_messages_conversation_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":4,\"orderBy\":[[\"title\",\"",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["48aedb518ca4"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "u2"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 4,
-        "orderBy": [["title", "desc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["actorUserId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "users",
-              "alias": "arb_events_actor_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":4,\"orderBy\":[[\"title\",\"",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["cc9b66007ad9"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "<",
-              "left": {
-                "type": "column",
-                "name": "visibility"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 4,
-        "orderBy": [["title", "desc"]],
-        "start": {
-          "row": {
-            "title": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["actorUserId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "users",
-              "alias": "arb_events_actor_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":4,\"orderBy\":[[\"title\",\"",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["bc5b5bfaf27c"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "<",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-pub-1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 4,
-        "orderBy": [["title", "desc"]],
-        "start": {
-          "row": {
-            "title": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["actorUserId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "users",
-              "alias": "arb_events_actor_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":4,\"orderBy\":[[\"title\",\"",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["619c043f66c9"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "u1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 4,
-        "orderBy": [["title", "desc"]],
-        "start": {
-          "row": {
-            "title": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["actorUserId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "users",
-              "alias": "arb_events_actor_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"title\",\"desc\"]],\"r",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "start",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-multi-seed"],
-      "ids": ["6e7dabdc31d5"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "id"
-              },
-              "right": {
-                "type": "literal",
-                "value": "u1"
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "conversations",
-                  "alias": "arb_channels_conversations"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "orderBy": [["title", "desc"]],
-        "start": {
-          "row": {
-            "title": "u1"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["actorUserId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "users",
-              "alias": "arb_events_actor_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"conversationId\",\"d",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(3)",
-        "and(1)",
-        "exists(1)",
-        "orderBy",
-        "related[]",
-        "IS_NULL",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["44ab42abe2a1"],
-      "ast": {
-        "table": "attachments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["channelId"]
-                },
-                "subquery": {
-                  "table": "participants",
-                  "alias": "arb_channels_participants"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "=",
-              "left": {
-                "type": "column",
-                "name": "metadataJson"
-              },
-              "right": {
-                "type": "literal",
-                "value": "ch-priv-1"
-              }
-            },
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": "=",
-                      "left": {
-                        "type": "column",
-                        "name": "occurredAt"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": 4101
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "IS NOT",
-                      "left": {
-                        "type": "column",
-                        "name": "name"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": null
-                      }
-                    },
-                    {
-                      "type": "and",
-                      "conditions": [
-                        {
-                          "type": "simple",
-                          "op": "NOT LIKE",
-                          "left": {
-                            "type": "column",
-                            "name": "deptID"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "standup%"
-                          }
-                        },
-                        {
-                          "type": "simple",
-                          "op": "<",
-                          "left": {
-                            "type": "column",
-                            "name": "channelId"
-                          },
-                          "right": {
-                            "type": "literal",
-                            "value": "u1"
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                },
-                {
-                  "type": "simple",
-                  "op": "IN",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": ["standup", "c"]
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        "orderBy": [["conversationId", "desc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["orgID", "deptID"],
-              "childField": ["orgID", "deptID"]
-            },
-            "subquery": {
-              "table": "departments",
-              "alias": "arb_team_members_department_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"deptID\",\"desc\"]],\"",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(4)",
-        "exists(1)",
-        "start",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["fe823b8c2eb0"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "confidence"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": 415
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "!=",
-                  "left": {
-                    "type": "column",
-                    "name": "isProcessed"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": true
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "IS",
-                  "left": {
-                    "type": "column",
-                    "name": "actorUserId"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": null
-                  }
-                }
-              ]
-            },
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["conversationId"],
-                      "childField": ["id"]
-                    },
-                    "subquery": {
-                      "table": "conversations",
-                      "alias": "arb_attachments_conversation"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "or",
-                  "conditions": [
-                    {
-                      "type": "simple",
-                      "op": "=",
-                      "left": {
-                        "type": "column",
-                        "name": "name"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "ch-pub-1"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": ">",
-                      "left": {
-                        "type": "column",
-                        "name": "authorId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "u1"
-                      }
-                    },
-                    {
-                      "type": "simple",
-                      "op": "ILIKE",
-                      "left": {
-                        "type": "column",
-                        "name": "conversationId"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": "a%"
-                      }
-                    }
-                  ]
-                }
-              ]
-            }
-          ]
-        },
-        "orderBy": [["deptID", "desc"]],
-        "start": {
-          "row": {
-            "deptID": "u1"
-          },
-          "exclusive": false
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["channelId"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_channels_conversations_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"confiden",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": [
-        "or(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["d01063644927"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["actorUserId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "users",
-                  "alias": "arb_events_actor"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "simple",
-              "op": "IN",
-              "left": {
-                "type": "column",
-                "name": "channelId"
-              },
-              "right": {
-                "type": "literal",
-                "value": ["c", "b"]
-              }
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "parentBigId"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["confidence", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["parentBigId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["parentBigId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "big_id_records",
-                    "alias": "arb_big_id_records_parent_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":1,\"orderBy\":[[\"channelI",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(1)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["a08d495e76ef"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["eventId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "events",
-                  "alias": "arb_event_tags_event"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "!=",
-                  "left": {
-                    "type": "column",
-                    "name": "createdAt"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": 3217
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "amount"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        "limit": 1,
-        "orderBy": [["channelId", "asc"]],
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["id"],
-              "childField": ["channelId"]
-            },
-            "subquery": {
-              "table": "conversations",
-              "alias": "arb_channels_conversations_d0",
-              "related": [
-                {
-                  "correlation": {
-                    "parentField": ["channelId"],
-                    "childField": ["id"]
-                  },
-                  "subquery": {
-                    "table": "channels",
-                    "alias": "arb_conversations_channel_d1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":4,\"table\":\"event_tags\",",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": ["or(1)", "exists(1)", "limit", "IS_NULL"],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["8cfc75ac4cce"],
-      "ast": {
-        "table": "event_tags",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "LIKE",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%"
-              }
-            },
-            {
-              "type": "simple",
-              "op": "IS",
-              "left": {
-                "type": "column",
-                "name": "name"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["channelId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "channels",
-                  "alias": "arb_conversations_channel"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        },
-        "limit": 4
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":9,\"orderBy\":[[\"id\",\"des",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": [
-        "or(2)",
-        "and(1)",
-        "exists(1)",
-        "start",
-        "limit",
-        "orderBy",
-        "related[]",
-        "IS_NULL"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["b0582bc71a50"],
-      "ast": {
-        "table": "big_id_records",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "simple",
-              "op": "IS NOT",
-              "left": {
-                "type": "column",
-                "name": "processedAt"
-              },
-              "right": {
-                "type": "literal",
-                "value": null
-              }
-            },
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "orgID"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup%"
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "=",
-                  "left": {
-                    "type": "column",
-                    "name": "id"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "standup-monday"
-                  }
                 },
                 {
                   "type": "simple",
                   "op": ">",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "u2"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": ">",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "ch-priv-1"
-                  }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["actorUserId"],
-                      "childField": ["id"]
-                    },
-                    "subquery": {
-                      "table": "users",
-                      "alias": "arb_events_actor"
-                    }
-                  },
-                  "op": "EXISTS"
-                }
-              ]
-            }
-          ]
-        },
-        "limit": 9,
-        "orderBy": [["id", "desc"]],
-        "start": {
-          "row": {
-            "id": "standup-monday"
-          },
-          "exclusive": true
-        },
-        "related": [
-          {
-            "correlation": {
-              "parentField": ["messageId"],
-              "childField": ["id"]
-            },
-            "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0"
-            }
-          }
-        ]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":3,\"table\":\"team_members",
-      "bucket": "A-nested-OR-with-EXISTS",
-      "features": ["or(2)", "exists(1)", "limit", "NOT_IN/LIKE"],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["108323234cc4"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "or",
-              "conditions": [
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
                   "left": {
                     "type": "column",
                     "name": "title"
                   },
                   "right": {
                     "type": "literal",
-                    "value": []
-                  }
-                },
-                {
-                  "type": "simple",
-                  "op": "ILIKE",
-                  "left": {
-                    "type": "column",
-                    "name": "name"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": "a%"
+                    "value": "u1"
                   }
                 }
               ]
             },
             {
-              "type": "simple",
-              "op": ">",
-              "left": {
-                "type": "column",
-                "name": "createdAt"
-              },
-              "right": {
-                "type": "literal",
-                "value": 5879
-              }
-            },
-            {
               "type": "correlatedSubquery",
               "related": {
                 "correlation": {
-                  "parentField": ["authorId"],
-                  "childField": ["id"]
+                  "parentField": ["id"],
+                  "childField": ["conversationId"]
                 },
                 "subquery": {
-                  "table": "users",
-                  "alias": "arb_messages_author"
+                  "table": "attachments",
+                  "alias": "arb_conversations_attachments"
                 }
               },
               "op": "EXISTS"
             }
           ]
         },
-        "limit": 3
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":2,\"orderBy\":[[\"orgID\",\"",
-      "bucket": "G-NOT-IN/LIKE-no-EXISTS",
-      "features": ["limit", "orderBy", "NOT_IN/LIKE"],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["ce63f8de27a2"],
-      "ast": {
-        "table": "team_members",
-        "where": {
-          "type": "simple",
-          "op": "NOT LIKE",
-          "left": {
-            "type": "column",
-            "name": "name"
-          },
-          "right": {
-            "type": "literal",
-            "value": "a%"
-          }
-        },
-        "limit": 2,
-        "orderBy": [["orgID", "desc"]]
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"limit\":9,\"orderBy\":[[\"id\",\"asc",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(1)",
-        "exists(2)",
-        "limit",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["f12acaa833a5"],
-      "ast": {
-        "table": "conversations",
-        "where": {
-          "type": "or",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["eventId"],
-                  "childField": ["id"]
-                },
-                "subquery": {
-                  "table": "events",
-                  "alias": "arb_event_tags_event"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "and",
-              "conditions": [
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["id"],
-                      "childField": ["conversationId"]
-                    },
-                    "subquery": {
-                      "table": "messages",
-                      "alias": "arb_conversations_messages"
-                    }
-                  },
-                  "op": "EXISTS"
-                },
-                {
-                  "type": "simple",
-                  "op": "NOT IN",
-                  "left": {
-                    "type": "column",
-                    "name": "orgID"
-                  },
-                  "right": {
-                    "type": "literal",
-                    "value": ["a"]
-                  }
-                }
-              ]
-            },
-            {
-              "type": "simple",
-              "op": "NOT ILIKE",
-              "left": {
-                "type": "column",
-                "name": "deptID"
-              },
-              "right": {
-                "type": "literal",
-                "value": "%notes"
-              }
-            }
-          ]
-        },
-        "limit": 9,
-        "orderBy": [["id", "asc"]],
+        "limit": 3,
         "related": [
           {
             "correlation": {
-              "parentField": ["parentBigId"],
+              "parentField": ["channelId"],
               "childField": ["id"]
             },
             "subquery": {
-              "table": "big_id_records",
-              "alias": "arb_big_id_records_parent_d0"
+              "table": "channels",
+              "alias": "arb_participants_channel_d0",
+              "related": [
+                {
+                  "correlation": {
+                    "parentField": ["id"],
+                    "childField": ["channelId"]
+                  },
+                  "subquery": {
+                    "table": "participants",
+                    "alias": "arb_channels_participants_d1"
+                  }
+                }
+              ]
             }
           }
         ]
@@ -5310,116 +494,32 @@
       "firstDelta": null
     },
     {
-      "canonicalAstHash": "{\"table\":\"messages\",\"where\":{\"co",
-      "bucket": "D-simple-OR-with-EXISTS",
-      "features": ["or(1)", "exists(1)", "NOT_IN/LIKE"],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["f7724f2b9ff8"],
+      "canonicalAstHash": "{\"limit\":3,\"related\":[{\"correlat",
+      "bucket": "A-nested-OR-with-EXISTS",
+      "features": [
+        "or(2)",
+        "and(3)",
+        "exists(2)",
+        "limit",
+        "related[]",
+        "NOT_IN/LIKE"
+      ],
+      "sources": ["hydrate-fuzz-multi-seed"],
+      "ids": ["b7244eaef21f"],
       "ast": {
-        "table": "messages",
+        "table": "conversations",
         "where": {
           "type": "or",
           "conditions": [
             {
-              "type": "simple",
-              "op": "NOT IN",
-              "left": {
-                "type": "column",
-                "name": "visibleTo"
-              },
-              "right": {
-                "type": "literal",
-                "value": []
-              }
-            },
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["id"],
-                  "childField": ["messageId"]
-                },
-                "subquery": {
-                  "table": "attachments",
-                  "alias": "arb_messages_attachments"
-                }
-              },
-              "op": "EXISTS"
-            }
-          ]
-        }
-      },
-      "zql": null,
-      "firstDelta": null
-    },
-    {
-      "canonicalAstHash": "{\"orderBy\":[[\"orgID\",\"desc\"]],\"r",
-      "bucket": "B-OR-of-AND-of-EXISTS",
-      "features": [
-        "or(1)",
-        "and(2)",
-        "exists(3)",
-        "start",
-        "orderBy",
-        "related[]",
-        "NOT_IN/LIKE"
-      ],
-      "sources": ["hydrate-fuzz-big-sweep"],
-      "ids": ["599e72c038df"],
-      "ast": {
-        "table": "departments",
-        "where": {
-          "type": "and",
-          "conditions": [
-            {
-              "type": "correlatedSubquery",
-              "related": {
-                "correlation": {
-                  "parentField": ["orgID", "deptID"],
-                  "childField": ["orgID", "deptID"]
-                },
-                "subquery": {
-                  "table": "departments",
-                  "alias": "arb_team_members_department"
-                }
-              },
-              "op": "EXISTS"
-            },
-            {
-              "type": "or",
+              "type": "and",
               "conditions": [
                 {
                   "type": "and",
                   "conditions": [
                     {
                       "type": "simple",
-                      "op": "NOT IN",
-                      "left": {
-                        "type": "column",
-                        "name": "name"
-                      },
-                      "right": {
-                        "type": "literal",
-                        "value": ["c", "c"]
-                      }
-                    },
-                    {
-                      "type": "correlatedSubquery",
-                      "related": {
-                        "correlation": {
-                          "parentField": ["orgID", "deptID"],
-                          "childField": ["orgID", "deptID"]
-                        },
-                        "subquery": {
-                          "table": "departments",
-                          "alias": "arb_team_members_department"
-                        }
-                      },
-                      "op": "EXISTS"
-                    },
-                    {
-                      "type": "simple",
-                      "op": "!=",
+                      "op": "=",
                       "left": {
                         "type": "column",
                         "name": "id"
@@ -5428,67 +528,334 @@
                         "type": "literal",
                         "value": "u1"
                       }
+                    },
+                    {
+                      "type": "simple",
+                      "op": ">=",
+                      "left": {
+                        "type": "column",
+                        "name": "createdAt"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": 7456
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "or",
+                      "conditions": [
+                        {
+                          "type": "simple",
+                          "op": "NOT IN",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": [67, 65, 94]
+                          }
+                        },
+                        {
+                          "type": "simple",
+                          "op": "!=",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": 2889
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "correlatedSubquery",
+                      "related": {
+                        "correlation": {
+                          "parentField": ["channelId"],
+                          "childField": ["id"]
+                        },
+                        "subquery": {
+                          "table": "channels",
+                          "alias": "arb_conversations_channel"
+                        }
+                      },
+                      "op": "EXISTS"
                     }
                   ]
                 },
                 {
                   "type": "simple",
-                  "op": "=",
+                  "op": ">",
                   "left": {
                     "type": "column",
-                    "name": "metadataJson"
+                    "name": "title"
                   },
                   "right": {
                     "type": "literal",
-                    "value": "u2"
+                    "value": "u1"
                   }
-                },
-                {
-                  "type": "correlatedSubquery",
-                  "related": {
-                    "correlation": {
-                      "parentField": ["messageId"],
-                      "childField": ["id"]
-                    },
-                    "subquery": {
-                      "table": "messages",
-                      "alias": "arb_attachments_message"
-                    }
-                  },
-                  "op": "EXISTS"
                 }
               ]
+            },
+            {
+              "type": "correlatedSubquery",
+              "related": {
+                "correlation": {
+                  "parentField": ["id"],
+                  "childField": ["conversationId"]
+                },
+                "subquery": {
+                  "table": "attachments",
+                  "alias": "arb_conversations_attachments"
+                }
+              },
+              "op": "EXISTS"
             }
           ]
         },
-        "orderBy": [["orgID", "desc"]],
-        "start": {
-          "row": {
-            "orgID": "standup-monday"
-          },
-          "exclusive": true
-        },
+        "limit": 3,
         "related": [
           {
             "correlation": {
-              "parentField": ["messageId"],
+              "parentField": ["channelId"],
               "childField": ["id"]
             },
             "subquery": {
-              "table": "messages",
-              "alias": "arb_attachments_message_d0",
+              "table": "channels",
+              "alias": "arb_participants_channel_d0",
               "related": [
                 {
                   "correlation": {
                     "parentField": ["id"],
-                    "childField": ["messageId"]
+                    "childField": ["channelId"]
                   },
                   "subquery": {
-                    "table": "attachments",
-                    "alias": "arb_messages_attachments_d1"
+                    "table": "participants",
+                    "alias": "arb_channels_participants_d1"
                   }
                 }
               ]
+            }
+          }
+        ]
+      },
+      "zql": null,
+      "firstDelta": null
+    },
+    {
+      "canonicalAstHash": "{\"limit\":3,\"related\":[{\"correlat",
+      "bucket": "A-nested-OR-with-EXISTS",
+      "features": [
+        "or(2)",
+        "and(3)",
+        "exists(2)",
+        "limit",
+        "related[]",
+        "NOT_IN/LIKE"
+      ],
+      "sources": ["hydrate-fuzz-multi-seed"],
+      "ids": ["7bda308b54b1"],
+      "ast": {
+        "table": "conversations",
+        "where": {
+          "type": "or",
+          "conditions": [
+            {
+              "type": "and",
+              "conditions": [
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "simple",
+                      "op": "=",
+                      "left": {
+                        "type": "column",
+                        "name": "id"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": "u1"
+                      }
+                    },
+                    {
+                      "type": "simple",
+                      "op": "NOT ILIKE",
+                      "left": {
+                        "type": "column",
+                        "name": "id"
+                      },
+                      "right": {
+                        "type": "literal",
+                        "value": "standup%"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "or",
+                      "conditions": [
+                        {
+                          "type": "simple",
+                          "op": "NOT IN",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": [67, 65, 94]
+                          }
+                        },
+                        {
+                          "type": "simple",
+                          "op": "!=",
+                          "left": {
+                            "type": "column",
+                            "name": "createdAt"
+                          },
+                          "right": {
+                            "type": "literal",
+                            "value": 2889
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "correlatedSubquery",
+                      "related": {
+                        "correlation": {
+                          "parentField": ["channelId"],
+                          "childField": ["id"]
+                        },
+                        "subquery": {
+                          "table": "channels",
+                          "alias": "arb_conversations_channel"
+                        }
+                      },
+                      "op": "EXISTS"
+                    }
+                  ]
+                },
+                {
+                  "type": "simple",
+                  "op": ">",
+                  "left": {
+                    "type": "column",
+                    "name": "title"
+                  },
+                  "right": {
+                    "type": "literal",
+                    "value": "u1"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "correlatedSubquery",
+              "related": {
+                "correlation": {
+                  "parentField": ["id"],
+                  "childField": ["conversationId"]
+                },
+                "subquery": {
+                  "table": "attachments",
+                  "alias": "arb_conversations_attachments"
+                }
+              },
+              "op": "EXISTS"
+            }
+          ]
+        },
+        "limit": 3,
+        "related": [
+          {
+            "correlation": {
+              "parentField": ["channelId"],
+              "childField": ["id"]
+            },
+            "subquery": {
+              "table": "channels",
+              "alias": "arb_participants_channel_d0",
+              "related": [
+                {
+                  "correlation": {
+                    "parentField": ["id"],
+                    "childField": ["channelId"]
+                  },
+                  "subquery": {
+                    "table": "participants",
+                    "alias": "arb_channels_participants_d1"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "zql": null,
+      "firstDelta": null
+    },
+    {
+      "canonicalAstHash": "{\"limit\":6,\"related\":[{\"correlat",
+      "bucket": "D-simple-OR-with-EXISTS",
+      "features": ["or(1)", "exists(1)", "limit", "related[]", "NOT_IN/LIKE"],
+      "sources": ["hydrate-fuzz-big-sweep"],
+      "ids": ["b8b288f3f7e7"],
+      "ast": {
+        "table": "events",
+        "where": {
+          "type": "or",
+          "conditions": [
+            {
+              "type": "correlatedSubquery",
+              "related": {
+                "correlation": {
+                  "parentField": ["id"],
+                  "childField": ["eventId"]
+                },
+                "subquery": {
+                  "table": "event_tags",
+                  "alias": "arb_events_tags"
+                }
+              },
+              "op": "EXISTS"
+            },
+            {
+              "type": "simple",
+              "op": "NOT IN",
+              "left": {
+                "type": "column",
+                "name": "processedAt"
+              },
+              "right": {
+                "type": "literal",
+                "value": []
+              }
+            }
+          ]
+        },
+        "limit": 6,
+        "related": [
+          {
+            "correlation": {
+              "parentField": ["conversationId"],
+              "childField": ["id"]
+            },
+            "subquery": {
+              "table": "conversations",
+              "alias": "arb_messages_conversation_d0"
             }
           }
         ]
