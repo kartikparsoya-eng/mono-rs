@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-29)
 Phase: 34
 Plan: Not started
 Status: Executing Phase 34
-Last activity: 2026-04-30 - Completed quick task 260430-gqe: wire parity check into streaming + drop bench dead-code path
+Last activity: 2026-04-30 - Completed quick task 260430-jf6: harness fixes — schema-typing align, canonical-key diff, KEEP_GOING flag, divergence catalog
 
 ## v5.0 Phase Overview
 
@@ -85,9 +85,10 @@ Every phase MUST pass these checks before commit:
 
 ### Quick Tasks Completed
 
-| #          | Description                                                  | Date       | Commit    | Directory                                                                                                           |
-| ---------- | ------------------------------------------------------------ | ---------- | --------- | ------------------------------------------------------------------------------------------------------------------- |
-| 260430-gqe | wire parity check into streaming + drop bench dead-code path | 2026-04-30 | dc41f58fe | [260430-gqe-wire-parity-check-into-streaming-drop-be](./quick/260430-gqe-wire-parity-check-into-streaming-drop-be/) |
+| #          | Description                                                                                           | Date       | Commit    | Directory                                                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------------------- | ---------- | --------- | ------------------------------------------------------------------------------------------------------------------- |
+| 260430-gqe | wire parity check into streaming + drop bench dead-code path                                          | 2026-04-30 | dc41f58fe | [260430-gqe-wire-parity-check-into-streaming-drop-be](./quick/260430-gqe-wire-parity-check-into-streaming-drop-be/) |
+| 260430-jf6 | harness fixes — schema-typing align, canonical-key diff, KEEP_GOING flag, 23-shape divergence catalog | 2026-04-30 | 571dae669 | [260430-jf6-harness-fixes-schema-typing-align-canoni](./quick/260430-jf6-harness-fixes-schema-typing-align-canoni/) |
 
 ## Session Continuity
 
