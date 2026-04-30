@@ -9,6 +9,7 @@ import {
   string,
   number,
   boolean,
+  json,
   table,
   relationships,
   ANYONE_CAN_DO_ANYTHING,
@@ -85,21 +86,27 @@ const teamMember = table('team_members')
 
 // FUZZ-02 schema extension per CONTEXT.md D-09..D-12; production-shape density
 // (2x jsonb, 2x timestamptz on events) per D-09; target apps/zbugs/shared/schema.ts.
-// Zero replicates JSONB/TIMESTAMPTZ/NUMERIC/BIGINT as `string()` — the rich PG
-// type lives in schema.sql; the AST-level fuzzer sees these as text columns.
+// Column types match upstream zero-cache resolution per
+// packages/zero-cache/src/types/pg-data-type.ts:
+//   TIMESTAMPTZ -> number (ms since epoch)
+//   JSONB       -> json
+//   NUMERIC     -> number
+//   BIGINT      -> number
+// (Earlier draft declared these as string() — that mismatched the canonical
+// pg-data-type map and caused SchemaVersionNotSupported on every connect,
+// blocking live fuzz runs. Aligned here.)
 // See .planning/phases/34-differential-fuzz-schema-extension/34-RESEARCH.md
-// (Schema Extension Layout) for the full rationale and Assumption A1 on
-// BIGINT replication.
+// (Schema Extension Layout) for the full rationale.
 
 const event = table('events')
   .columns({
     id: string(),
-    occurredAt: string(), // PG TIMESTAMPTZ — replicated as ISO string
-    processedAt: string().optional(), // PG TIMESTAMPTZ NULL — D-09 prod-shape jsonb/ts #2
-    metadataJson: string(), // PG JSONB — replicated as JSON string
-    auditTrail: string().optional(), // PG JSONB NULL — D-09 prod-shape jsonb #2
-    amount: string(), // PG NUMERIC — replicated as string (preserves precision)
-    quantity: number(), // PG BIGINT — Zero replicates >2^53 as string per A1; here number for fuzz
+    occurredAt: number(), // PG TIMESTAMPTZ — zero-cache resolves as number (ms)
+    processedAt: number().optional(), // PG TIMESTAMPTZ NULL
+    metadataJson: json(), // PG JSONB
+    auditTrail: json().optional(), // PG JSONB NULL
+    amount: number(), // PG NUMERIC — resolved as number
+    quantity: number(), // PG BIGINT — resolved as number
     isProcessed: boolean(),
     actorUserId: string().optional(),
     notes: string().optional(), // nullable text — NULL semantics fixtures (D-11)
@@ -112,7 +119,7 @@ const bigIdRecord = table('big_id_records')
     id: string(), // PG TEXT (string-encoded BIGINT >2^53 for B8/B9 organic surface per D-12)
     label: string(),
     parentBigId: string().optional(), // self-FK; nullable for NULL ≠ NULL JOIN test
-    createdAt: string(), // PG TIMESTAMPTZ
+    createdAt: number(), // PG TIMESTAMPTZ — resolved as number
   })
   .primaryKey('id');
 
@@ -122,7 +129,7 @@ const eventTag = table('event_tags')
     tagKey: string(),
     tagValue: string(),
     confidence: number(), // PG NUMERIC(5,4) (0..1; NaN-free per D-13)
-    metadataJson: string(), // PG JSONB
+    metadataJson: json(), // PG JSONB
   })
   .primaryKey('eventId', 'tagKey');
 
