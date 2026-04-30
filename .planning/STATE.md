@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-29)
 Phase: 34
 Plan: Not started
 Status: Executing Phase 34
-Last activity: 2026-04-30 - Completed quick task 260430-m6u: ivm-parity fix-in-loop infrastructure
+Last activity: 2026-04-30 - Completed quick task 260430-mu2: ivm-parity arb fix (catalog 56 → 6 real divergences)
 
 ## v5.0 Phase Overview
 
@@ -90,6 +90,7 @@ Every phase MUST pass these checks before commit:
 | 260430-gqe | wire parity check into streaming + drop bench dead-code path                                                          | 2026-04-30 | dc41f58fe | [260430-gqe-wire-parity-check-into-streaming-drop-be](./quick/260430-gqe-wire-parity-check-into-streaming-drop-be/) |
 | 260430-jf6 | harness fixes — schema-typing align, canonical-key diff, KEEP_GOING flag, 23-shape divergence catalog                 | 2026-04-30 | 571dae669 | [260430-jf6-harness-fixes-schema-typing-align-canoni](./quick/260430-jf6-harness-fixes-schema-typing-align-canoni/) |
 | 260430-m6u | ivm-parity fix-in-loop infrastructure: catalog 56 divergent shapes + regression runner + harness CORPUS_FILE override | 2026-04-30 | cc673f52b | [260430-m6u-ivm-parity-fix-in-loop-infrastructure-ca](./quick/260430-m6u-ivm-parity-fix-in-loop-infrastructure-ca/) |
+| 260430-mu2 | ivm-parity arb fix: scope simple+csq to root table; regenerate catalog (56 → 6 real divergences)                      | 2026-04-30 | a90cdfcf2 | [260430-mu2-ivm-parity-arb-fix-scope-simple-csq-to-r](./quick/260430-mu2-ivm-parity-arb-fix-scope-simple-csq-to-r/) |
 
 ## Session Continuity
 
