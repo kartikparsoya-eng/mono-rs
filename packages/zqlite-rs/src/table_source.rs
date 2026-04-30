@@ -16,6 +16,10 @@ pub enum TableSourceError {
     Pool(PoolError),
     Sqlite(rusqlite::Error),
     InvalidConnection(usize),
+    /// B10/D-03: explicit propagation of inner-mutex poison instead of
+    /// panicking via `.unwrap()`. Replaces the prior pattern in `swap_db`,
+    /// `reset_state`, `push`, etc.
+    PoisonedState,
 }
 
 impl fmt::Display for TableSourceError {
@@ -25,6 +29,9 @@ impl fmt::Display for TableSourceError {
             TableSourceError::Sqlite(e) => write!(f, "sqlite error: {e}"),
             TableSourceError::InvalidConnection(id) => {
                 write!(f, "invalid connection id: {id}")
+            }
+            TableSourceError::PoisonedState => {
+                write!(f, "table source inner mutex poisoned")
             }
         }
     }
@@ -250,26 +257,32 @@ impl RustTableSource {
         self.pool.swap_path(new_path).map_err(TableSourceError::Pool)?;
         if !same_path {
             // Different DB file — must reopen write connection.
-            let mut wc = self.write_conn.lock().unwrap();
+            // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+            let mut wc = self.write_conn.lock()
+                .map_err(|_| TableSourceError::PoisonedState)?;
             if wc.is_some() {
                 *wc = Some(rusqlite::Connection::open(new_path)?);
             }
         }
-        self.reset_state();
+        self.reset_state()?;
         Ok(())
     }
 
     /// Reset overlay, epoch, and connection metadata without touching the pool.
     /// Used when the shared pool has already been swapped externally.
-    pub fn reset_state(&self) {
-        *self.overlay.lock().unwrap() = None;
-        *self.push_epoch.lock().unwrap() = 0;
+    ///
+    /// B10/D-03: returns `Result` and propagates inner-mutex poison rather
+    /// than panicking via `.unwrap()`.
+    pub fn reset_state(&self) -> Result<()> {
+        *self.overlay.lock().map_err(|_| TableSourceError::PoisonedState)? = None;
+        *self.push_epoch.lock().map_err(|_| TableSourceError::PoisonedState)? = 0;
         // SAFETY: `last_pushed_epoch` is `AtomicU64` — `.store` through `&self`
         // is well-defined and race-free with concurrent `.load` calls.
         // No `unsafe` const-to-mut cast needed (B14 fix).
         for conn in &self.connections {
             conn.last_pushed_epoch.store(0, AtomicOrdering::Relaxed);
         }
+        Ok(())
     }
 
     pub fn table_name(&self) -> &str {
@@ -1010,7 +1023,7 @@ mod tests {
         };
 
         for _ in 0..10_000 {
-            src.reset_state();
+            src.reset_state().expect("reset_state poisoned in test");
         }
         reader.join().expect("reader thread panicked");
 

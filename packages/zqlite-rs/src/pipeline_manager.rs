@@ -160,7 +160,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         instance.syncable_tables = syncable_tables;
         instance.all_table_names = all_table_names;
         Ok(())
@@ -178,7 +180,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         instance.permission_tables = tables;
         Ok(())
     }
@@ -199,7 +203,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         if companions.is_empty() {
             instance.companions.remove(&query_id);
         } else {
@@ -220,7 +226,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
 
         let mut schema_cache = SchemaCache::new(&instance.db_path);
         let state = build_pipeline_state(
@@ -240,7 +248,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         instance.pipelines.retain(|p| p.lock().unwrap().query_id != query_id);
         instance.companions.remove(&query_id);
         Ok(())
@@ -253,7 +263,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
 
         let result = hydrate_instance(&instance);
         Ok(Buffer::from(encode_advance_result_buf(&result)))
@@ -266,7 +278,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
 
         let result = hydrate_query_instance(&instance, &query_id)?;
         Ok(Buffer::from(encode_advance_result_buf(&result)))
@@ -289,7 +303,9 @@ impl RustPipelineManager {
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
         // B12: mutable lock — advance_instance now refreshes companion
         // resolved_value post-advance to prevent A→B→A spurious resets.
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
 
         let result = advance_instance(&mut instance, &changes);
         Ok(Buffer::from(encode_advance_result_buf(&result)))
@@ -317,7 +333,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         instance.prev_db_path = Some(prev_db_path);
         Ok(())
     }
@@ -336,14 +354,19 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let mut instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let mut instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
 
         instance.shared_pool.swap_path(&new_db_path)
             .map_err(|e| napi::Error::from_reason(format!("Failed to swap pool: {e}")))?;
 
         for pm in instance.pipelines.iter() {
-            let pipeline = pm.lock().unwrap();
-            pipeline.source.reset_state();
+            // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+            let pipeline = pm.lock()
+                .map_err(|e| napi::Error::from_reason(format!("pipeline lock poisoned: {e}")))?;
+            pipeline.source.reset_state()
+                .map_err(|e| napi::Error::from_reason(format!("reset_state: {e}")))?;
         }
 
         instance.db_path = new_db_path;
@@ -360,7 +383,9 @@ impl RustPipelineManager {
             .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
         let instance_mutex = instances.get(&id)
             .ok_or_else(|| napi::Error::from_reason(format!("No instance: {id}")))?;
-        let instance = instance_mutex.lock().unwrap();
+        // B10/D-03: explicit poison propagation — no .unwrap() on inner mutexes.
+        let instance = instance_mutex.lock()
+            .map_err(|e| napi::Error::from_reason(format!("instance lock poisoned: {e}")))?;
         Ok(instance.pipelines.len() as u32)
     }
 
