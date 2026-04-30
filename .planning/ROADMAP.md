@@ -68,19 +68,24 @@ See `.planning/milestones/v5.0-ROADMAP.md` for full details.
 ### 📋 v6.0 (Planning)
 
 Use `/gsd-new-milestone` to:
+
 1. Surface and prioritize the carry-forward items above
 2. Add new v6.0 capabilities (FlippedJoin operator family is the biggest open item)
 3. Generate fresh `REQUIREMENTS.md` and Phase 35+ roadmap
+
+#### Planned Phases (v6.0)
+
+- [ ] **Phase 35 — Pool & Cascade Hardening** — Two design-level workstreams: B10 (`swap_path` retry + unified poison handling across `connection_pool.rs`/`pipeline_manager.rs`/`table_source.rs`) and NEW-1 (prev-snapshot connection pooling — eliminate per-call `Connection::open` in `emit_descendant_removals`; closes NEW-3 + NEW-5 as side effects). Acceptance: ≥2× cascade-delete throughput on 3-level / 100-root bench; zero `.unwrap()` on inner mutexes in production paths; Phase 33 TTFB+MemPeak thresholds carry-forward; Phase 34 B11 tests carry-forward. 4 plans (35-01..04). Plan: `.planning/phases/35-pool-cascade-hardening/`.
 
 ---
 
 ## Progress
 
-| Milestone | Phases | Status | Completed |
-| --------- | ------ | ------ | --------- |
-| v1.0 | 12 | Complete | 2026-04-20 |
-| v2.0 | 6 | Complete | 2026-04-21 |
-| v3.0 | — | Complete | 2026-04-21 |
-| v4.0 | 11 | Complete | 2026-04-29 |
-| v5.0 | 5 (30–34) | Complete | 2026-04-30 |
-| v6.0 | TBD | Planning | — |
+| Milestone | Phases                 | Status   | Completed  |
+| --------- | ---------------------- | -------- | ---------- |
+| v1.0      | 12                     | Complete | 2026-04-20 |
+| v2.0      | 6                      | Complete | 2026-04-21 |
+| v3.0      | —                      | Complete | 2026-04-21 |
+| v4.0      | 11                     | Complete | 2026-04-29 |
+| v5.0      | 5 (30–34)              | Complete | 2026-04-30 |
+| v6.0      | TBD (Phase 35 planned) | Planning | —          |
