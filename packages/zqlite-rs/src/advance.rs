@@ -461,8 +461,13 @@ fn collect_children_of_recursive(
     }
 }
 
+// B11: prev_db_path per TS pipeline-driver.ts:1542. Reads descendants
+// against the PREV snapshot — same-tx descendant deletes still present
+// there. Was reading against db_path (curr post-swap_snapshot) which
+// silently elided same-tx descendants.
+// See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
 fn emit_descendant_removals(
-    db_path: &str,
+    prev_db_path: &str,
     deleted_row: &serde_json::Map<String, serde_json::Value>,
     deleted_table: &str,
     children_of: &HashMap<String, Vec<ChildRelation>>,
@@ -475,7 +480,7 @@ fn emit_descendant_removals(
         None => return,
     };
     let conn = match rusqlite::Connection::open_with_flags(
-        db_path,
+        prev_db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
@@ -567,9 +572,9 @@ fn emit_descendant_removals(
                     row: None,
                     change_type: "remove".to_string(),
                 });
-                // Recurse for deeper levels
+                // Recurse for deeper levels — same prev snapshot (B11).
                 emit_descendant_removals(
-                    db_path, &child_row, &rel.child_table, children_of,
+                    prev_db_path, &child_row, &rel.child_table, children_of,
                     query_id, column_types, row_changes,
                 );
             }
@@ -1238,6 +1243,11 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
     pipeline: &mut PipelineState,
     changes: &[Change],
     db_path: &str,
+    // B11: prev_db_path per TS pipeline-driver.ts:1542 — read descendants
+    // from the PREV snapshot (where same-tx-deleted rows still exist).
+    // Distinct from db_path (curr; used for child_row_has_parent which
+    // needs post-tx state).
+    prev_db_path: &str,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<RowChange> {
     #[cfg(test)]
@@ -1318,8 +1328,9 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
                         let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
                         if !has_child_rows && !pipeline.children_of_map.is_empty() {
                             let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
+                            // B11: prev_db_path per TS pipeline-driver.ts:1542
                             emit_descendant_removals(
-                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
                                 &pipeline.query_id, &pipeline.column_types, &mut row_changes,
                             );
                         }
@@ -1379,13 +1390,16 @@ pub(crate) fn advance_persistent_pipeline_with_cancel(
                                 change_type: "remove".to_string(),
                             });
                             let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            // B11: prev_db_path per TS pipeline-driver.ts:1542
                             emit_descendant_removals(
-                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
                                 &pipeline.query_id, &pipeline.column_types, &mut row_changes,
                             );
                         }
                         SourceChange::Add(ref row) => {
                             let row_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            // child_row_has_parent: db_path (curr) is correct —
+                            // an Add must verify the parent exists in post-tx state.
                             if !child_row_has_parent(db_path, ci, &row_map) {
                                 continue;
                             }
@@ -1446,6 +1460,11 @@ pub(crate) fn advance_persistent_pipeline(
     pipeline: &mut PipelineState,
     changes: &[Change],
     db_path: &str,
+    // B11: prev_db_path per TS pipeline-driver.ts:1542 — read descendants
+    // from the PREV snapshot (where same-tx-deleted rows still exist).
+    // Distinct from db_path (curr; used for child_row_has_parent which
+    // needs post-tx state).
+    prev_db_path: &str,
 ) -> Vec<RowChange> {
     if !pipeline.has_operators {
         return changes_to_row_changes_direct(
@@ -1530,8 +1549,9 @@ pub(crate) fn advance_persistent_pipeline(
                         let has_child_rows = node.relationships.values().any(|v| !v.is_empty());
                         if !has_child_rows && !pipeline.children_of_map.is_empty() {
                             let deleted_map: serde_json::Map<String, serde_json::Value> = node.row.clone();
+                            // B11: prev_db_path per TS pipeline-driver.ts:1542
                             emit_descendant_removals(
-                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
                                 &pipeline.query_id, &pipeline.column_types, &mut row_changes,
                             );
                         }
@@ -1604,8 +1624,9 @@ pub(crate) fn advance_persistent_pipeline(
                                 change_type: "remove".to_string(),
                             });
                             let deleted_map: serde_json::Map<String, serde_json::Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            // B11: prev_db_path per TS pipeline-driver.ts:1542
                             emit_descendant_removals(
-                                db_path, &deleted_map, &change.table, &pipeline.children_of_map,
+                                prev_db_path, &deleted_map, &change.table, &pipeline.children_of_map,
                                 &pipeline.query_id, &pipeline.column_types, &mut row_changes,
                             );
                         }
@@ -1862,9 +1883,13 @@ impl RustPipeline {
         let t_lock = t1.elapsed();
 
         let t2 = Instant::now();
+        // B11: legacy RustPipeline class has no prev_db_path setter; pass
+        // db_path (preserves pre-fix legacy behavior — same-tx descendant
+        // deletes elided as before; mono-rs production uses RustPipelineManager
+        // which DOES have prev_db_path threading).
         let all_row_changes: Vec<RowChange> = pipelines.iter().flat_map(|pipeline_mutex| {
             let mut pipeline = pipeline_mutex.lock().unwrap();
-            advance_persistent_pipeline(&mut pipeline, &changes, &db_path)
+            advance_persistent_pipeline(&mut pipeline, &changes, &db_path, &db_path)
         }).collect();
         let t_ivm = t2.elapsed();
 
@@ -2460,7 +2485,8 @@ mod tests {
             // ~80 iters; use a generous margin.
             for _ in 0..120 {
                 for pipeline in ps.iter_mut() {
-                    let _ = advance_persistent_pipeline(pipeline, &changes, &db_path);
+                    // B11 bench: same-path is sufficient (no cascade-delete in this fixture)
+                    let _ = advance_persistent_pipeline(pipeline, &changes, &db_path, &db_path);
                 }
             }
             ps
@@ -2472,7 +2498,7 @@ mod tests {
         let mut seq_total_changes = 0;
         for _ in 0..iterations {
             for pipeline in pipelines.iter_mut() {
-                let row_changes = advance_persistent_pipeline(pipeline, &changes, &db_path);
+                let row_changes = advance_persistent_pipeline(pipeline, &changes, &db_path, &db_path);
                 seq_total_changes += row_changes.len();
             }
         }
@@ -2496,7 +2522,7 @@ mod tests {
                 .par_iter()
                 .flat_map(|pm| {
                     let mut pipeline = pm.lock().unwrap();
-                    advance_persistent_pipeline(&mut pipeline, &changes, &db_path)
+                    advance_persistent_pipeline(&mut pipeline, &changes, &db_path, &db_path)
                 })
                 .collect();
             par_total_changes += batch_changes.len();
@@ -2522,64 +2548,109 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 34 Wave 0 — Red-state stub for B11 (CONTEXT D-18).
-    // Wave 1 will flip this green by:
-    //   1. Adding a `set_prev_snapshot(prev_db_path: String)` napi method
-    //      to RustPipelineManager (additive — no existing buffered method
-    //      signature changes, per CLAUDE.md verification gate #4).
-    //   2. Routing `emit_descendant_removals` to read from `prev_db_path`
-    //      instead of `db_path` (post-tx).
-    //   3. Adding TS-side wiring in pipeline-driver.ts to call
-    //      `set_prev_snapshot(prev.db.db.name)` BEFORE
-    //      `swap_snapshot(curr.db.db.name)` on each advance.
+    // Phase 34 Wave 1 — B11 GREEN-STATE assertions (Task 1b flip).
+    //
+    // Wave 0 stub (red) asserted the bug existed: emit_descendant_removals
+    // signature was `db_path: &str` (reading post-tx snapshot), and no
+    // #[napi] set_prev_snapshot existed. After Plan 34-06 Task 1b lands the
+    // fix per CONTEXT D-15, the green-state assertions below verify:
+    //   1. emit_descendant_removals signature is `prev_db_path: &str`.
+    //   2. set_prev_snapshot is a #[napi] method on RustPipelineManager.
+    //   3. The descendant SQL reads against prev_db_path (not db_path).
+    //
+    // Spec: TS pipeline-driver.ts:1542-1577.
+    // See .planning/IVM-PORT-AUDIT-DEEP.md §B11.
     // ========================================================================
 
-    /// **B11 (BLOCKING) — Cascade-delete reads POST-tx snapshot.**
+    /// **B11 (BLOCKING) — Cascade-delete reads PREV snapshot.** (post-fix green)
     ///
-    /// Spec: TS upstream `pipeline-driver.ts:1542-1577` materializes the diff
-    /// from the `prev` snapshot BEFORE swapping to `curr`. Descendant rows
-    /// being deleted in the same transaction are still present in `prev` so
-    /// their Remove row-changes are emitted.
-    ///
-    /// Current Rust (`advance.rs:464-477`): `emit_descendant_removals` opens
-    /// a fresh read connection on `db_path`. By the time advance runs,
-    /// `swap_snapshot` has already pointed `db_path` at `curr.db.db.name`
-    /// (post-tx). Same-tx descendant deletes are silently elided.
-    ///
-    /// Wave 0 Red-state: source contains the literal
-    /// `Connection::open_with_flags(db_path,` at the descendant SQL site.
-    /// Wave 1 replaces it with `Connection::open_with_flags(prev_db_path,`
-    /// after threading the prev snapshot through.
+    /// Verifies the Plan 34-06 fix: emit_descendant_removals reads from the
+    /// PREV snapshot where same-tx descendants still exist, not the curr
+    /// (post-swap) snapshot where they have already been deleted.
     #[test]
-    #[ignore = "Phase 34 Wave 1 will flip this green by adding the set_prev_snapshot \
-        napi method on RustPipelineManager and routing emit_descendant_removals \
-        to read from the prev snapshot. Spec: TS pipeline-driver.ts:1542-1577."]
     fn test_b11_descendants_from_prev() {
         let src = include_str!("advance.rs");
-        // Red state: emit_descendant_removals function still exists and reads
-        // from `db_path` (post-tx). The function signature contains
-        // `db_path: &str` — Wave 1 replaces it with `prev_db_path: &str`.
+        // GREEN: emit_descendant_removals signature uses prev_db_path: &str.
         let fn_marker = src
             .find("fn emit_descendant_removals(")
             .expect("missing emit_descendant_removals — code refactored?");
-        let signature_block = &src[fn_marker..fn_marker + 400];
-        // Red state: `db_path` is the parameter name (not `prev_db_path`).
+        // Extend the window to include the open_with_flags call (multi-line
+        // signature + body lead-in spans ~600 chars).
+        let signature_block = &src[fn_marker..fn_marker + 800];
         assert!(
-            signature_block.contains("db_path: &str") &&
-                !signature_block.contains("prev_db_path: &str"),
-            "Wave 0 expected emit_descendant_removals(db_path: &str) (current bug — reads \
-             post-tx snapshot). Wave 1 should rename parameter to `prev_db_path` once the \
-             snapshot lifecycle is wired through. If renamed already, remove this stub."
+            signature_block.contains("prev_db_path: &str"),
+            "B11 (post-fix): emit_descendant_removals signature must contain \
+             `prev_db_path: &str`. Spec: TS pipeline-driver.ts:1542-1577. \
+             Saw signature block:\n{}",
+            signature_block,
         );
-        // The `set_prev_snapshot` napi method should NOT yet exist (Wave 1 adds it).
-        // Match by the `#[napi]` attribute pattern preceding a real method
-        // declaration — this skips over our own assertion-string literal that
-        // names the method in documentation text.
-        let napi_method_marker = "#[napi]\n    pub fn set_prev_snapshot";
+        // GREEN: SQL connection opens against prev_db_path, not db_path.
+        // Tolerate either one-line or multi-line open_with_flags formatting.
+        let opens_against_prev = signature_block.contains("open_with_flags(prev_db_path,") ||
+            signature_block.contains("open_with_flags(\n        prev_db_path,");
         assert!(
-            !src.contains(napi_method_marker),
-            "Wave 0 expected `set_prev_snapshot` NOT yet implemented as a #[napi] method. \
-             Found it — Wave 1 fix may have landed without removing the stub."
+            opens_against_prev,
+            "B11: descendant SQL must open against prev_db_path. \
+             Saw signature block:\n{}",
+            signature_block,
+        );
+    }
+
+    /// **B11 — set_prev_snapshot napi method present** (Task 1a artifact).
+    ///
+    /// Verifies the additive napi method exists on RustPipelineManager.
+    /// CLAUDE.md gate #4 preserved (no existing buffered-method signature
+    /// change).
+    #[test]
+    fn test_b11_set_prev_snapshot_napi_present() {
+        let src = include_str!("pipeline_manager.rs");
+        // GREEN: set_prev_snapshot decorated with #[napi], present in the
+        // RustPipelineManager impl. Use a tolerant whitespace pattern: the
+        // line above must contain `#[napi]` and the method line must be
+        // `pub fn set_prev_snapshot(`.
+        let method_marker = "pub fn set_prev_snapshot(";
+        let method_idx = src
+            .find(method_marker)
+            .expect("set_prev_snapshot method not found — Task 1a regressed?");
+        // Look at the 64 chars preceding the method declaration for #[napi].
+        let preceding_window_start = method_idx.saturating_sub(64);
+        let preceding = &src[preceding_window_start..method_idx];
+        assert!(
+            preceding.contains("#[napi]"),
+            "B11: set_prev_snapshot must carry #[napi] attribute (Task 1a). \
+             Preceding 64 chars:\n{}",
+            preceding,
+        );
+    }
+
+    /// **B11 — back-compat fallback path does not panic when prev_db_path
+    /// is None.**
+    ///
+    /// If a caller never invokes set_prev_snapshot, advance must not panic:
+    /// instead it logs a warning and falls back to db_path. This preserves
+    /// pre-fix behavior (same-tx descendants still elided in fallback path
+    /// — but no crash). Mono-rs production always wires setPrevSnapshot via
+    /// pipeline-driver.ts (Plan 34-06 Task 2), so this fallback is purely
+    /// defensive.
+    #[test]
+    fn test_b11_fallback_when_prev_not_set() {
+        // Pure source-level assertion: the fallback path reads
+        // `instance.prev_db_path.clone().unwrap_or_else(|| ...)` rather than
+        // `.unwrap()`. Without the unwrap_or_else, a None prev_db_path would
+        // panic — this assertion locks in the safe back-compat path.
+        let src = include_str!("pipeline_manager.rs");
+        assert!(
+            src.contains("prev_db_path.clone()") &&
+                src.contains(".unwrap_or_else"),
+            "B11: fallback path must use `prev_db_path.clone().unwrap_or_else(...)` \
+             so a None setting falls back to db_path with a logged warning \
+             rather than panicking. (Mono-rs production wires setPrevSnapshot \
+             via pipeline-driver.ts; this fallback exists for back-compat.)"
+        );
+        assert!(
+            src.contains("[B11] prev_db_path not set"),
+            "B11: fallback path must log a warning via eprintln when \
+             prev_db_path is None (per RESEARCH.md fallback design)."
         );
     }
 }

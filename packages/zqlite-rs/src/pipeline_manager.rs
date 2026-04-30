@@ -487,8 +487,6 @@ impl RustPipelineManager {
                 // TS pipeline-driver.ts:1542-1577 calls set_prev_snapshot(prev)
                 // BEFORE swap_snapshot(curr); we read it here. Fallback to
                 // db_path with a logged warning preserves back-compat.
-                // Resolved in Task 1a; threaded into advance_persistent_pipeline
-                // in Task 1b.
                 let prev_db_path_owned: String = instance.prev_db_path.clone()
                     .unwrap_or_else(|| {
                         eprintln!(
@@ -498,7 +496,6 @@ impl RustPipelineManager {
                         );
                         instance.db_path.clone()
                     });
-                let _ = &prev_db_path_owned; // Task 1a placeholder — Task 1b consumes.
 
                 rayon::scope(|s| {
                     for pm in instance.pipelines.iter() {
@@ -507,6 +504,7 @@ impl RustPipelineManager {
                         let permission_tables = &instance.permission_tables;
                         let syncable_tables = &instance.syncable_tables;
                         let db_path = instance.db_path.as_str();
+                        let prev_db_path = prev_db_path_owned.as_str();
                         let changes_ref = &changes;
                         s.spawn(move |_| {
                             if cancel.load(Ordering::Relaxed) { return; }
@@ -516,8 +514,9 @@ impl RustPipelineManager {
                             let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                                 let mut pipeline = pm.lock().unwrap();
                                 // STREAM-04: cancel-aware advance (Task 5/6).
+                                // B11 (Task 1b): pass prev_db_path for cascade-delete reads.
                                 let chunk = crate::advance::advance_persistent_pipeline_with_cancel(
-                                    &mut pipeline, changes_ref, db_path, &cancel,
+                                    &mut pipeline, changes_ref, db_path, prev_db_path, &cancel,
                                 );
                                 // STREAM-06 / D-20: filter per-chunk.
                                 let mut filtered = chunk;
@@ -756,8 +755,7 @@ fn advance_instance(instance: &PipelineInstance, changes: &[Change]) -> AdvanceR
     // pipeline-driver.ts:1542-1577 calls set_prev_snapshot(prev) BEFORE
     // swap_snapshot(curr); we read it here. Fallback to db_path with a
     // logged warning preserves back-compat for callers that don't yet
-    // wire setPrevSnapshot. Resolved here in Task 1a; threaded into
-    // advance_persistent_pipeline in Task 1b.
+    // wire setPrevSnapshot.
     let prev_db_path = instance.prev_db_path.clone()
         .unwrap_or_else(|| {
             eprintln!(
@@ -767,12 +765,13 @@ fn advance_instance(instance: &PipelineInstance, changes: &[Change]) -> AdvanceR
             );
             instance.db_path.clone()
         });
-    let _ = &prev_db_path; // Task 1a placeholder — Task 1b consumes this.
 
     // 1. Push changes through IVM operator trees
+    // B11 (Task 1b): advance_persistent_pipeline now consumes prev_db_path
+    // (descendant SQL reads) alongside db_path (child_row_has_parent reads).
     let mut all_row_changes: Vec<RowChange> = instance.pipelines.iter().flat_map(|pm| {
         let mut pipeline = pm.lock().unwrap();
-        advance_persistent_pipeline(&mut pipeline, changes, &instance.db_path)
+        advance_persistent_pipeline(&mut pipeline, changes, &instance.db_path, &prev_db_path)
     }).collect();
 
     // 2. Permission table filtering + minRowVersion bump
