@@ -68,6 +68,79 @@ CREATE TABLE team_members (
 
 CREATE INDEX team_members_org_dept_idx ON team_members("orgID", "deptID");
 
+-- ============================================================
+-- Prod-extension tables (covering ~94 of 222 prod slow-SQL shapes).
+-- Trimmed to filterable+orderable cols + a few projection cols.
+-- See .tmp/ivm-queries/slow_sql_analyzed_24h.json for source.
+-- ============================================================
+
+CREATE TABLE tickets (
+  id                TEXT PRIMARY KEY,
+  title             TEXT NOT NULL,
+  status            TEXT NOT NULL,
+  "ticketType"      TEXT NOT NULL,
+  "createdBy"       TEXT NOT NULL REFERENCES users(id),
+  "createdAt"       BIGINT NOT NULL,
+  "conversationId"  TEXT NULL REFERENCES conversations(id),
+  "assignedTo"      TEXT NULL REFERENCES users(id),
+  "channelId"       TEXT NULL REFERENCES channels(id),
+  "boardId"         TEXT NULL,
+  "projectId"       TEXT NULL,
+  "isArchived"      BOOLEAN NOT NULL DEFAULT false,
+  "lastEmailAt"     BIGINT NULL
+);
+CREATE INDEX tickets_assignedTo_idx ON tickets("assignedTo");
+CREATE INDEX tickets_createdBy_idx  ON tickets("createdBy");
+CREATE INDEX tickets_channelId_idx  ON tickets("channelId");
+
+CREATE TABLE activities (
+  id              TEXT PRIMARY KEY,
+  "userId"        TEXT NOT NULL REFERENCES users(id),
+  "actorAction"   TEXT NOT NULL,
+  "actionSource"  TEXT NOT NULL,
+  "isRead"        BOOLEAN NOT NULL DEFAULT false,
+  "messageId"     TEXT NULL REFERENCES messages(id),
+  classification  TEXT NULL,
+  "updatedAt"     BIGINT NOT NULL
+);
+CREATE INDEX activities_userId_idx     ON activities("userId");
+CREATE INDEX activities_messageId_idx  ON activities("messageId");
+
+CREATE TABLE canvases (
+  id              TEXT PRIMARY KEY,
+  title           TEXT NOT NULL,
+  "channelId"     TEXT NULL REFERENCES channels(id),
+  "createdBy"     TEXT NOT NULL REFERENCES users(id),
+  "viewAccessId"  TEXT NULL,
+  "editAccessId"  TEXT NULL,
+  "docType"       TEXT NOT NULL,
+  "userRepo"      TEXT NULL,
+  "updatedAt"     BIGINT NOT NULL
+);
+CREATE INDEX canvases_channelId_idx ON canvases("channelId");
+CREATE INDEX canvases_createdBy_idx ON canvases("createdBy");
+
+CREATE TABLE channel_recaps (
+  id           TEXT PRIMARY KEY,
+  "channelId"  TEXT NOT NULL REFERENCES channels(id),
+  "recapDate"  BIGINT NOT NULL,
+  summary      TEXT NOT NULL,
+  "userId"     TEXT NULL REFERENCES users(id)
+);
+CREATE INDEX channel_recaps_channelId_idx ON channel_recaps("channelId");
+CREATE INDEX channel_recaps_userId_idx    ON channel_recaps("userId");
+
+CREATE TABLE calls (
+  id           TEXT PRIMARY KEY,
+  title        TEXT NOT NULL,
+  "callType"   TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  "channelId"  TEXT NULL REFERENCES channels(id),
+  "startsAt"   BIGINT NOT NULL,
+  "startedAt"  BIGINT NULL
+);
+CREATE INDEX calls_channelId_idx ON calls("channelId");
+
 -- =============================================================================
 -- FUZZ-02 schema extension per CONTEXT.md D-09..D-12.
 -- Production-shape density (2x JSONB, 2x TIMESTAMPTZ on events) per D-09;
