@@ -11,6 +11,7 @@
     "start-rs": "ZERO_ENABLE_QUERY_PLANNER=false ZERO_PORT=4868 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/parity ZERO_REPLICA_FILE=/tmp/ivm-parity-rs.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_rs ZERO_NUM_SYNC_WORKERS=2 ZERO_ADMIN_PASSWORD=devdev ZERO_AUTH_SECRET=devsecret npx zero-cache",
     "fuzz": "tsx ast-fuzz.ts",
     "fuzz-check": "tsx random-ast-fuzz.ts",
+    "fuzz-check:gate": "FUZZ_NUM_RUNS=1000 npm run fuzz-check",
     "fuzz-shrink": "tsx random-ast-fuzz.ts --shrink-only",
     "fuzz-record": "tsx random-ast-fuzz.ts --record-only",
     "diff:track2": "tsx diff-tests-track2.ts",
@@ -21,7 +22,7 @@
     "sweep:advance": "tsx harness-advance-coverage.ts",
     "report": "tsx parity-report.ts",
     "test-rs": "cargo test --manifest-path ../../packages/zero-ivm-rs/Cargo.toml && cargo test --manifest-path ../../packages/zqlite-rs/Cargo.toml",
-    "test": "npm run fuzz && npm run seed-corpus && npm run synth-p6 && npm run refresh-stats && npm run sweep:hydrate && npm run sweep:advance && npm run fuzz-check && npm run report && cat parity_report.md | head -30",
+    "test": "npm run fuzz && npm run seed-corpus && npm run synth-p6 && npm run refresh-stats && npm run sweep:hydrate && npm run sweep:advance && npm run report && npm run fuzz-check && cat parity_report.md | head -30",
     "harness-legacy": "tsx harness.ts"
   },
   "dependencies": {
