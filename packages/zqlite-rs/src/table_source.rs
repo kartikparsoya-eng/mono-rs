@@ -133,8 +133,11 @@ impl RustTableSource {
         })
     }
 
+    /// Returns the database path. Lossy convenience wrapper around
+    /// `self.pool.path()` for callers that can't propagate `PoolError`. On
+    /// poison, returns an empty string. Per Phase 35 / B10/D-03.
     pub fn db_path(&self) -> String {
-        self.pool.path()
+        self.pool.path().unwrap_or_default()
     }
 
     /// Execute a query using a connection from the pool.
@@ -238,7 +241,12 @@ impl RustTableSource {
     /// replaces the write connection. Operator tree and connection metadata
     /// remain intact — only the SQLite file changes.
     pub fn swap_db(&self, new_path: &str) -> Result<()> {
-        let same_path = self.pool.path() == new_path;
+        // B10/D-03: pool.path() now Result; propagate poison.
+        let current = self
+            .pool
+            .path()
+            .map_err(TableSourceError::Pool)?;
+        let same_path = current == new_path;
         self.pool.swap_path(new_path).map_err(TableSourceError::Pool)?;
         if !same_path {
             // Different DB file — must reopen write connection.

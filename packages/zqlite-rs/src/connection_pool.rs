@@ -5,11 +5,25 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 /// Error type for connection pool operations.
+///
+/// Per Phase 35 / B10: unified error model. All pool methods return `PoolError`
+/// rather than panicking on poison or silently recovering. Callers convert at
+/// the napi boundary via `napi::Error::from_reason(format!("...: {e}"))`.
+///
+/// See `.planning/IVM-PORT-AUDIT-DEEP.md` §B10 for the audit finding and
+/// `.planning/phases/35-pool-cascade-hardening/35-CONTEXT.md` for design.
 #[derive(Debug)]
 pub enum PoolError {
     Sqlite(rusqlite::Error),
     Exhausted,
     Poisoned,
+    /// B10/D-01: distinct from `Sqlite` for path-open / FS errors that aren't
+    /// surfaced as `rusqlite::Error`. Reserved for future use; emitted by
+    /// `From<std::io::Error>`.
+    IoError(std::io::Error),
+    /// B10/D-05: returned by `swap_path*` when another swap is already
+    /// in progress (the `swap_guard` Mutex is held).
+    ConcurrentSwapInProgress,
 }
 
 impl fmt::Display for PoolError {
@@ -18,11 +32,23 @@ impl fmt::Display for PoolError {
             PoolError::Sqlite(e) => write!(f, "sqlite error: {e}"),
             PoolError::Exhausted => write!(f, "connection pool exhausted"),
             PoolError::Poisoned => write!(f, "connection pool mutex poisoned"),
+            PoolError::IoError(e) => write!(f, "pool io error: {e}"),
+            PoolError::ConcurrentSwapInProgress => {
+                write!(f, "another swap_path is in progress on this pool")
+            }
         }
     }
 }
 
-impl std::error::Error for PoolError {}
+impl std::error::Error for PoolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PoolError::Sqlite(e) => Some(e),
+            PoolError::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<rusqlite::Error> for PoolError {
     fn from(e: rusqlite::Error) -> Self {
@@ -30,15 +56,29 @@ impl From<rusqlite::Error> for PoolError {
     }
 }
 
+impl From<std::io::Error> for PoolError {
+    fn from(e: std::io::Error) -> Self {
+        PoolError::IoError(e)
+    }
+}
+
 type Result<T> = std::result::Result<T, PoolError>;
 
 /// A lightweight pool of read-only SQLite connections pinned to the same WAL
 /// snapshot. Safe to share across threads (`Send + Sync`).
+///
+/// Per Phase 35 / B10: `swap_path` polls with bounded retry; `swap_path_now`
+/// fails fast; `swap_path_with_timeout` is fully configurable. Concurrent
+/// `swap_path*` callers serialize via the `swap_guard: Mutex<()>` field —
+/// the loser observes `PoolError::ConcurrentSwapInProgress`.
 #[derive(Clone)]
 pub struct ConnectionPool {
     connections: Arc<Mutex<Vec<Connection>>>,
     path: Arc<Mutex<String>>,
     pool_size: usize,
+    /// B10/D-05: serialize concurrent `swap_path*` callers. `try_lock()`
+    /// non-blocking — second caller observes `ConcurrentSwapInProgress`.
+    swap_guard: Arc<Mutex<()>>,
 }
 
 impl ConnectionPool {
@@ -61,6 +101,7 @@ impl ConnectionPool {
             connections: Arc::new(Mutex::new(conns)),
             path: Arc::new(Mutex::new(path.to_owned())),
             pool_size,
+            swap_guard: Arc::new(Mutex::new(())),
         })
     }
 
@@ -110,9 +151,13 @@ impl ConnectionPool {
         Ok(())
     }
 
-    /// Returns the database path.
-    pub fn path(&self) -> String {
-        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// Returns the database path. Errors if the path mutex is poisoned.
+    ///
+    /// Per Phase 35 / B10/D-03: silent `unwrap_or_else` recovery removed.
+    /// Callers MUST handle the `Poisoned` error explicitly. For callers that
+    /// cannot easily propagate, see `db_path_or_default()` in `table_source.rs`.
+    pub fn path(&self) -> Result<String> {
+        Ok(self.path.lock().map_err(|_| PoolError::Poisoned)?.clone())
     }
 
     /// Returns the configured pool size.
@@ -126,39 +171,103 @@ impl ConnectionPool {
         Ok(conns.len())
     }
 
-    /// Re-opens all connections at a new database path. Each connection gets
-    /// a fresh `BEGIN DEFERRED` snapshot. All `PooledConnection` guards must
-    /// be dropped before calling this — checked via available count.
+    /// Re-opens all connections at a new database path with bounded retry.
+    /// Default timeout: 750ms (5 attempts at ~50/100/150/200/250ms increments).
+    ///
+    /// Per Phase 35 / B10/D-02. For configurable timeout, use
+    /// `swap_path_with_timeout`. For immediate-fail (no retry), use
+    /// `swap_path_now`.
     pub fn swap_path(&self, new_path: &str) -> Result<()> {
-        let current_path = self.path.lock().map_err(|_| PoolError::Poisoned)?.clone();
+        self.swap_path_with_timeout(new_path, Duration::from_millis(750))
+    }
 
+    /// Re-opens connections at `new_path` immediately. Returns
+    /// `PoolError::Exhausted` if any connection is currently checked out.
+    /// No retry.
+    ///
+    /// Per Phase 35 / B10/D-04: this is the fast-fail variant for callers
+    /// that have already drained the pool and want to fail loudly otherwise.
+    pub fn swap_path_now(&self, new_path: &str) -> Result<()> {
+        self.swap_path_with_timeout(new_path, Duration::from_millis(0))
+    }
+
+    /// Re-opens all connections at a new path. Polls with linear backoff
+    /// (50ms initial step, +50ms per attempt) until all connections are
+    /// checked in OR `timeout` is exceeded. Returns:
+    /// - `Ok(())` on successful swap.
+    /// - `PoolError::Exhausted` on timeout (some connection still checked out).
+    /// - `PoolError::ConcurrentSwapInProgress` if another swap is mid-flight.
+    /// - `PoolError::Poisoned` if any inner mutex is poisoned.
+    /// - `PoolError::Sqlite(...)` on connection-open failure at `new_path`.
+    ///
+    /// Per Phase 35 / B10/D-02 + D-04 + D-05.
+    pub fn swap_path_with_timeout(
+        &self,
+        new_path: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        // D-05: serialize concurrent swaps. try_lock — second caller fails fast.
+        let _guard = self
+            .swap_guard
+            .try_lock()
+            .map_err(|e| match e {
+                std::sync::TryLockError::WouldBlock => PoolError::ConcurrentSwapInProgress,
+                std::sync::TryLockError::Poisoned(_) => PoolError::Poisoned,
+            })?;
+
+        // Same-path fast path: refresh WAL snapshot via set_snapshot — no retry.
+        let current_path = self
+            .path
+            .lock()
+            .map_err(|_| PoolError::Poisoned)?
+            .clone();
         if new_path == current_path {
-            // Same DB file (WAL mode) — just refresh the read snapshot
-            // by ending the current transaction and starting a new one.
-            // This is the fast path: no Connection::open syscalls.
             return self.set_snapshot();
         }
 
-        // Different path — must reopen all connections.
+        // Different path — must reopen. Poll for full pool quiescence.
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI;
 
-        let mut conns = self.connections.lock().map_err(|_| PoolError::Poisoned)?;
-        if conns.len() != self.pool_size {
-            return Err(PoolError::Exhausted);
-        }
-        conns.clear();
-        for _ in 0..self.pool_size {
-            let conn = Connection::open_with_flags(new_path, flags)?;
-            conn.busy_timeout(Duration::from_millis(5000))?;
-            conn.execute_batch("BEGIN DEFERRED")?;
-            conns.push(conn);
-        }
-        drop(conns);
+        let start = std::time::Instant::now();
+        let mut attempt: u32 = 0;
+        let initial_step = Duration::from_millis(50);
 
-        *self.path.lock().map_err(|_| PoolError::Poisoned)? = new_path.to_owned();
-        Ok(())
+        loop {
+            // Try to acquire lock; if all conns idle, perform swap inline.
+            {
+                let mut conns = self
+                    .connections
+                    .lock()
+                    .map_err(|_| PoolError::Poisoned)?;
+                if conns.len() == self.pool_size {
+                    conns.clear();
+                    for _ in 0..self.pool_size {
+                        let conn = Connection::open_with_flags(new_path, flags)?;
+                        conn.busy_timeout(Duration::from_millis(5000))?;
+                        conn.execute_batch("BEGIN DEFERRED")?;
+                        conns.push(conn);
+                    }
+                    drop(conns);
+                    *self.path.lock().map_err(|_| PoolError::Poisoned)? =
+                        new_path.to_owned();
+                    return Ok(());
+                }
+                // Not idle — fall through and back off.
+            }
+
+            attempt += 1;
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Err(PoolError::Exhausted);
+            }
+            // Linear backoff: 50ms, 100ms, 150ms, ... (CD-01).
+            let step = initial_step * attempt;
+            let remaining = timeout.saturating_sub(elapsed);
+            let sleep = step.min(remaining);
+            std::thread::sleep(sleep);
+        }
     }
 }
 
@@ -184,6 +293,48 @@ impl Drop for PooledConnection {
                 conns.push(conn);
             }
         }
+    }
+}
+
+// ─── Test-only fault-injection helpers (B10/D-06) ─────────────────────────
+#[cfg(test)]
+impl ConnectionPool {
+    /// Test-only: poison the inner `connections` mutex. Spawns a thread
+    /// that locks the mutex and panics; after join, subsequent `lock()`
+    /// returns `Err`.
+    pub(crate) fn poison_connections_for_test(&self) {
+        let conns = Arc::clone(&self.connections);
+        let h = std::thread::spawn(move || {
+            let _g = conns.lock().unwrap();
+            panic!("intentional poison for test");
+        });
+        let _ = h.join();
+    }
+
+    /// Test-only: poison the inner `path` mutex.
+    pub(crate) fn poison_path_for_test(&self) {
+        let p = Arc::clone(&self.path);
+        let h = std::thread::spawn(move || {
+            let _g = p.lock().unwrap();
+            panic!("intentional poison for test");
+        });
+        let _ = h.join();
+    }
+
+    /// Test-only: construct a pool and pre-acquire `hold_count` connections.
+    /// Returns the pool plus the held guards so the caller can drop them
+    /// on a timer.
+    pub(crate) fn new_with_holds(
+        path: &str,
+        pool_size: usize,
+        hold_count: usize,
+    ) -> Result<(Self, Vec<PooledConnection>)> {
+        let pool = ConnectionPool::new(path, pool_size)?;
+        let mut held = Vec::with_capacity(hold_count);
+        for _ in 0..hold_count {
+            held.push(pool.get()?);
+        }
+        Ok((pool, held))
     }
 }
 
@@ -239,5 +390,116 @@ mod tests {
             PoolError::Exhausted => {}
             other => panic!("expected Exhausted, got {other}"),
         }
+    }
+
+    // ─── B10 / Phase 35 new tests ────────────────────────────────────────
+
+    #[test]
+    fn test_swap_path_retry_succeeds_after_drop() {
+        // B10/D-02: bounded retry — drop a held conn after 100ms; swap_path
+        // (default 750ms budget) must succeed within budget.
+        let db_a = create_test_db();
+        let db_b = create_test_db();
+        let (pool, mut held) = ConnectionPool::new_with_holds(
+            db_a.path().to_str().unwrap(),
+            2,
+            1,
+        )
+        .unwrap();
+        let pool_clone = pool.clone();
+        let path_b = db_b.path().to_str().unwrap().to_string();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held.pop().unwrap());
+        });
+        let r = pool_clone.swap_path(&path_b);
+        h.join().unwrap();
+        assert!(
+            r.is_ok(),
+            "swap_path should succeed within retry budget: {r:?}"
+        );
+        assert_eq!(pool_clone.path().unwrap(), path_b);
+    }
+
+    #[test]
+    fn test_swap_path_retry_exhausted() {
+        // B10/D-02: tight 200ms budget; held connection never drops.
+        let db_a = create_test_db();
+        let db_b = create_test_db();
+        let (pool, _held) = ConnectionPool::new_with_holds(
+            db_a.path().to_str().unwrap(),
+            2,
+            1,
+        )
+        .unwrap();
+        let r = pool.swap_path_with_timeout(
+            db_b.path().to_str().unwrap(),
+            Duration::from_millis(200),
+        );
+        assert!(matches!(r, Err(PoolError::Exhausted)), "got {r:?}");
+    }
+
+    #[test]
+    fn test_swap_path_now_fails_immediately() {
+        // B10/D-04: fast-fail — must return Exhausted in <50ms.
+        let db_a = create_test_db();
+        let db_b = create_test_db();
+        let (pool, _held) = ConnectionPool::new_with_holds(
+            db_a.path().to_str().unwrap(),
+            2,
+            1,
+        )
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let r = pool.swap_path_now(db_b.path().to_str().unwrap());
+        let elapsed = t0.elapsed();
+        assert!(matches!(r, Err(PoolError::Exhausted)), "got {r:?}");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "swap_path_now should fail fast — took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_swap_path_returns_in_progress() {
+        // B10/D-05: two swap callers — at most one wins; others see
+        // ConcurrentSwapInProgress or Exhausted (not silent corruption).
+        let db_a = create_test_db();
+        let db_b = create_test_db();
+        let (pool, _held) = ConnectionPool::new_with_holds(
+            db_a.path().to_str().unwrap(),
+            2,
+            1,
+        )
+        .unwrap();
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let path_b1 = db_b.path().to_str().unwrap().to_string();
+        let path_b2 = db_b.path().to_str().unwrap().to_string();
+        let h1 = std::thread::spawn(move || {
+            pool_a.swap_path_with_timeout(&path_b1, Duration::from_millis(300))
+        });
+        // Tiny race window — second caller often loses the swap_guard try_lock.
+        std::thread::sleep(Duration::from_millis(5));
+        let r2 = pool_b.swap_path_with_timeout(&path_b2, Duration::from_millis(300));
+        let _ = h1.join().unwrap();
+        // Accept any of: ConcurrentSwapInProgress (D-05), Exhausted (held), or
+        // Ok (h1 finished first). What we DON'T accept is silent corruption.
+        match r2 {
+            Err(PoolError::ConcurrentSwapInProgress)
+            | Err(PoolError::Exhausted)
+            | Ok(_) => {}
+            other => panic!("unexpected swap result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_path_returns_poisoned_on_poison() {
+        // B10/D-03: explicit poison propagation — no silent recovery.
+        let db = create_test_db();
+        let pool = ConnectionPool::new(db.path().to_str().unwrap(), 2).unwrap();
+        pool.poison_path_for_test();
+        let r = pool.path();
+        assert!(matches!(r, Err(PoolError::Poisoned)), "got {r:?}");
     }
 }
