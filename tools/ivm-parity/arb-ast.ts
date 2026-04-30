@@ -185,18 +185,29 @@ function opsForColumn(col: ColumnDef): SimpleOperator[] {
   return ops;
 }
 
-function literalForCol(col: ColumnDef, op: SimpleOperator): fc.Arbitrary<LiteralValue> {
+function literalForCol(
+  col: ColumnDef,
+  op: SimpleOperator,
+): fc.Arbitrary<LiteralValue> {
   if (op === 'IS' || op === 'IS NOT') return fc.constant(null);
   if (op === 'IN' || op === 'NOT IN') {
     if (col.type === 'number' || col.type === 'number?') {
-      return fc.array(fc.integer({min: 0, max: 100}), {minLength: 0, maxLength: 3});
+      return fc.array(fc.integer({min: 0, max: 100}), {
+        minLength: 0,
+        maxLength: 3,
+      });
     }
     return fc.array(fc.constantFrom('a', 'b', 'c', 'standup'), {
       minLength: 0,
       maxLength: 3,
     });
   }
-  if (op === 'LIKE' || op === 'NOT LIKE' || op === 'ILIKE' || op === 'NOT ILIKE') {
+  if (
+    op === 'LIKE' ||
+    op === 'NOT LIKE' ||
+    op === 'ILIKE' ||
+    op === 'NOT ILIKE'
+  ) {
     return fc.constantFrom('%standup%', 'standup%', '%notes', 'a%', '%');
   }
   if (col.type === 'boolean') {
@@ -213,7 +224,9 @@ function literalForCol(col: ColumnDef, op: SimpleOperator): fc.Arbitrary<Literal
  * table's columns — fixes the Wave 0 cross-tab bug where columns from any
  * table could attach to any other table.
  */
-function arbSimpleConditionForTable(table: TableDef): fc.Arbitrary<SimpleCondition> {
+function arbSimpleConditionForTable(
+  table: TableDef,
+): fc.Arbitrary<SimpleCondition> {
   if (table.columns.length === 0) {
     // Degenerate schema — return a no-op constant. Caller's fc.pre may discard.
     return fc.constant({
@@ -294,9 +307,9 @@ function arbOrderBy(table: TableDef): fc.Arbitrary<Ordering> {
   const single = fc
     .constantFrom(...table.columns)
     .chain(col =>
-      fc.constantFrom('asc' as const, 'desc' as const).map(
-        dir => [[col.name, dir]] as unknown as Ordering,
-      ),
+      fc
+        .constantFrom('asc' as const, 'desc' as const)
+        .map(dir => [[col.name, dir]] as unknown as Ordering),
     );
   // Two-element ordering — col1 first, then PK as tiebreaker (Zero semantics).
   const dual = fc.constantFrom(...table.columns).chain(col =>
@@ -337,7 +350,12 @@ function arbStart(
     } else if (def.type === 'boolean') {
       rowArbs[colName] = fc.boolean();
     } else {
-      rowArbs[colName] = fc.constantFrom('u1', 'u2', 'ch-pub-1', 'standup-monday');
+      rowArbs[colName] = fc.constantFrom(
+        'u1',
+        'u2',
+        'ch-pub-1',
+        'standup-monday',
+      );
     }
   }
   return fc.record({
@@ -456,7 +474,9 @@ export function buildArbitraries(zeroSchema: {
   const adapted = adaptSchema(zeroSchema);
   const tables = Object.values(adapted);
   if (tables.length === 0) {
-    throw new Error('arb-ast: schema has zero tables — refusing to build arbitraries.');
+    throw new Error(
+      'arb-ast: schema has zero tables — refusing to build arbitraries.',
+    );
   }
   const arbTable = fc.constantFrom(...tables);
 
@@ -473,54 +493,63 @@ export function buildArbitraries(zeroSchema: {
     simple: SimpleCondition;
     csq: CorrelatedSubquery;
   };
-  const recArb = fc.letrec<RecMap>(tie => ({
-    simple: arbTable.chain(t => arbSimpleConditionForTable(t)),
-    csq: arbTable.chain(t => {
-      const csqArb = arbCorrelatedSubqueryForTable(t, adapted);
-      if (!csqArb) {
+  // makeRecArb is invoked per AST root table so that the recursive `simple`
+  // and `csq` arbitraries draw from THIS table's columns and relationships
+  // only — not from a random other table. The previous version used
+  // `arbTable.chain(t => ...)` for both `simple` and `csq` which produced
+  // ASTs like `event_tags WHERE processedAt IS NULL` where `processedAt` is
+  // a column on `events`, not `event_tags`. This nonsense was filling the
+  // catalog with diverging-but-meaningless shapes — TS and RS handle
+  // unknown-column references differently, but neither behavior is what the
+  // user query meant. Per-table scoping eliminates the cross-table column
+  // leak at the source.
+  const makeRecArb = (rootTable: TableDef) =>
+    fc.letrec<RecMap>(tie => ({
+      simple: arbSimpleConditionForTable(rootTable),
+      csq: (() => {
+        const csqArb = arbCorrelatedSubqueryForTable(rootTable, adapted);
+        if (csqArb) return csqArb;
         // Fallback: pick any table with relationships.
         const withRels = tables.filter(x => x.relationships.length > 0);
         if (withRels.length === 0) {
           // Degenerate: no relationships at all — emit self-referential CSQ.
-          // fc.pre in arbAst may discard but at least we don't throw.
           return fc.constant({
-            correlation: {parentField: [...t.pk], childField: [...t.pk]},
-            subquery: {table: t.name, alias: 'arb_self'} as AST,
+            correlation: {
+              parentField: [...rootTable.pk],
+              childField: [...rootTable.pk],
+            },
+            subquery: {table: rootTable.name, alias: 'arb_self'} as AST,
           });
         }
-        // Pick deterministically via fc.constantFrom rather than Math.random
-        // so seeding stays reproducible (Wave 0 used Math.random — bug).
         return fc
           .constantFrom(...withRels)
           .chain(t2 => arbCorrelatedSubqueryForTable(t2, adapted)!);
-      }
-      return csqArb;
-    }),
-    cond: fc.oneof(
-      {weight: 5, arbitrary: tie('simple')},
-      {
-        weight: 2,
-        arbitrary: fc.record({
-          type: fc.constant('and' as const),
-          conditions: fc.array(tie('cond'), {
-            minLength: 2,
-            maxLength: MAX_BRANCHES_PER_NODE,
+      })(),
+      cond: fc.oneof(
+        {weight: 5, arbitrary: tie('simple')},
+        {
+          weight: 2,
+          arbitrary: fc.record({
+            type: fc.constant('and' as const),
+            conditions: fc.array(tie('cond'), {
+              minLength: 2,
+              maxLength: MAX_BRANCHES_PER_NODE,
+            }),
           }),
-        }),
-      },
-      {
-        weight: 2,
-        arbitrary: fc.record({
-          type: fc.constant('or' as const),
-          conditions: fc.array(tie('cond'), {
-            minLength: 2,
-            maxLength: MAX_BRANCHES_PER_NODE,
+        },
+        {
+          weight: 2,
+          arbitrary: fc.record({
+            type: fc.constant('or' as const),
+            conditions: fc.array(tie('cond'), {
+              minLength: 2,
+              maxLength: MAX_BRANCHES_PER_NODE,
+            }),
           }),
-        }),
-      },
-      {weight: 3, arbitrary: arbCorrelatedSubqueryCondition(tie('csq'))},
-    ),
-  }));
+        },
+        {weight: 3, arbitrary: arbCorrelatedSubqueryCondition(tie('csq'))},
+      ),
+    }));
 
   // --- Top-level arbAst: full operator surface -----------------------------
   // Per-table chain so column/rel arbitraries are local to the chosen table.
@@ -529,48 +558,57 @@ export function buildArbitraries(zeroSchema: {
   const arbAst: fc.Arbitrary<AST> = arbTable.chain(table => {
     // Per-table arbs.
     const orderByArb = arbOrderBy(table);
-    return fc
-      .record({
-        where: fc.option(recArb.cond, {nil: undefined, freq: 2}),
-        limit: fc.option(arbLimit, {nil: undefined, freq: 3}),
-        orderBy: fc.option(orderByArb, {nil: undefined, freq: 3}),
-        // start is conditional on orderBy being present — generate optimistically
-        // then drop in the .filter() below if mismatched.
-        startSeed: fc.option(fc.boolean(), {nil: undefined, freq: 4}),
-        relatedDepth0: arbTable.chain(t2 => {
-          const r = arbRelated(t2 === table ? table : t2, adapted, 0);
-          if (!r) return fc.constant(undefined);
-          return fc.option(r, {nil: undefined, freq: 3});
-        }),
-      })
-      .chain(opts => {
-        // Construct start ONLY when orderBy is present (Zero rejects otherwise).
-        const startArb =
-          opts.orderBy !== undefined && opts.startSeed !== undefined
-            ? fc.option(arbStart(table, opts.orderBy as Ordering), {
-                nil: undefined,
-                freq: 2,
-              })
-            : fc.constant(undefined);
-        return startArb.map(start => ({
-          opts,
-          start,
-        }));
-      })
-      .map(({opts, start}) => {
-        const ast: AST = {table: table.name};
-        if (opts.where !== undefined) ast.where = opts.where;
-        if (opts.limit !== undefined) ast.limit = opts.limit;
-        if (opts.orderBy !== undefined) ast.orderBy = opts.orderBy as Ordering;
-        if (start !== undefined) ast.start = start;
-        if (opts.relatedDepth0 !== undefined && opts.relatedDepth0.length > 0) {
-          ast.related = [...opts.relatedDepth0];
-        }
-        return ast;
-      })
-      // fc.pre-style filter: drop ASTs where start was set without orderBy
-      // (already constructively avoided above, but defensive).
-      .filter(ast => !ast.start || !!ast.orderBy);
+    // makeRecArb scopes simple+csq arbitraries to THIS root table so WHERE
+    // conditions never reference columns from a different table.
+    const recArb = makeRecArb(table);
+    return (
+      fc
+        .record({
+          where: fc.option(recArb.cond, {nil: undefined, freq: 2}),
+          limit: fc.option(arbLimit, {nil: undefined, freq: 3}),
+          orderBy: fc.option(orderByArb, {nil: undefined, freq: 3}),
+          // start is conditional on orderBy being present — generate optimistically
+          // then drop in the .filter() below if mismatched.
+          startSeed: fc.option(fc.boolean(), {nil: undefined, freq: 4}),
+          relatedDepth0: arbTable.chain(t2 => {
+            const r = arbRelated(t2 === table ? table : t2, adapted, 0);
+            if (!r) return fc.constant(undefined);
+            return fc.option(r, {nil: undefined, freq: 3});
+          }),
+        })
+        .chain(opts => {
+          // Construct start ONLY when orderBy is present (Zero rejects otherwise).
+          const startArb =
+            opts.orderBy !== undefined && opts.startSeed !== undefined
+              ? fc.option(arbStart(table, opts.orderBy as Ordering), {
+                  nil: undefined,
+                  freq: 2,
+                })
+              : fc.constant(undefined);
+          return startArb.map(start => ({
+            opts,
+            start,
+          }));
+        })
+        .map(({opts, start}) => {
+          const ast: AST = {table: table.name};
+          if (opts.where !== undefined) ast.where = opts.where;
+          if (opts.limit !== undefined) ast.limit = opts.limit;
+          if (opts.orderBy !== undefined)
+            ast.orderBy = opts.orderBy as Ordering;
+          if (start !== undefined) ast.start = start;
+          if (
+            opts.relatedDepth0 !== undefined &&
+            opts.relatedDepth0.length > 0
+          ) {
+            ast.related = [...opts.relatedDepth0];
+          }
+          return ast;
+        })
+        // fc.pre-style filter: drop ASTs where start was set without orderBy
+        // (already constructively avoided above, but defensive).
+        .filter(ast => !ast.start || !!ast.orderBy)
+    );
   });
 
   // ------------------------------------------------------------------------
@@ -589,7 +627,9 @@ export function buildArbitraries(zeroSchema: {
       return fc.constant({table: table.name});
     }
     // Fixed orderBy: PK ascending (Skip semantics require row to cover orderBy).
-    const orderBy: Ordering = [[table.pk[0] ?? 'id', 'asc' as const]] as unknown as Ordering;
+    const orderBy: Ordering = [
+      [table.pk[0] ?? 'id', 'asc' as const],
+    ] as unknown as Ordering;
     return fc
       .record({
         csq: csqArb,
@@ -615,22 +655,20 @@ export function buildArbitraries(zeroSchema: {
     if (!csqArb) {
       return fc.constant({table: table.name});
     }
-    return fc
-      .record({simple: simpleArb, csq: csqArb})
-      .map(({simple, csq}) => ({
-        table: table.name,
-        where: {
-          type: 'or' as const,
-          conditions: [
-            simple,
-            {
-              type: 'correlatedSubquery' as const,
-              related: csq,
-              op: 'EXISTS' as const,
-            } as CorrelatedSubqueryCondition,
-          ],
-        },
-      }));
+    return fc.record({simple: simpleArb, csq: csqArb}).map(({simple, csq}) => ({
+      table: table.name,
+      where: {
+        type: 'or' as const,
+        conditions: [
+          simple,
+          {
+            type: 'correlatedSubquery' as const,
+            related: csq,
+            op: 'EXISTS' as const,
+          } as CorrelatedSubqueryCondition,
+        ],
+      },
+    }));
   });
 
   // arbB3Targeted: AST with related[] containing a subquery with explicit limit.
@@ -638,20 +676,18 @@ export function buildArbitraries(zeroSchema: {
   // mishandles child-table edits/adds/removes per IVM-PORT-AUDIT-DEEP §B3.
   const arbB3Targeted: fc.Arbitrary<AST> = arbTableWithRels.chain(table => {
     // Force limit=5 (matches Category C in ast-fuzz.ts:620) plus a vary path.
-    return fc
-      .integer({min: 1, max: 5})
-      .chain(lim => {
-        const csqArb = arbCorrelatedSubqueryForTable(table, adapted, {
-          withLimit: lim,
-        });
-        if (!csqArb) {
-          return fc.constant({table: table.name});
-        }
-        return csqArb.map(csq => ({
-          table: table.name,
-          related: [csq],
-        }));
+    return fc.integer({min: 1, max: 5}).chain(lim => {
+      const csqArb = arbCorrelatedSubqueryForTable(table, adapted, {
+        withLimit: lim,
       });
+      if (!csqArb) {
+        return fc.constant({table: table.name});
+      }
+      return csqArb.map(csq => ({
+        table: table.name,
+        related: [csq],
+      }));
+    });
   });
 
   // Composition: arbAstWithTargeted = oneof(7×base, 1×B1, 1×B2, 1×B3).
