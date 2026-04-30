@@ -59,7 +59,7 @@ impl ExistsOperator {
             .iter()
             .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
             .collect();
-        serde_json::to_string(&vals).unwrap_or_default()
+        serde_json::to_string(&vals).expect("framework invariant: state-key serialization cannot fail")
     }
 
     fn fetch_children(&mut self, parent_row: &Row) -> Vec<Node> {

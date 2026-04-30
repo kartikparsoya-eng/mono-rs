@@ -24,7 +24,7 @@ fn cap_state_key(partition_key: Option<&[String]>, row: &Row) -> String {
             parts.push(row.get(k).cloned().unwrap_or(serde_json::Value::Null));
         }
     }
-    serde_json::to_string(&parts).unwrap_or_default()
+    serde_json::to_string(&parts).expect("framework invariant: state-key serialization cannot fail")
 }
 
 /// Matches TS serializePK: JSON.stringify(primaryKey.map(k => row[k]))
@@ -33,7 +33,7 @@ fn serialize_pk(primary_key: &[String], row: &Row) -> String {
         .iter()
         .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
         .collect();
-    serde_json::to_string(&vals).unwrap_or_default()
+    serde_json::to_string(&vals).expect("framework invariant: state-key serialization cannot fail")
 }
 
 /// Build a single-key constraint for partition-scoped fetches.

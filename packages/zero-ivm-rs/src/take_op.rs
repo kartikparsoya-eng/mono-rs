@@ -46,7 +46,7 @@ impl TakeOperator {
                     .iter()
                     .map(|k| row.get(k).cloned().unwrap_or(serde_json::Value::Null))
                     .collect();
-                serde_json::to_string(&vals).unwrap_or_default()
+                serde_json::to_string(&vals).expect("framework invariant: state-key serialization cannot fail")
             }
             None => String::new(),
         }
@@ -61,7 +61,7 @@ impl TakeOperator {
                 for k in pk {
                     vals.push(row.get(k).cloned().unwrap_or(serde_json::Value::Null));
                 }
-                serde_json::to_string(&vals).unwrap_or_default()
+                serde_json::to_string(&vals).expect("framework invariant: state-key serialization cannot fail")
             }
             None => "[\"take\"]".to_string(),
         }
@@ -344,7 +344,7 @@ impl Operator for TakeOperator {
                 vals.push(serde_json::Value::String(k.clone()));
                 vals.push(c.columns[k].clone());
             }
-            serde_json::to_string(&vals).unwrap_or_default()
+            serde_json::to_string(&vals).expect("framework invariant: state-key serialization cannot fail")
         } else {
             self.take_state_key(&Row::new())
         };
