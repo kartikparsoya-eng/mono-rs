@@ -151,14 +151,119 @@ fn apply_child_operators(
     if child_config.len() <= 1 {
         return nodes;
     }
+    // **Family-A fix — nested EXISTS hydrate.**
+    //
+    // Synthesize a per-group constraint from the partition_key of any Take
+    // operator in `child_config[1..]` BEFORE `.fetch()` is called.
+    //
+    // **Why this is needed:** All `nodes` here belong to a single parent-group
+    // (the caller iterates `grouped.keys()` and removes each group's nodes —
+    // see `batch_fetch_children` at line ~230). So they share the same
+    // partition_key value. The pipeline ends in a `TakeOperator(partition_key=Some(...))`
+    // emitted by `apply_exists_limit` (ast_to_config.rs:994-998) which:
+    //   - With `req.constraint.is_some()` → derives state-key from constraint and
+    //     proceeds with normal initial-fetch (take_op.rs:287-289).
+    //   - With `req.constraint.is_none()` && `max_bound.is_none()` →
+    //     returns `vec![]` (take_op.rs:286-295), silently dropping every node.
+    //
+    // The previous default `FetchRequest::default()` hit the second case for
+    // multi-hop EXISTS chains. The B5 hydrate fix (commit 0f2361b52) carved
+    // around this by routing FanOut branches through
+    // `build_branch_subpipeline_for_hydrate` + sequential `ExistsOperator`,
+    // but the **production hydrate path** for nested EXISTS still goes through
+    // `apply_child_operators` (called by `ParallelExistsOperator::fetch` and
+    // `ParallelJoinOperator::fetch` via `batch_fetch_children`).
+    //
+    // **TS reference:** TS uses sequential `Join`/`Exists` throughout
+    // (packages/zql/src/builder/builder.ts:626-646 — `applyCorrelatedSubQuery`
+    // builds the child pipeline via `buildPipelineInternal` and wraps it in a
+    // `Join`; the surrounding `Exists` calls `Join.fetch` per parent with a
+    // constraint). There is no batch shortcut. The Rust port batches for
+    // performance, but the per-group invocation of `apply_child_operators` is
+    // analogous to one TS per-parent fetch — and must carry the partition
+    // value in the same way a TS `Join.fetch` carries the constraint.
+    //
+    // **Recursion:** The fix self-heals through nested levels. If `child_config`
+    // emits a `ParallelExistsOperator` (because there's a CSQ inside an EXISTS
+    // subquery's WHERE), that inner operator's own `batch_fetch_children →
+    // apply_child_operators` call will derive its own partition constraint
+    // from the same logic, propagating correctness recursively.
+    let synthesized_constraint = synthesize_partition_constraint(child_config, &nodes);
+
+    // **Family-A fix (part 2) — use child-table source for nested operators.**
+    //
+    // `source` is the OUTER table's source (e.g., `messages` when called from
+    // a Level-1 ParallelExistsOperator). But `child_config[0]` is the CHILD
+    // table's Source (e.g., `conversations`). When `child_config[1..]` contains
+    // operators that internally rebuild sub-pipelines from a `source` parameter
+    // — notably `OperatorConfig::FanOut` (→ ParallelFanOutOperator) and
+    // `OperatorConfig::Exists` (→ ParallelExistsOperator) — those operators
+    // need the CHILD source, not the outer one, so their SourceBridge / fresh
+    // child-source construction targets the right table.
+    //
+    // Previously, `source.clone()` was passed straight through, so a nested
+    // FanOut would query the messages table for channels data → silent
+    // empty fetches even with the partition_constraint fix above.
+    //
+    // `make_child_source` reuses the parent's shared connection pool, so no
+    // new SQLite connection is opened.
+    let effective_source: Arc<RustTableSource> = match make_child_source(source, child_config) {
+        Some(src) => Arc::new(src),
+        None => source.clone(),
+    };
+
     let mut current: Box<dyn Operator> = Box::new(PreloadedSource::new(nodes));
     for config in &child_config[1..] {
-        current = match build_next_operator(source.clone(), current, config) {
+        current = match build_next_operator(effective_source.clone(), current, config) {
             Ok(op) => op,
             Err(_) => return vec![],
         };
     }
-    current.fetch(&FetchRequest::default())
+    let req = FetchRequest {
+        constraint: synthesized_constraint,
+        start: None,
+        reverse: false,
+    };
+    current.fetch(&req)
+}
+
+/// Walk `child_config[1..]` looking for a `Take` operator with a non-empty
+/// `partition_key`. If found and `nodes` is non-empty, build a `Constraint`
+/// from `nodes[0]`'s values at those partition_key fields. Returns `None`
+/// when no partitioned Take is present, when nodes is empty, or when the
+/// first node lacks the required fields.
+///
+/// **Invariant relied on:** All nodes in a single `apply_child_operators`
+/// call belong to one parent-group (see `batch_fetch_children` per-group
+/// iteration at line ~230), so they share the same value at every
+/// partition_key column. Sampling `nodes[0]` is therefore representative.
+fn synthesize_partition_constraint(
+    child_config: &[OperatorConfig],
+    nodes: &[Node],
+) -> Option<zero_ivm_rs::types::Constraint> {
+    if nodes.is_empty() {
+        return None;
+    }
+    for c in &child_config[1..] {
+        if let OperatorConfig::Take { partition_key: Some(pk), .. } = c {
+            if pk.is_empty() {
+                continue;
+            }
+            let mut cols: HashMap<String, serde_json::Value> = HashMap::new();
+            for f in pk {
+                match nodes[0].row.get(f) {
+                    Some(v) => {
+                        cols.insert(f.clone(), v.clone());
+                    }
+                    None => return None,
+                }
+            }
+            if !cols.is_empty() {
+                return Some(zero_ivm_rs::types::Constraint { columns: cols });
+            }
+        }
+    }
+    None
 }
 
 /// Batch fetch all children for a set of parent rows, returning a map from
