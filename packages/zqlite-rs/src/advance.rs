@@ -390,6 +390,64 @@ fn collect_child_table_map_recursive(
     }
 }
 
+/// Build a `relationship_name → child_table_name` map from the emitted
+/// `OperatorConfig` tree. This map keys are the **uniquified** relationship
+/// names (i.e., `<original_alias>_<count>`) as written into
+/// `OperatorConfig::Exists.relationship_name` by
+/// `ast_to_config::uniquify_top_level_csq_aliases`. The values are the
+/// underlying table names extracted from the child's first `Source` config.
+///
+/// **Why this exists:** `flatten_nodes_to_row_changes` looks up the table
+/// name via `rel_to_table.get(rel_name)` where `rel_name` comes from the
+/// runtime change output (always uniquified, post-Phase-34 alias-leak fix).
+/// The previous implementation built the map from the raw AST via
+/// `collect_child_tables(&query.ast)` — pre-uniquify — so every uniquified
+/// rel_name missed the lookup, fell back to using rel_name as the table
+/// name, and `coerce_row` returned None, dropping every CSQ-EXISTS child row.
+pub(crate) fn collect_rel_to_table_from_configs(
+    configs: &[OperatorConfig],
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    collect_rel_to_table_recursive(configs, &mut map);
+    map
+}
+
+fn collect_rel_to_table_recursive(
+    configs: &[OperatorConfig],
+    map: &mut HashMap<String, String>,
+) {
+    for config in configs {
+        match config {
+            OperatorConfig::Join { relationship_name, child, .. } => {
+                if let Some(OperatorConfig::Source { table_name, .. }) = child.first() {
+                    map.insert(relationship_name.clone(), table_name.clone());
+                }
+                collect_rel_to_table_recursive(child, map);
+            }
+            OperatorConfig::Exists { relationship_name, child, .. } => {
+                if let Some(OperatorConfig::Source { table_name, .. }) = child.first() {
+                    map.insert(relationship_name.clone(), table_name.clone());
+                }
+                collect_rel_to_table_recursive(child, map);
+            }
+            OperatorConfig::OrExists { branches, .. } => {
+                for branch in branches {
+                    if let Some(OperatorConfig::Source { table_name, .. }) = branch.child.first() {
+                        map.insert(branch.relationship_name.clone(), table_name.clone());
+                    }
+                    collect_rel_to_table_recursive(&branch.child, map);
+                }
+            }
+            OperatorConfig::FanOut { branches } => {
+                for branch in branches {
+                    collect_rel_to_table_recursive(branch, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // Maps parent_table_name → Vec<ChildRelation>. Inverse of child_table_map.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildRelation {
@@ -1304,9 +1362,23 @@ pub(crate) fn build_pipeline_state(
         }
     }
 
-    let rel_to_table: HashMap<String, String> = collect_child_tables(&query.ast)
-        .into_iter()
-        .collect();
+    // Build rel_to_table from the EMITTED OperatorConfig tree (post-uniquify)
+    // rather than the raw AST. The `OperatorConfig::Exists.relationship_name`
+    // field carries the uniquified alias produced by
+    // `uniquify_top_level_csq_aliases`; the `OperatorConfig::Source.table_name`
+    // inside its `child` is the actual table. Using the un-uniquified
+    // `collect_child_tables` here would key the map under the original alias
+    // (e.g., `arb_conversations_attachments`) while the change-output emits
+    // the uniquified relationship_name (e.g., `arb_conversations_attachments_1`),
+    // causing `flatten_nodes_to_row_changes` to fall back to using the
+    // uniquified name as the table name and fail `coerce_row` lookup —
+    // dropping every CSQ-EXISTS child row from the emitted RowChanges.
+    let mut rel_to_table: HashMap<String, String> =
+        collect_rel_to_table_from_configs(&operator_config);
+    // Keep the AST-derived entries too for `related[]` Joins (no uniquify).
+    for (rel_name, table_name) in collect_child_tables(&query.ast) {
+        rel_to_table.entry(rel_name).or_insert(table_name);
+    }
 
     let (table_name, columns, pk, sort) = match &operator_config[0] {
         OperatorConfig::Source {
