@@ -162,7 +162,43 @@ impl SchemaCache {
         pk_cols.sort_by_key(|(idx, _)| *idx);
         let pk: Vec<String> = pk_cols.into_iter().map(|(_, name)| name).collect();
         self.columns.insert(table_name.to_string(), cols);
-        self.primary_keys.insert(table_name.to_string(), pk);
+        // **Bug C fix (Family C — fuzz_00139, fuzz_00140):** Do not overwrite a
+        // pre-seeded primary_keys entry with an empty PRAGMA result. The replica
+        // tables on the production zero-cache do not carry PRIMARY KEY
+        // constraints from PG (the replicator copies columns but not
+        // constraints), so `PRAGMA table_info` returns `pk=0` for every column
+        // → `pk_cols` is empty → previous behavior INSERTED [] here,
+        // overwriting the seed from `seed_primary_keys(query.all_primary_keys)`
+        // populated by `build_pipeline_state`. The next CSQ recursion that
+        // calls `get_primary_key` for the same table then sees the empty PK,
+        // builds the child Source with `sort=[]`, the EXISTS_LIMIT Take inherits
+        // `sort=[]`, and at runtime `compare_rows` (types.rs:112) returns
+        // `Equal` for every pair when `sort` is empty → the `state_with_bound`
+        // branch in `TakeOperator::fetch` (take_op.rs ~352-372) never hits the
+        // `Less` break → returns all input rows instead of `limit`.
+        //
+        // The seed (from the Zero schema via `query.all_primary_keys`) is the
+        // authoritative source; PRAGMA is only a fallback for tables not in
+        // the seed. So we preserve any pre-seeded entry and only insert when
+        // (a) no entry exists or (b) the existing entry is empty and the
+        // PRAGMA result is non-empty.
+        //
+        // TS reference: The TS view-syncer builds its pipeline using PKs from
+        // the Zero schema (`packages/zero-cache/src/services/view-syncer/pipeline-driver.ts`
+        // / `packages/zql/src/builder/builder.ts:262 source.connect(...)`),
+        // never consulting SQLite PRAGMA — so the equivalent failure mode
+        // does not exist on the TS side. The Rust port intentionally seeds
+        // from the Zero schema (`build_pipeline_state` ~line 1323); the bug
+        // is that the PRAGMA fallback wrongly clobbered that seed.
+        let should_insert = match self.primary_keys.get(table_name) {
+            None => true,                       // no entry yet — install PRAGMA result
+            Some(existing) if existing.is_empty() => !pk.is_empty(),
+                                                // existing is empty — only overwrite if PRAGMA is non-empty
+            Some(_) => false,                   // existing non-empty (seeded) — never overwrite
+        };
+        if should_insert {
+            self.primary_keys.insert(table_name.to_string(), pk);
+        }
         Ok(())
     }
 
