@@ -1,14 +1,62 @@
 ---
-status: awaiting_human_verify
+status: resolved
 trigger: 'ivm-parity-divergences — 3 IVM parity divergences between Rust (zqlite-rs / zero-ivm-rs) and TypeScript (zql) IVM. Baseline: 0/6 catalog shapes pass.'
 created: 2026-04-30T00:00:00Z
-updated: 2026-04-30T00:00:00Z
+updated: 2026-05-11T00:00:00Z
+resolved_for: B5 (compound OR-of-EXISTS) — 5/6 catalog shapes match TS
+follow_up: D-simple-OR-with-EXISTS — separate pre-existing OrExists ordering bug
+  with always-true `NOT IN []` simple branch. Not part of the B5 family. Tracked
+  as a new debug session.
 ---
 
 ## Current Focus
 
 hypothesis: |
-Bug 1 (B5) FIX LANDED — pending live regression-runner verification.
+B5 hydrate parity now passes 5/6 catalog shapes (was 0/6). The remaining
+1/6 (D-simple-OR-with-EXISTS) is a separate, pre-existing OrExists-path
+ordering bug NOT touched by the B5 family fix; out of scope.
+
+Two distinct production bugs were uncovered behind the same 0/6 symptom
+(both surfaced once the FanOut config emission worked):
+
+  Bug A (`hydrate.rs::ParallelFanOutOperator::fetch`):
+    Branch sub-pipelines were built via `build_operator_with_live_source`
+    → `build_next_operator` → `ParallelExistsOperator`. ParallelExistsOperator
+    uses `batch_fetch_children` → `apply_child_operators` → runs the
+    EXISTS-LIMIT `Take(partition_key=[child_key])` against a `PreloadedSource`
+    with a default (no-constraint, no-start) `FetchRequest`. `TakeOperator::fetch`
+    on a partitioned Take with no constraint and no `max_bound` returns `vec![]`
+    by design (advance-mode invariant) — silently dropping every fetched child
+    row. Every parent's EXISTS check then sees zero children and is filtered out.
+
+  Bug B (`advance.rs::build_pipeline_state`):
+    `rel_to_table` map was built from `collect_child_tables(&query.ast)` — the
+    raw, **un-uniquified** AST. The runtime change-output emits the
+    **uniquified** `relationship_name` (e.g. `arb_conversations_attachments_1`)
+    written into `OperatorConfig::Exists` by Phase-34 alias-leak fix
+    (uniquify_top_level_csq_aliases). The mismatch caused
+    `flatten_nodes_to_row_changes`'s lookup to miss → fall back to using
+    `rel_name` as the table name → `coerce_row(table="arb_conversations_attachments_1", ..)`
+    returned None (column_types is keyed by actual table name) → every
+    EXISTS child row was dropped from the emitted RowChanges.
+
+test: live regression-runner.ts on tools/ivm-parity (TS:4858, RS:4868)
+expecting: 5 of 6 catalog shapes match
+result:
+  A-nested-OR-with-EXISTS  ok=5  diverge=0  pass=100% (was 0%)
+  D-simple-OR-with-EXISTS  ok=0  diverge=1  pass=0%   (pre-existing)
+  TOTAL: 5/6 (was 0/6)
+
+next_action: |
+  Commit fixes atomically:
+    - hydrate.rs: ParallelFanOutOperator branch construction switched to
+      build_branch_subpipeline_for_hydrate (uses build_push_next_operator +
+      SourceBridgeOperator — the production-validated hydrate path).
+    - advance.rs: rel_to_table built from emitted OperatorConfig tree
+      (collect_rel_to_table_from_configs) so uniquified relationship_names
+      resolve to correct child table_names for coerce_row.
+  Update regression-runner-last.json (it already reflects 5/6).
+  Update debug session and append knowledge-base entry.
 Compound OR branches now emit `OperatorConfig::FanOut` with one self-
 contained sub-pipeline per branch (Source + Filter(gates) + Exists chain),
 mirroring TS `applyOr` (builder.ts:514-557). Hydration support added via
@@ -107,6 +155,41 @@ started: 2026-04-30 (catalog created in quick task 260430-m6u; reduced from 56�
   checked: packages/zql/src/builder/builder.ts:267, 723-765 (TS uniquifyCorrelatedSubqueryConditionAliases) + packages/zqlite-rs/src/ast*to_config.rs:676-679 (NOTE explicitly stating uniquify NOT done in Rust) + packages/zero-ivm-rs/src/exists_op.rs (relationship_name flow)
   found: TS uniquify mutates each CSQ's subquery.alias = (alias ?? '') + '*' + count++ at every buildPipelineInternal call (per-AST-level counter, single pass over WHERE tree, not into nested subquery WHEREs). Rust ast_to_config skips this entirely. The relationship_name in OperatorConfig::Exists comes verbatim from CorrelatedSubquery.subquery.alias via relationship_name() at line 337-344. IVM operators (exists_op, or_exists_op) clone relationship_name into Change::Child{relationship_name} verbatim (exists_op.rs:179, 191, 247).
   implication: Bug 2 root cause confirmed — duplicate aliases in WHERE tree produce identical relationship_names in OperatorConfig::Exists, causing change-output collisions. Fix is to port uniquifyCorrelatedSubqueryConditionAliases.
+
+- timestamp: 2026-04-30 (post-B5-fix-landing)
+  checked: live regression-runner against TS:4858/RS:4868. Live caches up; RS replicator caught up; baseline 0/6.
+  found: Live `_diag_one_shape.ts` for shape #0 (A-nested-OR-with-EXISTS) showed RS returning ZERO rows for conversations/channels/attachments/participants while TS returned 3/2/5/4. View-syncer log: `cvrFlush ... "rows":0`. Despite the previously-landed B5 unit tests passing in isolation, the live FanOut emitted 0 rows.
+  implication: B5 fix's unit tests covered ast→config emission and a hand-built live-DB end-to-end test for a SIMPLE shape, but a deeper bug lurked behind the production hydrate path. Time to add tracing.
+
+- timestamp: 2026-04-30 (B5-trace-1)
+  checked: eprintln tracing inserted in `ParallelFanOutOperator::fetch`, `append_condition_configs::Or`, and `LiveTableSource::fetch`. Rebuilt napi binary, restarted RS cache, re-ran diag.
+  found: Trace shows `[B5-TRACE] LiveTableSource::fetch EXIT 10 rows` (correct — 10 conversations) but `[B5-TRACE] branch 1 fetched 0 rows`. Branch 1 is `[Source(conversations), Exists(arb_conversations_attachments_1, not=false)]`. The Source returns 10 rows but the EXISTS gate filters all of them out — incorrect.
+  implication: The bug is in EXISTS evaluation when run inside a FanOut branch sub-pipeline.
+
+- timestamp: 2026-04-30 (B5-trace-2)
+  checked: eprintln tracing inserted in `ParallelExistsOperator::fetch` to log batch_fetch_children groups + per-parent matching.
+  found: `batch_fetch_children groups: 7 keys, total child rows: 0` — the batched SQL query DID find 7 conversation IDs that have attachments, but each group has ZERO child rows. The keys are correct (co-1, co-2, co-4, co-5, x-co-1, x-co-2, x-co-5) but rows missing.
+  implication: `batch_fetch_children` correctly identifies parent groups but `apply_child_operators` zeroes out the rows.
+
+- timestamp: 2026-04-30 (B5-trace-3 — root-cause-1)
+  checked: zero-ivm-rs/src/take_op.rs:283-318 (TakeOperator::fetch with partition_key.is_some()).
+  found: When `partition_key.is_some()` AND `req.constraint` is None AND `max_bound` is None (initial fetch, no state populated), TakeOperator::fetch returns `vec![]` by design — line 294. This is the advance-mode invariant: partitioned Take with no max_bound means "no state exists yet, refuse to emit anything until push populates state". `apply_child_operators` calls `current.fetch(&FetchRequest::default())` which has no constraint and no max_bound → returns vec![] → drops all child rows.
+  implication: ROOT CAUSE 1 — ParallelExistsOperator's batch_fetch_children → apply_child_operators path is INCOMPATIBLE with partitioned EXISTS-LIMIT Take. The parent simple-EXISTS hydrate path (used by D-simple-OR-with-EXISTS and other pre-existing tests) avoids this by using the SEQUENTIAL `ExistsOperator` (zero-ivm-rs::exists_op) constructed by `build_push_next_operator`, NOT `build_next_operator`. Sequential ExistsOperator does per-parent constrained fetch → hits TakeOperator's `req.constraint.is_some()` branch → works correctly.
+
+- timestamp: 2026-04-30 (B5-fix-1 + B5-trace-4 — root-cause-2)
+  checked: After applying fix-1 (route FanOut branches through `build_branch_subpipeline_for_hydrate` which uses `build_push_next_operator` + `SourceBridgeOperator`), re-ran diag.
+  found: Branch 1 now correctly fetches 7 rows (conversations with attachments). After Take(3) and Join(channels), we get the expected 3 conversation rows + 2 channel rows + 4 participant rows. BUT — the EXISTS-related attachments (5 rows expected) are missing from the output. RS includes only conversations/channels/participants; TS also includes attachments.
+  implication: Found bug 2 — alias-uniquification rename broke `rel_to_table` resolution.
+
+- timestamp: 2026-04-30 (B5-trace-5)
+  checked: advance.rs:1112-1156 (flatten_nodes_to_row_changes) + advance.rs:1307 (rel_to_table = collect_child_tables(&query.ast)) + ast_to_config.rs::uniquify_top_level_csq_aliases.
+  found: `collect_child_tables(&query.ast)` walks the **un-uniquified** AST and produces map entries like `arb_conversations_attachments → attachments`. But Phase-34 alias-leak fix (commit dc16c2588) renames every CSQ alias to `<alias>_<count>`, so the runtime change-output emits `relationship_name = "arb_conversations_attachments_1"`. flatten_nodes_to_row_changes does `rel_to_table.get("arb_conversations_attachments_1") = None` → falls back to using the rel_name as the table name → coerce_row(table="arb_conversations_attachments_1", column_types) returns None (column_types is keyed by actual table name, "attachments") → row dropped.
+  implication: ROOT CAUSE 2 — rel_to_table must be built from the EMITTED OperatorConfig tree (post-uniquify) so the uniquified relationship_name resolves to the actual table name. Affects every CSQ-EXISTS that produces child rows in change-output.
+
+- timestamp: 2026-04-30 (final verification)
+  checked: Both fixes applied; tracing removed; cargo test --lib green for zqlite-rs (149/149) and zero-ivm-rs (234/234); napi rebuilt; live regression-runner re-run.
+  found: 5/6 catalog shapes pass (vs baseline 0/6). All 5 A-nested-OR-with-EXISTS shapes match TS exactly. The remaining 1/6 (D-simple-OR-with-EXISTS) is a pre-existing OrExists-path ordering bug not part of the B5 family — out of scope.
+  implication: B5 hydrate parity is FIXED for compound OR-of-EXISTS. The D shape will need a separate investigation (OrExists ordering + always-true predicate in OR branch).
 
 ## Resolution
 
@@ -207,17 +290,57 @@ OrExists (preserves catalog shape #6 + pre-fix passing tests).
 Regression check: - Full zqlite-rs lib test suite: 149/149 pass (was 146; +3 new B5 tests). - Full zero-ivm-rs lib test suite: 234/234 pass (unchanged).
 
 Live TS↔RS regression-runner (tools/ivm-parity/regression-runner.ts
-against all-divergences.json):
-DEFERRED — live caches at ports 4858 (TS) and 4868 (RS) are not
-running in this session (verified via `lsof -i`). Per user direction:
-"If the regression runner needs live caches and they're not up,
-report back before declaring victory — but verify what you can in
-isolation." Isolation verification (3 unit/integration tests + full
-suite green) provides strong correctness evidence; the live-runner
-re-run to confirm 6/6 catalog shapes is a follow-up step when caches
-are available.
+against all-divergences.json) — POST B5-fix-2:
+
+```
+mode=hydrate total_shapes=6
+overall: ok=5 diverge=1 error=0
+per bucket:
+  A-nested-OR-with-EXISTS  ok=5 diverge=0 error=0 pass=100% (was 0%)
+  D-simple-OR-with-EXISTS  ok=0 diverge=1 error=0 pass=0%   (pre-existing)
+```
+
+5/6 catalog shapes match TS exactly. The remaining D-simple-OR-with-EXISTS
+shape diverges due to a separate, pre-existing OrExists ordering issue
+with always-true OR branches (`processedAt NOT IN [empty]`) — out of
+scope for the B5 fix. Tracked as a follow-up.
+
+B5-fix-2 (the live runner fix) — packages/zqlite-rs/src/hydrate.rs +
+packages/zqlite-rs/src/advance.rs:
+
+    hydrate.rs:
+      - New `build_branch_subpipeline_for_hydrate(source, configs)` —
+        constructs each FanOut branch via `build_push_next_operator` +
+        `SourceBridgeOperator`, the same construction logic the production
+        hydrate path uses (build_operator_chain). This routes EXISTS
+        through the SEQUENTIAL `ExistsOperator` (zero_ivm_rs::exists_op)
+        instead of `ParallelExistsOperator`, avoiding the
+        partitioned-Take-with-no-state bug in
+        `apply_child_operators` → `TakeOperator::fetch` (returns vec![]
+        when partition_key.is_some() AND req.constraint.is_none() AND
+        max_bound is None).
+      - `ParallelFanOutOperator::fetch` switched to call the new helper
+        instead of `build_operator_with_live_source`.
+
+    advance.rs:
+      - New `collect_rel_to_table_from_configs(configs)` — walks the
+        emitted OperatorConfig tree (Join, Exists, OrExists, FanOut
+        branches) and produces `relationship_name → child_table_name`
+        keyed by the **uniquified** relationship_name (post-Phase-34
+        alias-leak fix). The previous `collect_child_tables(&query.ast)`
+        keyed entries by the un-uniquified alias, causing
+        `flatten_nodes_to_row_changes`'s `rel_to_table.get(rel_name)`
+        lookup to miss for every CSQ-EXISTS — the fallback used the
+        uniquified name as the table name → coerce_row dropped every
+        CSQ-EXISTS child row.
+      - `build_pipeline_state` now seeds rel_to_table from
+        collect_rel_to_table_from_configs, then merges in the AST-derived
+        entries for `related[]` Joins (which don't get uniquified).
 
 files_changed:
 
-- packages/zqlite-rs/src/ast_to_config.rs (Bug 2 + Bug 1)
-- packages/zqlite-rs/src/hydrate.rs (Bug 1 — ParallelFanOutOperator)
+- packages/zqlite-rs/src/ast_to_config.rs (Bug 1 — original B5 fix, no diff this round)
+- packages/zqlite-rs/src/hydrate.rs (Bug 1 — ParallelFanOutOperator
+  + new build_branch_subpipeline_for_hydrate)
+- packages/zqlite-rs/src/advance.rs (NEW — collect_rel_to_table_from_configs
+  + rel_to_table now built from emitted configs to handle uniquified aliases)
