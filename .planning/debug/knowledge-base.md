@@ -23,3 +23,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Files changed:** packages/zqlite-rs/src/hydrate.rs, packages/zqlite-rs/src/advance.rs, tools/ivm-parity/regression-runner-last.json (5/6 snapshot)
 
 ---
+
+## ivm-parity-d-simple — RS `NOT IN []` short-circuit ignored SQL NULL semantics (catalog 5/6 → 6/6)
+
+- **Date:** 2026-05-11
+- **Error patterns:** ivm-parity, regression-runner, D-simple-OR-with-EXISTS, NOT IN, IN, empty array, empty literal, empty set, short-circuit, NULL semantics, IS NOT NULL, isNotNull, condition_to_predicate_json, ast_to_config.rs, filter.ts, filter.rs, createPredicate, Predicate::And, empty AND, always-true, always-false, processedAt, OR with EXISTS, limit displacement, hydrate parity, zqlite-rs
+- **Root cause:** `packages/zqlite-rs/src/ast_to_config.rs::condition_to_predicate_json` short-circuited `x NOT IN ()` to `{"and": []}` — an unconditional-true predicate with no field reference. The empty-AND evaluates true for any row at `packages/zero-ivm-rs/src/filter.rs:232`, bypassing the predicate's `is_null_for_row` gate (which only runs when there is a field reference). TS reference `packages/zql/src/builder/filter.ts:87-93 createPredicate` has an explicit early NULL check: if `lhs === null || lhs === undefined` it returns `false` before evaluating the operator. Net TS semantics: `x NOT IN []` ≡ `x IS NOT NULL`. RS over-permissive predicate let rows with `NULL processedAt` wrongly pass the simple branch of the `OR(EXISTS, processedAt NOT IN [])`, filling `limit=6` slots and displacing legitimate matches.
+- **Fix:** Replaced the `{"and": []}` short-circuit for `NOT IN []` (column-LHS path) with `{"field": <column-name>, "isNotNull": true}` — matches TS semantics exactly. `IN []` short-circuit untouched (`{"or": []}` always-false correctly matches TS: NULL early-check returns false and non-NULL value not in empty set also returns false). Added 2 unit tests in `ast_to_config.rs::tests` that pin the contract for both `IN []` and `NOT IN []`. **Generalizable pattern:** anywhere Rust short-circuits an empty-collection operator (`IN`, `NOT IN`, `LIKE`, `BETWEEN` on empty range, etc.), it must preserve TS's NULL-on-LHS-returns-false gate by referencing the field — never emit a predicate that has no field reference and evaluates unconditionally.
+- **Files changed:** packages/zqlite-rs/src/ast_to_config.rs, tools/ivm-parity/regression-runner-last.json (6/6 snapshot)
+
+---
