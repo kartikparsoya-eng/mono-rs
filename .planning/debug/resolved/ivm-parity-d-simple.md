@@ -90,7 +90,7 @@ resolved/ivm-parity-divergences.md as out-of-scope follow-up.
   :4858/:4868.
   found: |
   AST is `events WHERE OR(EXISTS(event_tags WHERE eventId=events.id),
-  processedAt NOT IN []) LIMIT 6 RELATED conversations`.
+processedAt NOT IN []) LIMIT 6 RELATED conversations`.
   TS returned 4 events: all have processedAt!=null: - ev-dst-fall-test (no tags, processedAt non-null) - ev-dst-spring-test (no tags, processedAt non-null) - ev-jsonb-test-1 (2 tags, processedAt non-null) - ev-pure-or-test-1 (2 tags, processedAt non-null)
   RS returned 6 events: - ev-dst-fall-test (processedAt non-null) - ev-dst-spring-test (processedAt non-null) - ev-jsonb-empty-test (processedAt NULL — wrongly included) - ev-jsonb-test-1 (processedAt non-null) - ev-no-ticket-test (processedAt NULL — wrongly included) - ev-null-test-1 (processedAt NULL — wrongly included)
   DB total: 8 events, 4 with processedAt!=null, 4 NULL.
@@ -112,7 +112,7 @@ resolved/ivm-parity-divergences.md as out-of-scope follow-up.
   never runs.
   implication: The fix is in ast_to_config.rs: emit a NULL-aware
   short-circuit for NOT IN []. Equivalent expression: `field IS NOT
-  NULL` → `{"field": <name>, "isNotNull": true}` matches TS exactly
+NULL` → `{"field": <name>, "isNotNull": true}` matches TS exactly
   (TS NULL gate returns false; NOT IN empty set returns true otherwise →
   field IS NOT NULL semantics).
 

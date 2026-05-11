@@ -123,7 +123,7 @@ None. No credentials, no external APIs.
 - **Step 5 (commit 2 gate):** All four tooling files confirmed non-empty via `test -s`.
 - **Step 6 (commit 3 gate):** Commit-body claims (56 shapes, bucket distribution, baseline counts) cross-verified against the actual on-disk catalog header and snapshot JSON before commit.
 - **Step 7 (final cross-check):** `git diff --name-only 5f133e556699b2ab114a92caa045eba736b2f3dc..HEAD | grep -v "^tools/ivm-parity/"` returned empty. All changes scoped.
-- **OOS untracked verification:** Post-commit-3, `git status --short tools/ivm-parity/` shows 9 OOS files still in `??` state (harness-golden-_.ts, harness-golden-shared.ts, run-capture-golden.sh, run-replay-golden.sh, prod\___asts.json, \_gen_prod_\*.py). None are in any of the 3 commits.
+- **OOS untracked verification:** Post-commit-3, `git status --short tools/ivm-parity/` shows 9 OOS files still in `??` state (harness-golden-_.ts, harness-golden-shared.ts, run-capture-golden.sh, run-replay-golden.sh, prod\_\_\_asts.json, \_gen_prod_\*.py). None are in any of the 3 commits.
 
 ## Lessons Learned
 

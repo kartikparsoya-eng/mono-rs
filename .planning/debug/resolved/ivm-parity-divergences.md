@@ -19,44 +19,42 @@ ordering bug NOT touched by the B5 family fix; out of scope.
 Two distinct production bugs were uncovered behind the same 0/6 symptom
 (both surfaced once the FanOut config emission worked):
 
-  Bug A (`hydrate.rs::ParallelFanOutOperator::fetch`):
-    Branch sub-pipelines were built via `build_operator_with_live_source`
-    → `build_next_operator` → `ParallelExistsOperator`. ParallelExistsOperator
-    uses `batch_fetch_children` → `apply_child_operators` → runs the
-    EXISTS-LIMIT `Take(partition_key=[child_key])` against a `PreloadedSource`
-    with a default (no-constraint, no-start) `FetchRequest`. `TakeOperator::fetch`
-    on a partitioned Take with no constraint and no `max_bound` returns `vec![]`
-    by design (advance-mode invariant) — silently dropping every fetched child
-    row. Every parent's EXISTS check then sees zero children and is filtered out.
+Bug A (`hydrate.rs::ParallelFanOutOperator::fetch`):
+Branch sub-pipelines were built via `build_operator_with_live_source`
+→ `build_next_operator` → `ParallelExistsOperator`. ParallelExistsOperator
+uses `batch_fetch_children` → `apply_child_operators` → runs the
+EXISTS-LIMIT `Take(partition_key=[child_key])` against a `PreloadedSource`
+with a default (no-constraint, no-start) `FetchRequest`. `TakeOperator::fetch`
+on a partitioned Take with no constraint and no `max_bound` returns `vec![]`
+by design (advance-mode invariant) — silently dropping every fetched child
+row. Every parent's EXISTS check then sees zero children and is filtered out.
 
-  Bug B (`advance.rs::build_pipeline_state`):
-    `rel_to_table` map was built from `collect_child_tables(&query.ast)` — the
-    raw, **un-uniquified** AST. The runtime change-output emits the
-    **uniquified** `relationship_name` (e.g. `arb_conversations_attachments_1`)
-    written into `OperatorConfig::Exists` by Phase-34 alias-leak fix
-    (uniquify_top_level_csq_aliases). The mismatch caused
-    `flatten_nodes_to_row_changes`'s lookup to miss → fall back to using
-    `rel_name` as the table name → `coerce_row(table="arb_conversations_attachments_1", ..)`
-    returned None (column_types is keyed by actual table name) → every
-    EXISTS child row was dropped from the emitted RowChanges.
+Bug B (`advance.rs::build_pipeline_state`):
+`rel_to_table` map was built from `collect_child_tables(&query.ast)` — the
+raw, **un-uniquified** AST. The runtime change-output emits the
+**uniquified** `relationship_name` (e.g. `arb_conversations_attachments_1`)
+written into `OperatorConfig::Exists` by Phase-34 alias-leak fix
+(uniquify_top_level_csq_aliases). The mismatch caused
+`flatten_nodes_to_row_changes`'s lookup to miss → fall back to using
+`rel_name` as the table name → `coerce_row(table="arb_conversations_attachments_1", ..)`
+returned None (column_types is keyed by actual table name) → every
+EXISTS child row was dropped from the emitted RowChanges.
 
 test: live regression-runner.ts on tools/ivm-parity (TS:4858, RS:4868)
 expecting: 5 of 6 catalog shapes match
 result:
-  A-nested-OR-with-EXISTS  ok=5  diverge=0  pass=100% (was 0%)
-  D-simple-OR-with-EXISTS  ok=0  diverge=1  pass=0%   (pre-existing)
-  TOTAL: 5/6 (was 0/6)
+A-nested-OR-with-EXISTS ok=5 diverge=0 pass=100% (was 0%)
+D-simple-OR-with-EXISTS ok=0 diverge=1 pass=0% (pre-existing)
+TOTAL: 5/6 (was 0/6)
 
 next_action: |
-  Commit fixes atomically:
-    - hydrate.rs: ParallelFanOutOperator branch construction switched to
-      build_branch_subpipeline_for_hydrate (uses build_push_next_operator +
-      SourceBridgeOperator — the production-validated hydrate path).
-    - advance.rs: rel_to_table built from emitted OperatorConfig tree
-      (collect_rel_to_table_from_configs) so uniquified relationship_names
-      resolve to correct child table_names for coerce_row.
-  Update regression-runner-last.json (it already reflects 5/6).
-  Update debug session and append knowledge-base entry.
+Commit fixes atomically: - hydrate.rs: ParallelFanOutOperator branch construction switched to
+build_branch_subpipeline_for_hydrate (uses build_push_next_operator +
+SourceBridgeOperator — the production-validated hydrate path). - advance.rs: rel_to_table built from emitted OperatorConfig tree
+(collect_rel_to_table_from_configs) so uniquified relationship_names
+resolve to correct child table_names for coerce_row.
+Update regression-runner-last.json (it already reflects 5/6).
+Update debug session and append knowledge-base entry.
 Compound OR branches now emit `OperatorConfig::FanOut` with one self-
 contained sub-pipeline per branch (Source + Filter(gates) + Exists chain),
 mirroring TS `applyOr` (builder.ts:514-557). Hydration support added via
@@ -182,8 +180,8 @@ started: 2026-04-30 (catalog created in quick task 260430-m6u; reduced from 56�
   implication: Found bug 2 — alias-uniquification rename broke `rel_to_table` resolution.
 
 - timestamp: 2026-04-30 (B5-trace-5)
-  checked: advance.rs:1112-1156 (flatten_nodes_to_row_changes) + advance.rs:1307 (rel_to_table = collect_child_tables(&query.ast)) + ast_to_config.rs::uniquify_top_level_csq_aliases.
-  found: `collect_child_tables(&query.ast)` walks the **un-uniquified** AST and produces map entries like `arb_conversations_attachments → attachments`. But Phase-34 alias-leak fix (commit dc16c2588) renames every CSQ alias to `<alias>_<count>`, so the runtime change-output emits `relationship_name = "arb_conversations_attachments_1"`. flatten_nodes_to_row_changes does `rel_to_table.get("arb_conversations_attachments_1") = None` → falls back to using the rel_name as the table name → coerce_row(table="arb_conversations_attachments_1", column_types) returns None (column_types is keyed by actual table name, "attachments") → row dropped.
+  checked: advance.rs:1112-1156 (flatten*nodes_to_row_changes) + advance.rs:1307 (rel_to_table = collect_child_tables(&query.ast)) + ast_to_config.rs::uniquify_top_level_csq_aliases.
+  found: `collect_child_tables(&query.ast)` walks the **un-uniquified** AST and produces map entries like `arb_conversations_attachments → attachments`. But Phase-34 alias-leak fix (commit dc16c2588) renames every CSQ alias to `<alias>*<count>`, so the runtime change-output emits `relationship_name = "arb_conversations_attachments_1"`. flatten_nodes_to_row_changes does `rel_to_table.get("arb_conversations_attachments_1") = None` → falls back to using the rel_name as the table name → coerce_row(table="arb_conversations_attachments_1", column_types) returns None (column_types is keyed by actual table name, "attachments") → row dropped.
   implication: ROOT CAUSE 2 — rel_to_table must be built from the EMITTED OperatorConfig tree (post-uniquify) so the uniquified relationship_name resolves to the actual table name. Affects every CSQ-EXISTS that produces child rows in change-output.
 
 - timestamp: 2026-04-30 (final verification)
@@ -341,6 +339,6 @@ files_changed:
 
 - packages/zqlite-rs/src/ast_to_config.rs (Bug 1 — original B5 fix, no diff this round)
 - packages/zqlite-rs/src/hydrate.rs (Bug 1 — ParallelFanOutOperator
-  + new build_branch_subpipeline_for_hydrate)
+  - new build_branch_subpipeline_for_hydrate)
 - packages/zqlite-rs/src/advance.rs (NEW — collect_rel_to_table_from_configs
-  + rel_to_table now built from emitted configs to handle uniquified aliases)
+  - rel_to_table now built from emitted configs to handle uniquified aliases)
