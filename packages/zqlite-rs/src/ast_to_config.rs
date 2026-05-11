@@ -1058,11 +1058,25 @@ fn condition_to_predicate_json(cond: &Condition) -> Result<serde_json::Value, St
                         serde_json::Value::Array(a) => a.clone(),
                         other => vec![other.clone()],
                     };
-                    // Empty array short-circuit:
-                    // `x IN ()` is always false, `x NOT IN ()` is always true.
+                    // Empty array short-circuit — must respect SQL NULL semantics:
+                    //   `x IN  ()` → always false (matches TS: NULL early-check
+                    //                returns false; non-NULL value not in empty
+                    //                set returns false).
+                    //   `x NOT IN ()` → `x IS NOT NULL` (matches TS createPredicate
+                    //                at packages/zql/src/builder/filter.ts:87-93:
+                    //                NULL early-check returns false; non-NULL value
+                    //                NOT in empty set returns true).
+                    //
+                    // Previously emitted `{"and": []}` for NOT IN [] — an
+                    // unconditional true that ignored NULL semantics and caused
+                    // the D-simple-OR-with-EXISTS catalog divergence (RS included
+                    // rows with NULL processedAt that TS correctly rejected).
                     if arr.is_empty() {
                         return if op == "NOT IN" {
-                            Ok(serde_json::json!({"and": []})) // always true
+                            Ok(serde_json::json!({
+                                "field": field,
+                                "isNotNull": true,
+                            }))
                         } else {
                             Ok(serde_json::json!({"or": []})) // always false
                         };
@@ -1778,6 +1792,52 @@ mod tests {
         let pred = condition_to_predicate_json(&cond).unwrap();
         assert_eq!(pred["field"], "id");
         assert_eq!(pred["in"], serde_json::json!([1, 2, 3]));
+    }
+
+    /// Regression: `x IN ()` is always false (matches TS createPredicate —
+    /// empty set never contains anything, and NULL early-check also returns
+    /// false). Empty-OR predicate evaluates to false in filter.rs:233.
+    #[test]
+    fn test_condition_to_predicate_in_empty_array_is_always_false() {
+        let cond = Condition::Simple {
+            op: "IN".to_string(),
+            left: ConditionValue::Column {
+                name: "processedAt".to_string(),
+            },
+            right: ConditionValue::Literal {
+                value: serde_json::json!([]),
+            },
+        };
+        let pred = condition_to_predicate_json(&cond).unwrap();
+        assert_eq!(pred, serde_json::json!({"or": []}));
+    }
+
+    /// Regression for D-simple-OR-with-EXISTS catalog divergence: `x NOT IN ()`
+    /// must be `x IS NOT NULL`, NOT a blanket-true predicate. TS createPredicate
+    /// (packages/zql/src/builder/filter.ts:87-93) has an early NULL check that
+    /// returns false when lhs is null/undefined; non-NULL values fail the
+    /// `set.has(lhs)` check (empty set) so `!set.has(lhs)` is true. Net
+    /// behavior: equivalent to `field IS NOT NULL`.
+    ///
+    /// Previously RS emitted `{"and": []}` which evaluates true even for NULL
+    /// rows, causing rows with NULL processedAt to wrongly pass the OR via the
+    /// simple branch and fill limit=6 slots, displacing legitimate matches.
+    #[test]
+    fn test_condition_to_predicate_not_in_empty_array_is_is_not_null() {
+        let cond = Condition::Simple {
+            op: "NOT IN".to_string(),
+            left: ConditionValue::Column {
+                name: "processedAt".to_string(),
+            },
+            right: ConditionValue::Literal {
+                value: serde_json::json!([]),
+            },
+        };
+        let pred = condition_to_predicate_json(&cond).unwrap();
+        assert_eq!(
+            pred,
+            serde_json::json!({"field": "processedAt", "isNotNull": true})
+        );
     }
 
     #[test]

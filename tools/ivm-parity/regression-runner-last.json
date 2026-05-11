@@ -1,8 +1,8 @@
 {
   "mode": "hydrate",
   "total": {
-    "ok": 5,
-    "diverge": 1,
+    "ok": 6,
+    "diverge": 0,
     "error": 0
   },
   "perBucket": {
@@ -12,10 +12,10 @@
       "error": 0
     },
     "D-simple-OR-with-EXISTS": {
-      "ok": 0,
-      "diverge": 1,
+      "ok": 1,
+      "diverge": 0,
       "error": 0
     }
   },
-  "at": "2026-04-30T12:43:15.404Z"
+  "at": "2026-05-11T05:57:47.502Z"
 }
