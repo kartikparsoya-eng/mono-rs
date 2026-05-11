@@ -491,8 +491,6 @@ impl Operator for ParallelExistsOperator {
                 };
                 let passes = if not_exists { count == 0 } else { count > 0 };
                 if passes || or_matches {
-                    // Attach exists children as a relationship so they get
-                    // flattened into RowChanges (matching TS behavior).
                     node.relationships.insert(rel_name.clone(), children);
                     Some(node)
                 } else {
@@ -707,18 +705,26 @@ impl Operator for ParallelFanOutOperator {
     fn fetch(&mut self, req: &FetchRequest) -> Vec<Node> {
         // Fan out to all branches, dedupe by primary key.
         // Each branch is a self-contained sub-pipeline (Source +
-        // Filter/Exists/...) — build it with a LiveTableSource backed by
-        // our shared SQLite source.
+        // Filter/Exists/...).
+        //
+        // **B5-FIX:** Use `build_branch_subpipeline_for_hydrate` (which uses
+        // `build_push_next_operator` + `SourceBridgeOperator`, mirroring the
+        // production hydrate path) instead of `build_operator_with_live_source`
+        // (which uses `build_next_operator` and `ParallelExistsOperator`,
+        // tripping a partitioned-Take-with-no-state bug in
+        // `apply_child_operators`). This makes the FanOut branches use the
+        // same sequential `ExistsOperator` that works for the simple-EXISTS
+        // hydrate path.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<Node> = Vec::new();
-        for branch_config in &self.branches {
-            let mut branch_op = match build_operator_with_live_source(
+        for (i, branch_config) in self.branches.iter().enumerate() {
+            let mut branch_op = match build_branch_subpipeline_for_hydrate(
                 self.source.clone(),
                 branch_config,
             ) {
                 Ok(op) => op,
                 Err(e) => {
-                    eprintln!("ParallelFanOutOperator branch build failed: {e}");
+                    eprintln!("ParallelFanOutOperator branch {} build failed: {e}", i);
                     continue;
                 }
             };
@@ -791,6 +797,59 @@ fn build_operator_with_live_source(
     let mut current: Box<dyn Operator> = live_source;
     for config in &configs[rest_start..] {
         current = build_next_operator(source.clone(), current, config)?;
+    }
+    Ok(current)
+}
+
+/// **B5-FIX:** Build a self-contained sub-pipeline for one OR-branch using
+/// the SAME operator construction logic as the production hydrate path
+/// (`build_operator_chain` + `build_push_next_operator` +
+/// `SourceBridgeOperator`).
+///
+/// Why not `build_operator_with_live_source`?
+///   - It uses `build_next_operator` which constructs `ParallelExistsOperator`.
+///   - `ParallelExistsOperator::fetch` calls `batch_fetch_children` which calls
+///     `apply_child_operators(child_config=[Source, Take(partition_key=…)])`.
+///   - `apply_child_operators` runs the partitioned `Take` against a
+///     `PreloadedSource` with a default (no-constraint, no-start)
+///     `FetchRequest`. `TakeOperator::fetch` with `partition_key.is_some()`,
+///     no constraint, and no `max_bound` returns `vec![]` — silently
+///     dropping all child rows.
+///   - Result: every parent's EXISTS check sees zero children, so the
+///     `EXISTS` gate filters everyone out.
+///
+/// `build_push_next_operator` instead constructs sequential `ExistsOperator`
+/// (zero_ivm_rs::exists_op) which does per-parent constrained child fetches
+/// — `child.fetch(constraint=parent_key)` — that hit the
+/// `req.constraint.is_some()` branch in `TakeOperator::fetch`, returning
+/// child rows correctly.
+fn build_branch_subpipeline_for_hydrate(
+    source: Arc<RustTableSource>,
+    configs: &[OperatorConfig],
+) -> Result<Box<dyn Operator>, String> {
+    if configs.is_empty() {
+        return Err("empty operator config".to_string());
+    }
+    // First config must be the parent Source — used to seed the
+    // SourceBridgeOperator (which fetches via the shared connection 0).
+    match &configs[0] {
+        OperatorConfig::Source { .. } => {}
+        other => {
+            return Err(format!(
+                "build_branch_subpipeline_for_hydrate: first config must be a Source, got {:?}",
+                other
+            ));
+        }
+    }
+    // connection_id = 0 — same connection that the parent pipeline registered
+    // in `build_pipeline_state`. The shared `Arc<RustTableSource>` already
+    // has connection 0 with the correct sort/filters; reusing it means the
+    // FanOut branch sees the same row visibility as the parent.
+    let connection_id: usize = 0;
+    let root: Box<dyn Operator> = Box::new(SourceBridgeOperator::new(source.clone(), connection_id));
+    let mut current: Box<dyn Operator> = root;
+    for config in &configs[1..] {
+        current = build_push_next_operator(source.clone(), current, config)?;
     }
     Ok(current)
 }

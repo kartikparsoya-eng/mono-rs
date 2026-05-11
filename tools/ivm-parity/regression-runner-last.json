@@ -1,14 +1,14 @@
 {
   "mode": "hydrate",
   "total": {
-    "ok": 0,
-    "diverge": 6,
+    "ok": 5,
+    "diverge": 1,
     "error": 0
   },
   "perBucket": {
     "A-nested-OR-with-EXISTS": {
-      "ok": 0,
-      "diverge": 5,
+      "ok": 5,
+      "diverge": 0,
       "error": 0
     },
     "D-simple-OR-with-EXISTS": {
@@ -17,5 +17,5 @@
       "error": 0
     }
   },
-  "at": "2026-04-30T10:55:20.006Z"
+  "at": "2026-04-30T12:43:15.404Z"
 }
